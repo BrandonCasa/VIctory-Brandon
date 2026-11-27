@@ -64,18 +64,19 @@ pub(super) fn warm_from(dir: &std::path::Path) {
 
 thread_local! {
     static WARM_PUBLISHED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-    static PRELOAD_NATIVE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static CACHE_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(super) fn take_warm_publication() -> Option<String> { WARM_PUBLISHED.take() }
 
-/// During startup accept only the exact native artifact in this receipt.
-/// A cache miss goes back to normal first-use scheduling.
-pub(super) fn from_receipt<T>(native: String, f: impl FnOnce() -> T) -> T {
-    struct Clear;
-    impl Drop for Clear { fn drop(&mut self) { PRELOAD_NATIVE.take(); } }
-    PRELOAD_NATIVE.replace(Some(native));
-    let _clear = Clear;
+pub(super) fn cache_only() -> bool { CACHE_ONLY.get() }
+
+/// Restore the exact current description on the live device. Cold compiles
+/// remain on the regular guarded workers.
+pub(super) fn from_cache<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore { fn drop(&mut self) { CACHE_ONLY.set(self.0); } }
+    let _restore = Restore(CACHE_ONLY.replace(true));
     f()
 }
 
@@ -562,25 +563,10 @@ pub(crate) fn pipeline(
     load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
-    if let Some(result) = PRELOAD_NATIVE.with_borrow(|expected| {
-        let expected = expected.as_ref()?;
-        let saved = warm_folder().filter(|_| key() == *expected)
-            .and_then(|dir| read_warm(&dir.join(expected)));
-        Some(match saved {
-            Some(saved) => load(&saved, PCWSTR(HSTRING::from(expected.as_str()).as_ptr())),
-            None => Err(windows::Win32::Foundation::E_INVALIDARG.into()),
-        })
-    }) {
-        return result;
-    }
     let create = || {
         let _permit = super::make::enter_driver_compile();
         let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
         create()
-    };
-    let Some(library) = library() else {
-        MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
     };
     let key = key();
     let name = key.as_str();
@@ -614,6 +600,16 @@ pub(crate) fn pipeline(
         else { publish_warm(warm_file.as_deref(), name, &wide, &pso); }
         return Ok(pso);
     }
+    let preload = cache_only();
+    if preload && let Some((pso, _)) = load_warm() {
+        LOADED.fetch_add(1, Ordering::Relaxed);
+        return Ok(pso);
+    }
+    let Some(library) = library() else {
+        if preload { return Err(windows::Win32::Foundation::E_INVALIDARG.into()); }
+        MADE.fetch_add(1, Ordering::Relaxed);
+        return create();
+    };
     let began = std::time::Instant::now();
     let loaded = {
         let mut loading = crate::timeline::span("pipeline: acquire library load guards");
@@ -636,6 +632,7 @@ pub(crate) fn pipeline(
             });
             return Ok(pso);
         }
+        Err(e) if preload => return Err(e),
         Err(e) => e,
     };
     // Compiled outside any lock: compiles take up to seconds.

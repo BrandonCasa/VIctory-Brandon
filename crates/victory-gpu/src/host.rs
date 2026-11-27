@@ -1532,6 +1532,10 @@ struct TwinUse {
     behind: [Option<bool>; 2],
     /// The draw or dispatch being prepared writes the twin.
     writing: bool,
+    /// A title command used the depth side before the closing copy.
+    depth_accessed: bool,
+    /// Closing this recording put the twin's final bytes back in depth.
+    copied_back: bool,
     /// The depth plane's twin holds what the plane lacks although the list
     /// copied the twins since: the plane's pass waits for the list's close.
     late: bool,
@@ -2547,7 +2551,7 @@ struct Deferred {
     landed_aliases: std::collections::HashSet<(usize, usize, usize)>,
     descriptor_writes: bool,
     material_outputs: Option<Vec<usize>>,
-    gpu_texture_writers: std::collections::HashSet<usize>,
+    gpu_texture_writers: std::collections::HashMap<usize, Option<(usize, usize)>>,
     /// Native texture serials, scoped to this recording. A destination copy
     /// is valid until either image acquires another writable use.
     alias_writes: std::collections::HashMap<u64, u64>,
@@ -2598,6 +2602,7 @@ struct Deferred {
     builder_batches: Vec<std::sync::Arc<AtomicBool>>,
     builder_inputs: std::collections::HashMap<(u64, usize), crate::memory::BuilderInputs>,
     builder_outputs: Vec<(std::sync::Arc<AtomicBool>, Vec<(u64, u64)>)>,
+    traversal_trace: Option<crate::memory::TraversalTrace>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2624,10 +2629,11 @@ struct Deferred {
 
 impl Deferred {
     fn guest_texture_writer(&mut self, resource: crate::object::This) {
-        self.gpu_texture_writers.insert(resource as usize);
+        let span = crate::resource::guest_texture_span(resource);
+        self.gpu_texture_writers.insert(resource as usize, span);
         // A shader list holds the native allocation even if the title drops
         // or reuses its resource wrapper before submission.
-        match crate::resource::guest_texture_span(resource) {
+        match span {
             Some(span) => { self.guest_writes.insert(span); }
             // Buffer barriers also pass through `transition`, which emits
             // no native texture operation for them. Their actual writes
@@ -3078,7 +3084,6 @@ impl StageSelections {
     /// Selectors for every actual SRV stage that accepts a candidate's view
     /// dimension. One unbounded stage of that kind retains the full heap.
     pub(crate) fn excludes(&self, kind: u32, logical: u32) -> bool {
-        if self.entries.is_empty() { return false; }
         let mut cache = self.coverage.borrow_mut();
         let coverage = cache.entry(kind).or_insert_with(|| {
             let mut scopes = Vec::new();
@@ -3088,13 +3093,15 @@ impl StageSelections {
                 self.entries.get(&id)?;
                 scopes.push(id);
             }
-            if scopes.is_empty() { return None; }
+            // Binding can observe the heap before a command is recorded. No
+            // native command of this kind means no descriptor can be read.
+            let used = scopes.is_empty();
             scopes.sort_unstable();
             scopes.dedup();
             let mut slots: Vec<u32> = scopes.iter().flat_map(|id| self.entries[id].0.slots.iter().copied()).collect();
             slots.sort_unstable();
             slots.dedup();
-            Some(StageCoverage { slots, scopes, used: false })
+            Some(StageCoverage { slots, scopes, used })
         });
         let Some(coverage) = coverage else { return false; };
         if coverage.slots.binary_search(&logical).is_ok() { return false; }
@@ -3134,6 +3141,7 @@ struct StageCoverage {
     used: bool,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct SampleAccess<'a> {
     pub heap: usize,
     pub kind: u32,
@@ -4483,6 +4491,9 @@ fn read_backs(list: &HostList) {
         if !failed.load(Ordering::Acquire) {
             crate::memory::published(outputs);
         }
+    }
+    if let Some(trace) = &list.deferred().traversal_trace {
+        crate::memory::trace_retired_traversal(trace);
     }
     for back in &list.deferred().texture_backs {
         crate::texback::land(back);
@@ -6564,7 +6575,7 @@ impl Host {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
-        let mut texture_writers = std::collections::HashSet::new();
+        let mut texture_writers = std::collections::HashMap::new();
         let mut prepared = Vec::with_capacity(runs.len());
         for (list, sampled) in runs.iter().zip(&late_samples) {
             let restore = self.sample_mip_epilogue(sampled, &mut preludes);
@@ -6575,6 +6586,12 @@ impl Host {
         stage.next("submit: the last refreshes");
         batch.flush();
         crate::watch::ask_once_end();
+        if !batch.remapped_reads.is_empty() {
+            let _mapping = crate::watch::title_memory_reading();
+            if !batch.remapped_reads.iter().all(crate::texback::RemappedRead::still_mapped) {
+                refuse_frame(format_args!("placed texture backing changed while preparing its upload"));
+            }
+        }
         if FAILED_FRAME.load(Ordering::Acquire) {
             // Cached CPU detiles for a rejected first upload can be observed
             // again on replay. Never discard an earlier or claimed GPU version.
@@ -6675,7 +6692,7 @@ impl Host {
         let prepared = std::time::Instant::now();
         stage.next("submit: sending");
         // Rejected recordings never changed the GPU image or its prior guest landing.
-        for owner in texture_writers { crate::texback::written(owner); }
+        for (owner, span) in texture_writers { crate::texback::written(owner, span); }
         // When it runs on the card, for the timeline.
         #[cfg(feature = "diagnostics")]
         let stamp = stamps::take();
@@ -7629,8 +7646,11 @@ impl HostList {
                 needs: [false; 2],
                 behind: [None; 2],
                 writing: false,
+                depth_accessed: false,
+                copied_back: false,
                 late: false,
             });
+        u.depth_accessed |= !colour;
         let was = (u.needs, u.behind, u.writing);
         let copy = match u.behind[side] {
             Some(behind) => behind,
@@ -7733,6 +7753,7 @@ impl HostList {
                 // and only the depth plane's pass is left.
                 let copy = u.behind[0] == Some(true);
                 u.behind[0] = Some(false);
+                u.copied_back |= copy;
                 u.late = false;
                 (u.depth.clone(), u.twin.clone(), copy)
             })
@@ -7819,7 +7840,7 @@ impl HostList {
             let d = self.deferred();
             if d.indexed_heaps.iter().any(|(_, _, slots)| slots.opaque & 8 != 0 && !slots.words_only)
                 || d.material_outputs.as_ref().is_some_and(|o| *o != outputs)
-                || d.gpu_texture_writers.iter().any(|r| !outputs.contains(r))
+                || d.gpu_texture_writers.keys().any(|r| !outputs.contains(r))
                 || d.guest_writes.iter().any(|s| !output_spans.contains(s))
                 || !d.backs.is_empty() || !d.writes.is_empty() || !d.size_results.is_empty()
             {
@@ -8349,6 +8370,10 @@ impl HostList {
             Entry::Occupied(e) => (e.get().clone(), false),
             Entry::Vacant(e) => (e.insert(Default::default()).clone(), true),
         }
+    }
+
+    pub(crate) fn traversal_trace(&self) -> crate::memory::TraversalTrace {
+        self.deferred().traversal_trace.get_or_insert_with(Default::default).clone()
     }
 
     pub(crate) fn defer_landing(&self, work: impl Fn() + Send + 'static) {
@@ -8899,7 +8924,7 @@ impl HostList {
     pub(crate) fn prepared_native_uav(&self, owner: usize, copy: &std::sync::Arc<crate::resource::HostTexture>,
         writes: bool, access: SampleAccess<'_>) -> bool {
         let d = self.deferred();
-        if writes && !d.gpu_texture_writers.contains(&owner) {
+        if writes && !d.gpu_texture_writers.contains_key(&owner) {
             #[cfg(feature = "diagnostics")]
             tracing::warn!(slot=access.logical, serial=copy.serial, "changed native UAV has no recorded writer for its current allocation");
             return false;
@@ -8924,18 +8949,87 @@ impl HostList {
         conflict.is_none()
     }
 
+    pub(crate) fn prepared_depth_twin_uav(&self, owner: usize, twin: &std::sync::Arc<crate::resource::Twin>,
+        image: &std::sync::Arc<crate::resource::HostTexture>, access: SampleAccess<'_>) -> bool {
+        // Reuse the recorded twin preparation only when the title never
+        // touches the native depth image in this list. The close publishes
+        // both UAV images when there is a separate depth-plane pass.
+        let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let prepared = twins.get(&(std::sync::Arc::as_ptr(twin) as usize))
+            .is_some_and(|u| u.needs[1] && !u.depth_accessed && u.copied_back);
+        drop(twins);
+        prepared && self.prepared_native_uav(owner, image, true, access)
+    }
+
     pub(crate) fn prepare_late_depth_sample(
         &self, copy: &std::sync::Arc<crate::resource::HostTexture>, twin: std::sync::Arc<crate::resource::Twin>,
-        sampled: &mut LateSamples,
+        sampled: &mut LateSamples, access: SampleAccess<'_>,
     ) -> bool {
         let d = self.deferred();
-        if d.non_sampled.contains(&copy.serial) || d.non_sampled.contains(&twin.colour.serial) {
+        let depth_used = d.non_sampled.contains(&copy.serial);
+        let colour_used = d.non_sampled.contains(&twin.colour.serial);
+        drop(d);
+        if depth_used || colour_used {
+            // The closing copy and, when present, the plane pass already
+            // publish the native depth image. Every possible reader still
+            // needs a recorded shader-readable state at its own command.
+            let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+            let synchronized = twins.get(&(std::sync::Arc::as_ptr(&twin) as usize))
+                .is_some_and(|u| u.needs[1] && !u.depth_accessed && u.copied_back);
+            drop(twins);
+            if synchronized && self.sampled_state_ready(copy, Some(access)) {
+                #[cfg(feature = "diagnostics")]
+                {
+                    static FIRST: std::sync::Once = std::sync::Once::new();
+                    FIRST.call_once(|| tracing::info!(serial=copy.serial,
+                        "late indexed depth SRV uses the recorded twin copyback"));
+                }
+                return true;
+            }
+            #[cfg(feature = "diagnostics")]
+            self.trace_late_depth_conflict(copy, &twin, access, None);
             return false;
         }
-        drop(d);
         sampled.native.insert(copy.serial, copy.clone());
         sampled.twins.insert(copy.serial, twin);
         true
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn trace_late_depth_conflict(
+        &self, copy: &std::sync::Arc<crate::resource::HostTexture>, twin: &std::sync::Arc<crate::resource::Twin>,
+        access: SampleAccess<'_>, uav_image: Option<&std::sync::Arc<crate::resource::HostTexture>>,
+    ) {
+        let d = self.deferred();
+        let depth_used = d.non_sampled.contains(&copy.serial);
+        let colour_used = d.non_sampled.contains(&twin.colour.serial);
+        drop(d);
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let ends = |image: &std::sync::Arc<crate::resource::HostTexture>| states
+            .get(&(std::sync::Arc::as_ptr(image) as usize)).map(|&(first, last, _)| (first, last));
+        let depth = ends(copy);
+        let colour = ends(&twin.colour);
+        let plane = twin.plane.as_ref().and_then(ends);
+        let state = uav_image.map_or(depth.map_or(0xc0, |d| d.0), |image| ends(image).map_or(0, |s| s.0));
+        drop(states);
+        let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let recorded_twin = twins.get(&(std::sync::Arc::as_ptr(twin) as usize))
+            .map(|u| (u.needs, u.behind, u.depth_accessed, u.copied_back, u.late));
+        drop(twins);
+        let uses = self.sample_uses.lock().unwrap_or_else(|e| e.into_inner());
+        let uav = uav_image.is_some();
+        let image = uav_image.unwrap_or(copy);
+        let conflict = uses.conflict(image.serial, state, access.heap, access.kind, uav,
+            |id| access.stages.is_none_or(|stages| stages.may_select(id, access.logical)));
+        if let (Some((command, _, _, Some(id))), Some(stages)) = (conflict, access.stages) {
+            stages.report_missing(id, command, uses.pipeline(command).unwrap_or_default(), access.logical);
+        }
+        tracing::info!(list = %format_args!("{self:p}"), slot = access.logical, serial = copy.serial,
+            uav, view_serial = image.serial, depth_used, colour_used, ?depth, ?colour, ?plane, ?recorded_twin, ?conflict,
+            shader_states = ?uses.shader_states(image.serial),
+            pipeline = ?conflict.and_then(|(cmd, _, _, _)| uses.pipeline(cmd)),
+            target_views = ?conflict.map(|(cmd, _, _, _)| uses.target_view(cmd, copy.texture.as_raw() as usize)),
+            "late depth view conflicts with a recorded texture use");
     }
 
     pub(crate) fn prepare_late_alias_sample(
@@ -8944,7 +9038,7 @@ impl HostList {
     ) -> bool {
         if let Some(alias) = crate::texture::SampleAlias::new(placed, source, reader) {
             let d = self.deferred();
-            if !d.non_sampled.contains(&reader.serial) && !d.gpu_texture_writers.contains(&(source as usize)) {
+            if !d.non_sampled.contains(&reader.serial) && !d.gpu_texture_writers.contains_key(&(source as usize)) {
                 drop(d);
                 sampled.native.insert(reader.serial, reader.clone());
                 sampled.aliases.insert(reader.serial, std::sync::Arc::new(alias));
@@ -9055,12 +9149,14 @@ impl HostList {
             let merged_failure = merged.as_ref().and_then(|r| r.as_ref().err()).copied()
                 .map(|i| (i, crate::descriptor::index_words::take_missing_word()));
             let selection = merged.and_then(Result::ok);
-            let selections = |uav: bool| if let Some(writes) = writes {
+            let selections = |uav: bool| {
                 let heap_id = std::sync::Arc::as_ptr(&host) as usize;
                 let uses = self.sample_uses.lock().unwrap_or_else(|e| e.into_inner());
-                let (readers, sources) = (uses.readers_for(heap_id, uav), uses.scopes_for(heap_id, uav));
-                drop(uses);
+                let readers = uses.readers_for(heap_id, uav);
                 let mut stages = StageSelections { readers, ..Default::default() };
+                let Some(writes) = writes else { return stages; };
+                let sources = uses.scopes_for(heap_id, uav);
+                drop(uses);
                 for (id, words) in sources {
                     if !uav && forms.words_only && words.as_ref() == forms.words.as_slice() {
                         #[cfg(feature = "diagnostics")]
@@ -9082,7 +9178,7 @@ impl HostList {
                     }
                 }
                 stages
-            } else { StageSelections::default() };
+            };
             let stages = selections(false);
             let uav_stages = selections(true);
             // Publishing a missing descriptor or streaming a new set of
@@ -9249,7 +9345,7 @@ impl HostList {
         &self,
         batch: &mut Batch,
         air: &[(usize, usize)],
-        texture_writers: &mut std::collections::HashSet<usize>,
+        texture_writers: &mut std::collections::HashMap<usize, Option<(usize, usize)>>,
         sampled: &LateSamples,
         taken: impl Fn(usize) -> bool,
     ) -> Vec<(crate::texture::PreludeUpload, bool)> {
@@ -9261,14 +9357,22 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let (mut copies, mut refreshes, mut refreshed) = (0u64, 0u64, 0u64);
         let deferred = self.deferred();
-        texture_writers.extend(deferred.gpu_texture_writers.iter().copied());
+        texture_writers.extend(deferred.gpu_texture_writers.iter().map(|(&owner, &span)| (owner, span)));
         for &span in deferred.landed_aliases.iter().chain(&sampled.landed_aliases) {
             if let Some((owner, lo, hi)) = crate::resource::gpu_target_overlaps(span).into_iter()
-                .find(|&(owner, lo, hi)| texture_writers.contains(&owner) || !crate::texback::available(owner, lo, hi)) {
+                .find(|&(owner, lo, hi)| {
+                    if texture_writers.contains_key(&owner) { return true; }
+                    if crate::texback::available(owner, lo, hi) { return false; }
+                    if let Some(read) = crate::texback::remapped_read(owner, span.1, span.2) {
+                        batch.remapped_reads.push(read);
+                        return false;
+                    }
+                    true
+                }) {
                 #[cfg(feature = "diagnostics")]
                 tracing::error!(reader=?crate::resource::live_texture_description(span.0),
                     producer=?crate::resource::live_texture_description(owner), read_bytes=span.2,
-                    same_list_writer=deferred.gpu_texture_writers.contains(&owner), queued_writer=texture_writers.contains(&owner),
+                    same_list_writer=deferred.gpu_texture_writers.contains_key(&owner), queued_writer=texture_writers.contains_key(&owner),
                     landed=crate::texback::available(owner, lo, hi), late=sampled.landed_aliases.contains(&span),
                     "ordered placed texture landing unavailable");
                 refuse_frame(format_args!("GPU-owned bytes {lo:#x}..{hi:#x} from {owner:#x} overlapping placed texture at {:#x} have no ordered byte-exact landing", span.1));
@@ -9686,6 +9790,8 @@ mod wide_refresh_tests {
 struct Batch {
     /// Buffer sources whose ordered refresh already ran before a fenced selector read.
     refreshed_selectors: std::collections::BTreeSet<u64>,
+    /// Physical backing used to separate placed reads from old target writes.
+    remapped_reads: Vec<crate::texback::RemappedRead>,
     sparse: ByCopy<(
         std::sync::Arc<crate::shadow::Shadow>,
         crate::shadow::ReadSpans,

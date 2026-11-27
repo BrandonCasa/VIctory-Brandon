@@ -267,34 +267,20 @@ pub fn native_folder(dir: &Path) -> PathBuf {
     dir.join("warm-libraries").join(adapter)
 }
 
-/// Install native PSOs prepared by an offline warm before starting the
-/// guest. The title acquires the same object when it creates that recipe.
+/// Restore previously demanded PSOs before the guest starts its frame
+/// watchdog. The driver validates each entry against today's description.
 pub fn preload() {
     // Several thousand distinct recipes occur in the first world frame.
     // Bound objects awaiting a guest handle when a cache spans other scenes.
     const MAX_RETAINED: usize = 4096;
     if std::env::var_os("VICTORY_PRELOAD_PIPELINES").is_some_and(|v| v == "0") { return; }
     let Some(dir) = super::library::folder() else { return };
-    let Ok(receipts) = std::fs::read_to_string(dir.join("warm-done.txt")) else { return };
     let Ok(early) = std::fs::read_to_string(dir.join("early-pipelines.txt")) else { return };
-    let early: HashSet<_> = early.lines().collect();
-    // Several translation revisions can have receipts for the same recipe.
-    // Try the newest first, and let the native key and driver validate it.
-    let mut candidates = Vec::<(&str, Vec<&str>)>::new();
-    let mut by_key = HashMap::<&str, usize>::new();
-    for line in receipts.lines().rev() {
-        let mut fields = line.split_whitespace();
-        let (Some(_), Some(key), Some("exact-v1"), Some(native)) =
-            (fields.next(), fields.next(), fields.next(), fields.next()) else { continue };
-        if !is_hex(key, 32) || !is_hex(native, 32) || !early.contains(key)
-            || !super::library::warm_folder().is_some_and(|d| d.join(native).is_file()) { continue; }
-        if let Some(&i) = by_key.get(key) {
-            if !candidates[i].1.contains(&native) { candidates[i].1.push(native); }
-        } else if candidates.len() < MAX_RETAINED {
-            by_key.insert(key, candidates.len());
-            candidates.push((key, vec![native]));
-        }
-    }
+    let mut seen = HashSet::new();
+    let candidates: Vec<_> = early.lines()
+        .filter(|key| is_hex(key, 32) && seen.insert(*key) && !super::make::is_bad_key(key))
+        .take(MAX_RETAINED)
+        .collect();
     if candidates.is_empty() { return; }
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     let next = AtomicUsize::new(0);
@@ -305,11 +291,10 @@ pub fn preload() {
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
-                while let Some((key, names)) = candidates.get(next.fetch_add(1, Relaxed)) {
+                while let Some(key) = candidates.get(next.fetch_add(1, Relaxed)) {
                     let id = std::array::from_fn(|i| u8::from_str_radix(&key[i*2..i*2+2], 16).unwrap());
                     let Some((shaders, state)) = restored(&id) else { continue };
-                    let ready = names.iter().find_map(|&name| super::library::from_receipt(name.to_owned(),
-                        || HostPipeline::new(&shaders, state.as_deref())));
+                    let ready = super::library::from_cache(|| HostPipeline::new(&shaders, state.as_deref()));
                     if let Some(ready) = ready {
                         super::cached_pending(&shaders, state, Some(ready));
                         loaded.fetch_add(1, Relaxed);

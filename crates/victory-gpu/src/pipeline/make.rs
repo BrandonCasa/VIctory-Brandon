@@ -154,7 +154,7 @@ fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R
     f(keys)
 }
 
-fn is_bad_key(key: &str) -> bool {
+pub(super) fn is_bad_key(key: &str) -> bool {
     bad_keys(|keys| keys.contains(key))
 }
 

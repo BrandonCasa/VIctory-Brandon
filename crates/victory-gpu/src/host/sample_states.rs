@@ -167,6 +167,11 @@ impl Uses {
         next.checked_sub(1).map(|i| self.pipelines[i].1)
     }
 
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn shader_states(&self, serial: u64) -> (u32, &[(u32, u8)]) {
+        (self.command, self.transitions.get(&serial).map_or(&[], Vec::as_slice))
+    }
+
     /// The ordinal, required and actual shader-read states for the first
     /// potential reader lacking its stage's bit. The native list prelude
     /// establishes its first tracked state before command zero.
@@ -306,6 +311,8 @@ fn omitting_an_entire_srv_pins_every_matching_stage() {
     assert!(!scopes.excludes(32, 11)); // broad, matching cube stage
     assert!(!scopes.excludes(64, 11)); // bounded reflection, unavailable buffer
     assert!(!scopes.excludes(0, 11));  // implicit view could match both broad stages
+    assert!(scopes.excludes(128, 11)); // no issued stage can select this view
+    assert!(StageSelections::default().excludes(4, 11));
     scopes.readers.push((0, None));
     scopes.coverage.get_mut().clear();
     assert!(!scopes.excludes(4, 11));  // unbounded shape

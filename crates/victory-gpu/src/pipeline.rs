@@ -145,6 +145,8 @@ pub(crate) struct Translated {
     pub(crate) stores_textures: bool,
     /// Whether it can store through raw addresses.
     pub(crate) stores_by_address: bool,
+    /// Whether the guest shader tests acceleration structure nodes.
+    pub(crate) ray_tracing: bool,
     /// Whether it stores through a view it picks from the heap by an index,
     /// once asked (`crate::picked`).
     pub(crate) picks: std::sync::atomic::AtomicU8,
@@ -302,6 +304,7 @@ fn translate_with(container: &[u8], get_host: impl FnOnce(&[u8]) -> Result<victo
         stores: writes.buffer,
         stores_textures: writes.texture,
         stores_by_address: writes.address,
+        ray_tracing: writes.ray_tracing,
         picks: Default::default(),
     })
 }
@@ -355,6 +358,7 @@ struct ProgramWrites {
     buffer: bool,
     texture: bool,
     address: bool,
+    ray_tracing: bool,
 }
 
 #[cfg(windows)]
@@ -378,6 +382,7 @@ impl ProgramWrites {
                 }
                 Encoding::Mimg => {
                     self.texture |= name.is_none_or(|n| n.starts_with("image_store") || n.starts_with("image_atomic"));
+                    self.ray_tracing |= matches!(name, Some("image_bvh_intersect_ray" | "image_bvh64_intersect_ray"));
                 }
                 Encoding::Sop1 if name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")) => {
                     self.buffer = true;

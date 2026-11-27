@@ -2917,10 +2917,11 @@ impl HostHeap {
                     continue;
                 }
                 // A previous draw prepared this exact SRV in this recording.
-                // Recheck the guest words, mapping and published native image.
-                // Submit still validates the descriptor read by each occurrence.
+                // Recheck its guest record and lifetime, allocation topology
+                // and published image before using the recorded preparation.
+                // Submission also pins the enclosing heap's publication.
                 let lifetime = super::record_lifetime(generation);
-                if may_defer && row.is_some_and(|r| r.record == record && r.form == 8)
+                if (may_defer || !recording) && row.is_some_and(|r| r.record == record && r.form == 8)
                     && self.made.get(logical) == Some(record) && self.buffer_ready(logical)
                     && let Some(image) = list.current_sampled_slot(self as *const Self as usize, logical, record, topology, lifetime)
                     && self.keeps_resource(logical, &image.texture)
@@ -3077,7 +3078,30 @@ impl HostHeap {
                     let failure = if slots.exact.contains_key(&logical) { Some("exact access") }
                         else if kind == victory_shader::ResourceType::Uav {
                             Some(if source.is_some() { "changed UAV aliases a separate producer" }
-                                else if crate::resource::twin(this).is_some() { "changed UAV needs its depth twin synchronized" }
+                                else if let Some(twin) = crate::resource::twin(this) {
+                                    if !recording {
+                                        let access = crate::host::SampleAccess {
+                                            heap: self as *const Self as usize,
+                                            kind: texture_kind(&view).map_or(0, |(_, kind)| kind),
+                                            logical,
+                                            stages: uav_stages,
+                                        };
+                                        let image = twin.plane.as_ref().into_iter()
+                                            .chain(std::iter::once(&twin.colour))
+                                            .find(|image| self.keeps_resource(logical, &image.texture));
+                                        if slots.opaque & victory_shader::emit::TEXTURE_WRITE_ACCESS != 0
+                                            && !crate::resource::title_fills(this) && !crate::texback::wanted(this)
+                                            && image.is_some_and(|image| list.prepared_depth_twin_uav(object, &twin, image, access))
+                                        {
+                                            continue;
+                                        }
+                                        #[cfg(feature = "diagnostics")]
+                                        if let Some(image) = image {
+                                            list.trace_late_depth_conflict(&copy, &twin, access, Some(image));
+                                        }
+                                    }
+                                    "changed UAV needs its depth twin synchronized"
+                                }
                                 else if crate::resource::title_fills(this) { "changed UAV needs ordered upload of its initial texels" }
                                 else if crate::texback::wanted(this) { "changed UAV needs ordered readback after shader writes" }
                                 else { "changed native UAV lacks a recorded write or compatible command state" })
@@ -3097,24 +3121,32 @@ impl HostHeap {
                             && late_guest_sample_conflict(logical, object, &copy).is_some()
                         { Some("separate writer overlaps sampled placement") }
                         else if !recording && let Some(twin) = crate::resource::twin(this) {
-                            if late.as_deref_mut().is_some_and(|samples| list.prepare_late_depth_sample(&copy, twin, samples)) { None }
+                            let access = crate::host::SampleAccess {
+                                heap: self as *const Self as usize,
+                                kind: texture_kind(&view).map_or(0, |(_, kind)| kind),
+                                logical,
+                                stages,
+                            };
+                            if late.as_deref_mut().is_some_and(|samples| list.prepare_late_depth_sample(&copy, twin, samples, access)) { None }
                             else { Some("sampled depth image has conflicting recorded use") }
                         }
                         else if let Some(conflict) = (recording && cpu_owned).then(|| late_guest_sample_conflict(logical, object, &copy)).flatten() { Some(conflict) }
-                        // At submission, late_sample_conflict checks every physical
-                        // byte of the upload against all preceding and same-list
-                        // writes under the pinned heap publication.
-                        else if recording && cpu_owned && slots.opaque & victory_shader::emit::TEXTURE_WRITE_ACCESS != 0 {
-                            Some("sampled guest bytes may be written by this recording")
-                        }
                         else if recording {
+                            let opaque_writer = cpu_owned
+                                && slots.opaque & victory_shader::emit::TEXTURE_WRITE_ACCESS != 0;
                             // Streaming can move the mip window while several draws on
                             // the same list name the same immutable allocation. Both
                             // views contribute their required subresources to its upload.
-                            if previous.is_some_and(|(_, serial, producer)| serial == copy.serial && producer.is_none())
-                                && same_object
+                            let same_allocation = previous.is_some_and(|(_, serial, producer)| serial == copy.serial && producer.is_none())
+                                && same_object;
+                            if opaque_writer && !(placed && same_allocation && copy.flags() & 7 == 0) {
+                                Some("sampled guest bytes may be written by this recording")
+                            } else if same_allocation
                                 && list.advance_sampled_view(slot, previous, version)
                             {
+                                // Check the execution-time upload against the actual write
+                                // ranges under the pinned descriptor publication.
+                                if opaque_writer { list.note_volatile_sample(slot); }
                                 crate::draw::readable_resolved(list, kind, &resolved, placed, source, false);
                                 None
                             } else { Some("recorded draw requires a different texture allocation") }

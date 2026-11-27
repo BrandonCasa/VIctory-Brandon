@@ -1405,7 +1405,8 @@ impl State {
                 (unsafe { texture.as_ref()?.GetDesc() }.MipLevels > 1).then_some((*ptr, false, *words))
             });
             let depth = dsv.as_ref().and_then(|(texture, record)| {
-                (unsafe { texture.GetDesc() }.MipLevels > 1).then_some((texture.as_raw() as usize, true, record.key().1))
+                (cfg!(feature = "diagnostics") || unsafe { texture.GetDesc() }.MipLevels > 1)
+                    .then_some((texture.as_raw() as usize, true, record.key().1))
             });
             list.note_target_views(colors.chain(depth).collect());
         }
@@ -1626,6 +1627,7 @@ impl State {
         compute: bool,
         views: &[crate::memory::ViewSpan],
         use_: crate::memory::Use,
+        shader: &str,
     ) -> Option<crate::memory::Ready> {
         let heap = match self.heaps[0] {
             0 => None,
@@ -1664,6 +1666,8 @@ impl State {
             }
         }
         addresses.extend(views.iter().map(|v| v.at));
+        let ray_shader = (t.ray_tracing && self.dispatch_groups_x.is_some_and(|x| x != 0))
+            .then_some(shader);
         crate::memory::ready(
             list,
             heap,
@@ -1675,6 +1679,7 @@ impl State {
             &self.builder_ranges,
             views,
             self.indexed_root_slots(&t.host.indexed_forms, compute),
+            ray_shader,
         )
     }
 
@@ -1972,7 +1977,7 @@ impl State {
                 } else {
                     crate::memory::Use::Reads
                 };
-                let Some(ready) = self.memory_ready(list, t, compute, &addresses, use_) else {
+                let Some(ready) = self.memory_ready(list, t, compute, &addresses, use_, &stage.shader.hash) else {
                     list.refused_pipeline(self.pipeline);
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;

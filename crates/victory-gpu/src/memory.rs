@@ -68,6 +68,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -1571,13 +1572,14 @@ fn discover_instances(ranges: &[[u64; 3]]) -> Option<InstanceGraph> {
 /// original instance dependencies. For an external TLAS, retail XDXR
 /// reads the byte offset at +52, strides its instances by 128, and shifts
 /// the dword at instance+60 left eight to obtain the referenced BLAS.
-fn reserve_trace_views(mut views: Vec<ViewSpan>) -> Option<()> {
+fn reserve_trace_views(mut views: Vec<ViewSpan>, observe: bool) -> Option<Option<(u64, u64)>> {
     use std::collections::HashSet;
     views.sort_unstable();
     views.dedup();
     let mut seen = HashSet::new();
     let mut spans = Vec::new();
     let mut next = Vec::new();
+    let mut published = None;
     while !views.is_empty() {
         let mut external = Vec::new();
         {
@@ -1594,6 +1596,9 @@ fn reserve_trace_views(mut views: Vec<ViewSpan>) -> Option<()> {
                         return None;
                     }
                     let s = m.structures.get(&base)?;
+                    if observe && published.is_none() {
+                        published = Some((base, s.generation));
+                    }
                     next.extend(s.dependencies.iter().map(|&(at, _, _)| ViewSpan { at, bytes: None }));
                     spans.push((at, s.size));
                     if let Some(bytes) = view.bytes.filter(|&bytes| bytes > s.size) {
@@ -1664,7 +1669,7 @@ fn reserve_trace_views(mut views: Vec<ViewSpan>) -> Option<()> {
         if m.reserve(at, bytes, false) { return true; }
         tracing::error!(address = format_args!("{at:#x}"), bytes, "traversal range unavailable");
         false
-    }).then_some(())
+    }).then_some(published)
 }
 
 /// Discovery may reach a BLAS by its header, its published size, and a
@@ -1945,10 +1950,39 @@ pub(crate) fn published(outputs: &[(u64, u64)]) {
         ));
         return;
     }
-    for at in canonical.unwrap() {
-        m.structures.get_mut(&at).unwrap().published = true;
+    let canonical = canonical.unwrap();
+    for at in &canonical {
+        m.structures.get_mut(at).unwrap().published = true;
     }
     m.versions.remove(&key);
+    static REPORTED: AtomicUsize = AtomicUsize::new(0);
+    if trace_enabled() && REPORTED.load(Ordering::Relaxed) < TRACE_LIMIT
+        && REPORTED.fetch_add(1, Ordering::Relaxed) < TRACE_LIMIT
+    {
+        tracing::info!(frame = crate::frame::current(), generation, outputs = canonical.len(),
+            first_address = format_args!("{:#x}", canonical[0]), "retired BVH build published");
+    }
+}
+
+const TRACE_LIMIT: usize = 16;
+static TRAVERSALS_REPORTED: AtomicUsize = AtomicUsize::new(0);
+
+fn trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(feature = "diagnostics")
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_TRACE").is_some_and(|v| v == "1"))
+}
+
+pub(crate) type TraversalTrace = Arc<Mutex<Option<(String, u64, u64)>>>;
+
+pub(crate) fn trace_retired_traversal(trace: &TraversalTrace) {
+    if let Some((shader, address, generation)) = trace.lock().unwrap_or_else(|e| e.into_inner()).take()
+        && TRAVERSALS_REPORTED.load(Ordering::Relaxed) < TRACE_LIMIT
+        && TRAVERSALS_REPORTED.fetch_add(1, Ordering::Relaxed) < TRACE_LIMIT
+    {
+        tracing::info!(frame = crate::frame::current(), shader, published_generation = generation,
+            address = format_args!("{address:#x}"), "retired ray traversal referenced a published BVH");
+    }
 }
 
 pub(crate) struct SizeResult {
@@ -2127,6 +2161,7 @@ pub(crate) fn ready(
     ranges: &[[u64; 3]],
     views: &[ViewSpan],
     indexed: crate::descriptor::host::IndexedSlots,
+    ray_shader: Option<&str>,
 ) -> Option<Ready> {
     let declared = ranges.first().filter(|_| matches!(use_, Use::Builds { .. }))
         .map(|first| list.builder_inputs(first[2] >> 8, Arc::as_ptr(heap) as usize));
@@ -2219,6 +2254,9 @@ pub(crate) fn ready(
             return Some(ready);
         }
         let spans = ranges.to_vec();
+        let trace = ray_shader.filter(|_| use_ == Use::Reads && trace_enabled()
+                && TRAVERSALS_REPORTED.load(Ordering::Relaxed) < TRACE_LIMIT)
+            .map(|shader| (shader.to_owned(), list.traversal_trace()));
         list.defer_builder(move || (|| {
             let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
             let m = guard.as_mut()?;
@@ -2266,7 +2304,14 @@ pub(crate) fn ready(
                     views.push(ViewSpan { at, bytes });
                 }
                 let count = views.len();
-                reserve_trace_views(views).or_else(|| { tracing::error!(count, "could not reserve traversal views"); None })?;
+                let published = reserve_trace_views(views, trace.is_some())
+                    .or_else(|| { tracing::error!(count, "could not reserve traversal views"); None })?;
+                if let (Some((shader, trace)), Some((address, generation))) = (&trace, published) {
+                    let mut trace = trace.lock().unwrap_or_else(|e| e.into_inner());
+                    if trace.is_none() {
+                        *trace = Some((shader.clone(), address, generation));
+                    }
+                }
                 guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
             } else if let Use::SizeQuery { source, destination } = use_ {
                 let source_base = m.structure_at(source).or_else(|| { tracing::error!(?use_, "BVH size query has no producer"); None })?;
@@ -2461,11 +2506,6 @@ mod trace {
         said: u32,
     }
 
-    fn on() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_TRACE").is_some_and(|v| v == "1"))
-    }
-
     fn value(at: u64) -> u64 {
         let mut b = [0u8; 8];
         crate::host::copy_mapped(b.as_mut_ptr(), at as *const u8, 8, false);
@@ -2481,7 +2521,7 @@ mod trace {
         }
 
         pub(super) fn look(&mut self, frame: u64) {
-            if !on() {
+            if !trace_enabled() {
                 return;
             }
             let mut gone = Vec::new();
@@ -2511,7 +2551,7 @@ mod trace {
             constants: &[u32],
             threads: Option<[u32; 3]>,
         ) {
-            if !on() {
+            if !trace_enabled() {
                 return;
             }
             let _ = addresses;

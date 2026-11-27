@@ -75,21 +75,119 @@ struct Publication {
 static PUBLISHED: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, Publication>>> =
     std::sync::LazyLock::new(Default::default);
 
-static GPU_WRITTEN: std::sync::LazyLock<Mutex<std::collections::HashSet<usize>>> =
+type Backing = (usize, usize, usize, u64, u64);
+type PhysicalSpan = (usize, u64, u64);
+
+struct Writer {
+    last_mapping: u64,
+    // Unknown remains unknown. A later mapping may still expose any of the
+    // bytes written before we knew which physical pages the allocation used.
+    physical: Option<Vec<PhysicalSpan>>,
+}
+
+static GPU_WRITTEN: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, Writer>>> =
     std::sync::LazyLock::new(Default::default);
 
-pub(crate) fn written(owner: usize) {
-    GPU_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).insert(owner);
+#[cfg(feature = "diagnostics")]
+fn trace_ownership() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_TRACE_TEXTURE_OWNER"))
+}
+
+/// Keep this conservative when any part of the range has no section identity.
+/// The caller holds the title mapping read lock across the observation.
+fn complete_backing(at: usize, len: usize) -> Option<Vec<Backing>> {
+    let end = at.checked_add(len)?;
+    let mut next = at;
+    let backing = crate::inplace::backing(at, len);
+    for &(lo, hi, ..) in &backing {
+        if lo != next { return None; }
+        next = hi;
+    }
+    (len != 0 && next == end).then_some(backing)
+}
+
+fn physical_span((lo, hi, section, offset, _): Backing) -> PhysicalSpan {
+    (section, offset, offset + (hi - lo) as u64)
+}
+
+fn add_physical(ranges: &mut Vec<PhysicalSpan>, backing: Vec<Backing>) {
+    ranges.extend(backing.into_iter().map(physical_span));
+    ranges.sort_unstable();
+    let mut kept = 0;
+    for i in 0..ranges.len() {
+        let (section, lo, hi) = ranges[i];
+        if kept != 0 && ranges[kept - 1].0 == section && lo <= ranges[kept - 1].2 {
+            ranges[kept - 1].2 = ranges[kept - 1].2.max(hi);
+        } else {
+            ranges[kept] = (section, lo, hi);
+            kept += 1;
+        }
+    }
+    ranges.truncate(kept);
+}
+
+pub(crate) fn written(owner: usize, span: Option<(usize, usize)>) {
+    if let Some((at, len)) = span.filter(|&(at, len)| crate::inplace::sparse_range(at, len)) {
+        let _mapping = crate::watch::title_memory_reading();
+        let epoch = crate::resource::alias_generation();
+        let mut writers = GPU_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        let writer = writers.entry(owner).or_insert_with(|| Writer { last_mapping: 0, physical: Some(Vec::new()) });
+        if writer.last_mapping != epoch && let Some(physical) = &mut writer.physical {
+            match complete_backing(at, len) {
+                Some(backing) => add_physical(physical, backing),
+                None => writer.physical = None,
+            }
+            writer.last_mapping = epoch;
+        }
+    } else {
+        GPU_WRITTEN.lock().unwrap_or_else(|e| e.into_inner())
+            .insert(owner, Writer { last_mapping: 0, physical: None });
+    }
     PUBLISHED.lock().unwrap_or_else(|e| e.into_inner()).remove(&owner);
 }
 
 pub(crate) fn available(owner: usize, lo: usize, hi: usize) -> bool {
-    if !GPU_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).contains(&owner) { return true; }
+    if !GPU_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&owner) { return true; }
     PUBLISHED.lock().unwrap_or_else(|e| e.into_inner()).get(&owner)
         .is_some_and(|p| {
             let i = p.bytes.partition_point(|r| r.end <= lo);
             p.ticket.valid.load(Ordering::Acquire) && p.bytes.get(i).is_some_and(|r| r.start <= lo && hi <= r.end)
         })
+}
+
+fn overlaps(writers: &[PhysicalSpan], (section, lo, hi): PhysicalSpan) -> bool {
+    let first = writers.partition_point(|&(s, _, end)| (s, end) <= (section, lo));
+    writers.get(first).is_some_and(|&(s, from, _)| s == section && from < hi)
+}
+
+pub(crate) struct RemappedRead {
+    lo: usize,
+    hi: usize,
+    backing: Vec<Backing>,
+}
+
+impl RemappedRead {
+    pub(crate) fn still_mapped(&self) -> bool {
+        self.backing == crate::inplace::backing(self.lo, self.hi - self.lo)
+    }
+}
+
+/// Virtual overlap with a previously written target is harmless only if the
+/// read has complete physical backing disjoint from every write of that target.
+pub(crate) fn remapped_read(owner: usize, lo: usize, len: usize) -> Option<RemappedRead> {
+    let _mapping = crate::watch::title_memory_reading();
+    let hi = lo.checked_add(len)?;
+    let backing = complete_backing(lo, len)?;
+    let writers = GPU_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let prior = writers.get(&owner)?.physical.as_deref()?;
+    let shared = backing.iter().copied().any(|part| overlaps(prior, physical_span(part)));
+    #[cfg(feature = "diagnostics")]
+    if trace_ownership() {
+        tracing::info!(owner, lo, hi, writer_ranges = prior.len(), ?backing, shared,
+            "checked physical backing of an unlanded texture writer");
+    }
+    (!shared).then_some(RemappedRead { lo, hi, backing })
 }
 
 fn publish(back: &Back, bytes: Vec<std::ops::Range<usize>>) {
@@ -584,10 +682,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_reused_address_only_conflicts_with_previous_physical_writes() {
+        let mut writer = Vec::new();
+        add_physical(&mut writer, vec![(0x10000, 0x20000, 7, 0x40000, 1)]);
+        add_physical(&mut writer, vec![(0x10000, 0x20000, 7, 0x90000, 2)]);
+
+        assert!(!overlaps(&writer, physical_span((0x10000, 0x14000, 7, 0x70000, 3))));
+        assert!(overlaps(&writer, physical_span((0x30000, 0x34000, 7, 0x44000, 4))));
+        assert!(overlaps(&writer, physical_span((0x10000, 0x14000, 7, 0x90000, 5))));
+        assert!(!overlaps(&writer, (8, 0x40000, 0x44000)));
+    }
+
+    #[test]
     fn partial_landing_vouches_only_for_contiguous_written_bytes() {
         let owner = 95;
         let ticket = track(owner, 0x8000, 0x9000);
-        written(owner);
+        written(owner, None);
         PUBLISHED.lock().unwrap().insert(owner, Publication {
             ticket, bytes: vec![0x8110..0x8120, 0x8150..0x8180],
         });

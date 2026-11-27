@@ -564,6 +564,7 @@ impl HostPipeline {
             );
             let pso = match made {
                 Ok(pso) => pso,
+                Err(_) if super::library::cache_only() => return None,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
@@ -617,6 +618,7 @@ impl HostPipeline {
             );
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                 Ok(pso) => pso,
+                Err(_) if super::library::cache_only() => return None,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
@@ -713,6 +715,11 @@ impl HostPipeline {
             )
         };
         let mut made = make(&desc, &|| name(rect_gs.as_ref()));
+        // A cache miss cannot establish that the driver rejects the GS.
+        // Leave the real creation and any fallback decision to the worker.
+        if made.is_err() && super::library::cache_only() {
+            return None;
+        }
         if made.is_err() && rect_gs.is_some() {
             // The host refused the geometry stage: once more without it.
             tracing::warn!(?shaders, "host pipeline refused with the rectangle geometry stage");
