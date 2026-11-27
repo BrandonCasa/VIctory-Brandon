@@ -10,7 +10,7 @@ BC1/4 use 12 record bytes per 8-byte output block. BC3/5 use 24 per 16-byte bloc
 
 ## Proposed redesign
 
-Add a streaming decoder for private, discardable output. Complete one record or a small batch, reconstruct its blocks and retain lane state and block history across batches. Preserve compressed input consumption order, lane stalls, interleaving and format-specific block numbering. If reconstruction fails before the lane stream ends, continue validating lanes when necessary to preserve the currently reported error. Use the existing two-phase decoder for guest-visible output where early lane failure currently leaves the destination untouched.
+Have `into_destination` and `into_pages` tell the fill callback whether it received guest-visible memory or private scratch. Decide after attempting the physical window, on each fill, since even a contiguous mapping can fail and fall back to scratch. For private output, let the lane scheduler feed completed record batches directly to reconstruction, preserving lane consumption order, stalls, format-specific block numbering and decoder history. Share the lane logic with the guest-visible path, which still validates all lanes before reconstruction starts. Preserve error precedence if reconstruction fails before a later lane error. Scatter only the successfully filled prefix under the existing retry and notification rules.
 
 ## Before and after
 
@@ -18,4 +18,4 @@ For B output blocks of record stride R, private-path record storage falls from B
 
 ## Expected impact and confidence
 
-High for peak memory and potentially streaming throughput on large fragmented BCPack jobs. The size ratio and discard-on-error boundary follow from source; the frequency of fragmented destinations is unknown. Measure request mix, peak concurrent scratch, decode bandwidth, and equivalence on valid and corrupt streams for every format.
+The peak-memory saving follows from the record stride on requests that actually fill private scratch. Its frequency includes both fragmentation and failed direct mappings. Measure peak concurrent scratch and decode bandwidth, and check valid and corrupt streams on virtual, mapped physical and buffered physical outputs.

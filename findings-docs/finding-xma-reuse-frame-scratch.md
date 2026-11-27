@@ -1,4 +1,4 @@
-# Reuse packet and PCM scratch across XMA frames
+# Decode XMA frames into the voice's pending sample queue
 
 ## Location and execution path
 
@@ -10,11 +10,11 @@ Each successfully framed input allocates a byte vector for packed frame bits and
 
 ## Proposed redesign
 
-Add a caller-buffer form of `read_frame` that returns frame offsets and bit count, retaining the owning interface for existing callers. Give the single worker reusable packed-byte and PCM vectors. Clear lengths before each frame or flush and retain capacity. Finish logging, truncating and copying samples into the correct voice queue before servicing another voice. Keep per-voice decoder overlap, ring indices and pending samples independent.
+Add a caller-buffer form of `read_frame` for the worker, clearing the logical length on each attempt, including after an incomplete frame. Keep the public owning `read_frame` as a wrapper for existing callers. Give `Decoder` a bulk output interface that exposes one decoded frame before advancing its overlap, retaining the existing `Vec<i16>` interface as a wrapper. The HLE can apply its loop-end trim, then its outstanding skip, and extend the voice's reserved PCM deque directly with the retained interleaved samples. Use a statically dispatched iterator or bulk writer so the inner loop has no indirect callback per sample. Drain the flush tail into the same deque before resetting the decoder. Keep unread samples already queued, silence and diagnostics on bad frames, guest context update order and the next loop's skip.
 
 ## Before and after
 
-For F frames, scratch allocation count falls from approximately 2F to capacity growth for the largest packed frame and channel count encountered. Retained scratch is bounded by these maxima per worker. Packet gathering across gaps, transform work and copying accepted samples into the voice queue still scale with the amount decoded.
+For F frames, the packed-byte scratch grows to the largest packetized frame encountered. The F temporary PCM buffers and the copy of each accepted sample into the voice queue disappear. The queue still grows to hold unread output, and each retained sample is still converted and stored once. Decode and overlap processing remain necessary even when a frame is trimmed.
 
 ## Expected impact and confidence
 

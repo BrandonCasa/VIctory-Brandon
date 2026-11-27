@@ -10,11 +10,11 @@ One eligible shape is a 256 × 256 format-41, single-mip, single-slice linear te
 
 ## Proposed redesign
 
-Start with one linear mip and slice whose guest rows and mapped footprint are byte-for-byte identical. Check format, offsets, row width and pitch, row count, depth and exact ticket length before publishing directly from the mapped footprint with `copy_mapped`. Keep the mapping and ticket locks through publication. Skip the old read only with cheap, current proof that every destination page is readable. The resident bit in `texture::committed` cannot establish protection. Without that proof, keep `read_into` as the gate and still save the intermediate tiling pass on identical layouts. Keep the preservation path for padding or mismatched layouts.
+Classify the copy when `texback::record` has both the ticket's guest layout and the device's actual footprints. Store a direct-copy offset and length in `Back` only for a single linear mip and slice whose format, row width, pitch, row count, depth and full ticket extent match. Replays can reuse this decision. At landing, hold the mapping and ticket guards and recheck ticket validity. If there is no cheap current proof of destination readability, keep `read_into` as the gate. On success, keep the readback buffer mapped through `copy_mapped`. Layouts with padding or mismatches still use preservation and retiling.
 
 ## Before and after
 
-For dense coverage of B bytes the old-value payload read falls from B bytes to a region/page readability check. The tiling and final B-byte publication still occur. A sparse layout keeps the old read; very fragmented mappings can make the check more expensive than reading sequentially. No GPU bandwidth saving is assumed.
+A matching B-byte layout avoids retiling B bytes on every landing, including replay. It can also avoid the B-byte preservation read if current readability is established more cheaply. Direct publication still copies B bytes to the title. Classification is paid once per recording and does not cache mapping permissions.
 
 ## Expected impact and confidence
 

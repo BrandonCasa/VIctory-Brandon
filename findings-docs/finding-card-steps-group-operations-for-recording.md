@@ -6,15 +6,15 @@
 
 ## Current cost
 
-For L levels, even an operation known to belong to just one level is tested L times. At 256 or more operations, eight workers each visit every operation to find their slot writes, including all operations with no slot destination. The latter scan also occurs in stage 1 fill-only workloads.
+`does_of` knows the originating run and step, but keeps a list address. `fill_to` later searches the run list and takes the deferred-list lock again for each chosen fill. Recording then tests each resolved operation at every level. At 256 or more operations, eight workers scan the same operations to find their slot writes.
 
 ## Proposed redesign
 
-Resolve holders and destinations in the original order. For a single level, record directly from `ops`. For multiple levels, group accepted operation indices by level in stable order using contiguous storage, so a long dependency chain does not allocate a list per level. Keep the first-level barrier, one read per staging place and level, and all reads before writes. Handle descriptor updates separately: keep the direct scan for one partition; for eight, append only slot writes to their `(slot_index / 4) % 8` bucket during an existing pass over the resolved ops. Preserve order inside each bucket and skip worker dispatch when there are no slot writes.
+Keep the run ordinal and step index when `does_of` walks the submission. For `take_steps`, use them to clone chosen fill destinations under one short list lock per contributing run, in step order. Release it before resolving shadows or recording commands. Derive the existing list-address identity where `Taken` or the split probe needs it, including duplicate list submissions. Resolve operations in original order. Record a single level directly. For multiple levels, group accepted indices stably in contiguous storage, keeping reads before writes and one read per place per level. Once the accepted count reaches the partition threshold, distribute slot writes in one pass by `(slot_index / 4) % 8`, preserving bucket order. Skip worker dispatch if there are no slot writes.
 
 ## Before and after
 
-For T operations, L levels and P partitions, selection overhead drops from O(TL + TP) tests to O(T + L + P) plus work on emitted entries. It takes O(T) temporary indices, which can be allocated contiguously. Required copies, barriers and descriptor creations still occur.
+For F chosen fills across M submitted runs, locating destinations can cost O(FM) list comparisons today. Direct run indices remove that search and batching reduces F lock acquisitions to one per contributing run. For T emitted operations, L levels and P partitions, stable grouping reduces selection from O(TL + TP) to O(T + L + P) using O(T) temporary entries. Copies, barriers and descriptor writes remain.
 
 ## Expected impact and confidence
 

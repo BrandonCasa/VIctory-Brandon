@@ -6,15 +6,15 @@
 
 ## Current cost
 
-Under the shared line mutex, the worker builds a vector containing one optional fence for *every* queued item. Only then does `landable` (2708–2710) stop at the first incomplete flight. If the first item is unfinished, no other entry influenced the decision. The same suffix can be copied again after a wake. Submitters share the mutex.
+Under the shared line mutex the relay materializes an optional fence for every queued item. `landable` stops at the first unfinished flight. When a nonempty prefix lands, draining the front of `Vec<Late>` also moves the entire surviving suffix. New submissions share this lock.
 
 ## Proposed redesign
 
-Read the completed fence once and inspect the queue in place. Return either the length of the landable prefix or, when that length is zero, the first flight's fence to wait for. Count preceding writes and signals in order even when there is no completed flight. Keep the current drain, in-hand write publication, landing and failure handling, and release the lock before waiting.
+Store the mixed FIFO in `Line` as a `VecDeque<Late>`. Read the completed fence once and walk from the front through ready flights, writes and signals. Wait outside the lock on the first unfinished fence if it is at the head. Otherwise move just the ready prefix into the landing batch and publish `settling`, `in_hand` and the landing writers under the same lock as today. Let `card_steps::writers` accept queue iteration across a wrap. Keep the whole-queue `mem::take` for non-relay settlement.
 
 ## Before and after
 
-For N queued items and K landable items, identifying the prefix costs O(N) time and space today. It needs O(min(N, K + 1)) time and O(1) extra space. Draining the K items still has its original cost. The list limit defaults to 256 lists, but writes and signals are additional line entries.
+For N queued items and K ready items, prefix selection examines at most min(N, K + 1) entries with O(1) scan storage. Removing K entries moves those entries into the landing batch without shifting the N − K survivors. The landing batch still needs O(K) space. The largest saving is a short ready prefix in a deep queue.
 
 ## Expected impact and confidence
 

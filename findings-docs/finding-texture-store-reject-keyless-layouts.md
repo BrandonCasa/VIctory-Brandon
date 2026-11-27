@@ -10,11 +10,13 @@ A single-mip texture can never produce a smaller-mip lookup key. Nor can a textu
 
 ## Proposed redesign
 
-After the store and whole-texture gates, reject a single mip or a size at most `MIN_PREFIX` before building the parts vector. For other layouts, use an iterator shared with `key_levels` to stop at the first qualifying prefix and remember that eligibility only if the staging object is reused. Keep full key enumeration and prefix hashing on the worker. For eligible content, build job parts and clone bytes only after the digest wins the existing seen check. Keyless layouts then leave the seen set available for eligible shapes with identical bytes.
+After the store and whole-texture gates, reject single-mip or too-small layouts immediately. For the remaining shapes, share the existing eligibility rules between the producer, worker and lookup. `Layout::bytes_from(k)` scans the mip suffix for its largest byte extent. Calling it from `read_from` and again for the length at each candidate can make a full eligibility check quadratic in mip count. Factor the extent calculation into the layout code and visit mips from smallest to largest with a running maximum. Apply the same whole-layout, tail, level and prefix-size checks to that value.
+
+The producer stops at its first eligible level, then builds parts and clones bytes only after the digest passes the seen check. The worker enumerates eligible keys in one metadata pass. For `stored_levels`, keep the requested level's existing tail clamp and check just that suffix. Keyless uploads never reserve a blob identity.
 
 ## Before and after
 
-For an ineligible unseen payload, O(B) producer hashing, O(B) copying, O(B) queued storage and a worker wakeup become a metadata check. For repeated ineligible content the existing seen check already avoids the copy, but still hashes. Eligible content retains the existing transfer and persistence costs.
+For an ineligible unseen payload of B bytes and M mips, the producer avoids the store's O(B) hash, payload copy and queued storage. The metadata check takes at most O(M) time and constant scratch. Staging still performs any hash it needs for change detection. Eligible content retains the existing transfer and persistence costs.
 
 ## Expected impact and confidence
 

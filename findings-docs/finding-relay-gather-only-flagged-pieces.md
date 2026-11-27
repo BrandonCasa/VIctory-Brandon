@@ -1,4 +1,4 @@
-# Build relay readback membership from wanted pieces only
+# Compare each declared relay piece once per flight
 
 ## Location and execution path
 
@@ -6,16 +6,18 @@ When completed flights with card-resident write ranges land, `Host::relay_card_b
 
 ## Current cost
 
-A plan declaring P pieces pays for P triples even if only one piece changed. Overlapping ranges can legitimately cover different bytes of one 64 KiB piece. A positive flag in any overlapping range applies to them all, so simply fetching at the first positive flag would lose data.
+`card_before` merges byte ranges by shadow, but two disjoint ranges can still touch the same 64 KiB piece. Each gets a result word and a GPU hash of the whole piece. In a flown plan the ordinary compare also advances the baseline, so a later occurrence can report no change. Landing reconstructs membership across P occurrences so that a changed piece brings back every declared slice of that piece.
 
 ## Proposed redesign
 
-Accumulate a local 64-bit mask for each aligned group of pieces visited within a range. OR only nonzero masks into a per-plan map keyed by (shadow identity, group), so dense runs require one table update per word and widely separated ranges allocate no intervening words. Keep the existing rules for unexamined, missing and suspect pieces. After all ranges have contributed, revisit each non-picked range in order, intersect its bounds with each stored mask and enumerate set bits in ascending order. This preserves overlapping partial ranges, picked-view discovery, per-range counters, exact-byte deduplication across plans and the check for bytes already fetched.
+In `card_before`, keep the exact byte spans for landing and derive comparison runs from their already sorted piece intervals. Reuse the overlap and adjacency rule in `shadow::joined_piece_runs`. For a flown plan whose ordinary pieces all have a baseline and fit under the existing admission check, dispatch each run once and point each span's `at` at its first shared result word. Keep the complete word for torn-read checks. Landing can consult that word and the suspect set while visiting each original slice. Keep picked comparisons separate.
+
+Mixed plans can also drop the flag vector without changing their GPU dispatches. Ordinary spans are disjoint, in byte order and grouped by shadow, so all occurrences of the same piece are consecutive. Look ahead to OR their flags, treating an unchecked occurrence or missing word as wanted, then walk that group again to emit its original slices in order if wanted or suspect. Two cursors into the existing spans suffice even if many slices share one piece. Preserve per-range accounting, exact-byte clipping, cross-flight deduplication, already-fetched checks and the existing skip when the result mapping itself is absent.
 
 ## Before and after
 
-For P candidate occurrences and F unique wanted pieces, the sparse representation needs O(F) membership space instead of O(P + F). Expected lookup and insertion make the two traversals O(P), replacing sorting and per-occurrence binary search. Hash storage can cost more for tiny or dense plans; select the representation according to observed density.
+For P ordinary piece occurrences covering U distinct pieces, a fully compared plan launches U ordinary hash groups and reserves U ordinary result words. Planning adds one linear pass over sorted spans and one descriptor per contiguous run. Landing takes O(P) time for flag membership and O(1) extra membership storage on either path. The fetch list and cross-flight deduplication still scale with the selected slices. With no shared pieces the GPU hashes the same bytes.
 
 ## Expected impact and confidence
 
-Medium to high when large declarations produce sparse changes on the relay. It saves CPU in the gathering phase, with identical GPU transfers. Measure candidate counts, wanted density, gather time and relay completion latency. Overlapping partial ranges with a positive flag in only the later range are a decisive correctness case.
+The GPU saving depends on disjoint declarations sharing pieces. The CPU gather can shrink even when all pieces are distinct. Compare hash groups, result words and landing time. Check two disjoint slices of one piece, picked views, a full result buffer and two flights writing the same piece.

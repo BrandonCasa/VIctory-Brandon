@@ -10,11 +10,13 @@ For each copy, the planner iterates over every earlier operation, checking for c
 
 ## Proposed redesign
 
-Keep the linear all-fill path. Use the existing scan for zero-length steps and when the estimated pair comparisons are cheaper than building an index. For copy-heavy plans, sort and deduplicate just the endpoints of nonempty copy destinations. Each write covers whole cells between those endpoints; a read queries or updates every cell it intersects, including partially covered boundary cells. In original order, query prior writes against each read and write, and prior reads against each write. Then apply range-maximum updates to separate read and write trees. Store level plus one so an untouched cell yields level zero for the current operation. Preserve closure, placed-copy checks and refusals, including zero-length steps.
+Split `plan` at the placed-copy conflict check. `cut_for` only consumes `BEHIND_PLACED` and the offending pair. Run the same dependency closure, early refusals and ordered conflict search, then return from the probe. The real plan still checks CPU readers and assigns levels under the submission lock. Keep the all-fill path and use the pairwise scan for small plans or zero-length steps.
+
+For copy-heavy plans, partition the address space at nonempty copy-destination endpoints. Keep separate read and write range maxima, initially zero. In command order, query prior writes over each read and write, and prior reads over each write. The largest result is the new level. For each touched interval, raise its stored value to the maximum of its old value and the new level plus one. A later independent read can have a lower level than an earlier read of the same cell. Partial reads mark every cell they intersect because every indexed write covers whole cells.
 
 ## Before and after
 
-For T chosen operations with C real copies, current level assignment can make O(TC) comparisons. A compressed range-max implementation with range updates and queries can assign levels in O(T log T) time and O(T) space including endpoint preparation. The 12,288-step and 4 MiB intermediate limits bound applicability. The earlier dependency closure and actual GPU copies retain their costs.
+A no-cut probe that reaches the placed-copy check can omit the remaining validation and scheduling. A real plan of T chosen operations with C nonempty copies can still need O(TC) pair checks. At most 2C endpoints bound the index. Sorting them and using lazy range-maximum updates gives O(T log(C + 1)) level assignment and O(C) extra index space beyond the existing output. Dependency closure and the separate CPU-reader checks keep their current costs.
 
 ## Expected impact and confidence
 

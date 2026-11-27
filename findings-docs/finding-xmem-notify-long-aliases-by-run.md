@@ -10,11 +10,11 @@
 
 ## Proposed redesign
 
-In `shown_at`, resolve consecutive slices of one section as a run, retaining input offsets across missing pages. Under the separate `SHOWN` read lock, intersect each run once with the existing long views and collect short aliases from their page buckets. Clip spans to the written bytes. Release the lock, sort by address and join adjacent spans. If any spans overlap, first split the unmerged spans at their original page boundaries and use the existing sort-and-join rule to preserve the output for repeated pages. Long-view probes then fall from P × L to R × L without adding work on remaps. Keep alias resolution after the physical write.
+Let a DirectStorage fill pass its resolved section runs to `pages_written`, clipped to the notification's byte range. Under the page-table lock, validate the same generation used by the writer. Both page removal and a slice reassignment in `arrange` invalidate the plan. On a miss, resolve the current runs, skipping unknown pages while preserving their positions in the input. Drop that lock, then consult the current `SHOWN` aliases under their own read lock even on a generation hit. Intersect long views once per run and collect short aliases from their page buckets. Release the lock before sorting or notifying. Where alias spans overlap, split them at the original page boundaries before applying the existing sort and adjacency rule.
 
 ## Before and after
 
-For P pages and L long mappings the existing long-view probe count is P × L. With R physical runs, an interval index can approach O(R log L + matches) for long views, in addition to O(P) page resolution and short-alias work. A single long intersection yields one piece before sorting. Index updates cost more when mappings change.
+For P pages across R runs and L long mappings, long-view probes fall from P × L to R × L. A current write plan can also avoid P more physical-page lookups and per-page section reference clones. Short aliases still require page-bucket probes, and overlap can still require sorting page-sized pieces. The mapping writer needs no new long-view index.
 
 ## Expected impact and confidence
 

@@ -1,4 +1,4 @@
-# Pass the existing digest of a stable texture snapshot to the texture store
+# Reuse stable texture digests and hash shared mip prefixes once
 
 ## Location and execution path
 
@@ -10,12 +10,12 @@ The store hashes the same full snapshot again before checking its process-wide s
 
 ## Proposed redesign
 
-Carry the computed digest alongside the stable read buffer through `keep_whole`. Use exactly its current blob component for the seen check and job filename. Keep the current digest path for live guest memory in `refresh_timed` (1371–1384), where a remapping guard alone does not establish byte-for-byte stability across the two reads. Preserve the prefix-key hashing, eligibility checks and owned job payload.
+Pass the stable buffer's digest through `keep_whole` for the seen check and blob name. Keep the store's independent read for live guest bytes. On the worker, walk the eligible levels in reverse. For eligible mips, `Layout::bytes_from` is the maximum byte extent of the remaining mip suffix (`victory-formats/src/texture.rs:607-625`), so this already visits prefix lengths in nondecreasing order. Advance the four digest lanes over complete 64-byte blocks. At each distinct length, finalize a copy with its padded tail and length, including an all-zero tail block at an exact multiple of 64. Reuse that digest for equal lengths and emit keys in the original level order. Keep the ordinary digest for a single prefix.
 
 ## Before and after
 
-For B total eligible bytes on the stable-copy paths, this removes B bytes of hash input, with O(1) additional state. Both versions still detile changed bytes and copy accepted jobs. Unchanged staging content already exits before the store and gains nothing.
+For B eligible stable bytes, the producer removes B bytes of duplicate hashing. Given L eligible prefixes of lengths pᵢ, the worker currently hashes Σ(⌊pᵢ/64⌋ + 1) blocks. The shared pass hashes ⌊max(pᵢ)/64⌋ full blocks plus one tail block per distinct length. Visiting the existing key list takes O(L) time with constant extra hash state. Accepted jobs still copy and retain the tiled payload.
 
 ## Expected impact and confidence
 
-Medium for streaming with the optional store and stable reads, zero when the store is disabled. High confidence that the input and algorithm match on these paths. Measure eligible bytes, refresh-thread hashing time and stored-blob identity under copy-through and remapping workloads.
+The producer saving applies only to stable reads with the optional store enabled. The worker saving depends on how much the qualifying prefixes overlap. Compare blob and mip keys byte-for-byte for duplicate lengths and for lengths just below, at and above a 64-byte boundary.

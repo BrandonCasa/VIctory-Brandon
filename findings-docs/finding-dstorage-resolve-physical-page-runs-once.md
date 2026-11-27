@@ -10,12 +10,14 @@ A known list is validated under the page-table lock, then looked up again to bui
 
 ## Proposed redesign
 
-Resolve the list and validate ownership in one page-table read. Hold a single run inline and allocate extra descriptors only on fragmentation. Record an epoch under that same lock and advance it on physical-page removal: allocation uses fresh IDs, and virtual remaps change only the aliases. Open the single-run window as today. Before a buffered scatter or retry, check the epoch under the table lock and re-resolve the filled prefix if it changed or the earlier lookup failed. Clip both mapping and copying to the prefix; a short inflate must not commit untouched suffix pages. Drop the lock before mapping or writing. Preserve list polling, refills for changed lists, and the separate lookup of current aliases for notifications.
+Resolve page IDs to section runs under the page-table read lock, keeping a single run inline. Record a generation for the page-ID-to-slice mapping. Advance it under the write lock on an actual removal and whenever `arrange` reassigns slice indices (`xmem.rs:1112-1183`). The latter can change a run while every page ID is still owned. Fresh allocations use new IDs.
+
+Before reusing a plan for the direct window, buffered scatter, retry or notification, check that generation under the read lock. Re-resolve stale or unknown pages for the extent that operation needs. Keep the section references alive and release the lock before mapping or copying. For a short inflate, clip both the mapped pages and copied bytes to the filled prefix on scatter. Keep page-list polling and the post-fill reread that can trigger a fresh fill. Direct writes still notify the requested range even on error. Buffered writes notify the filled prefix after the whole scatter succeeds.
 
 ## Before and after
 
-For P pages in R runs, the stable contiguous case can use one O(P) resolution in place of two. A stable fragmented write can avoid a third traversal. O(R) retained run descriptors replace transient copies. Payload bytes and the required final mutable-list check remain.
+For P physical pages in R runs, stable mappings need one O(P) resolution per accepted list version. Direct mapping, buffered scatter and post-write alias discovery can share O(R) descriptors. Each use still validates ownership freshness, and current virtual aliases must be looked up after the write. Page-list rereads and retries on mapping failure remain.
 
 ## Expected impact and confidence
 
-Medium to high during large page-backed streaming loads. The duplicate lookups are explicit, but mapped aliases, copy/decode time and concurrent remaps may dominate. Measure locked page lookups per request, generation misses, lock waits and streaming completion latency.
+Measure locked page lookups per request, generation misses, lock waits and streaming completion latency. Check a slice swap between validation and use, and a short inflate whose unused suffix includes an unknown page. The expected saving is in repeated lookups during page-backed loads.

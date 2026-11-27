@@ -1,4 +1,4 @@
-# Hash translated DXIL without copying each shader into a temporary vector
+# Build pipeline library keys on demand from borrowed DXIL
 
 ## Location and execution path
 
@@ -10,11 +10,11 @@ Every nonempty shader passed through this helper causes an allocation and a full
 
 ## Proposed redesign
 
-Derive both the driver bytecode descriptor and the name input from the translated shader's owned slice. Supply an empty slice for a missing stage and borrow the generated geometry shader for the duration of the hash. Retain the identical sequence of stage bytes, length prefixes, pipeline kind, root blob and state text so warm caches still hit. No pointer-derived slice with an unconstrained lifetime is needed.
+Give `library::pipeline` a lazy name builder and pass it through the compute, graphics and stream helpers. Resolve `library()` before building or widening the name. Return the serializer's owning blob from `root_signature` and borrow its bytes for creation and naming, eliminating `bytes.to_vec()`. Hash slices borrowed from the translated shaders and optional rectangle geometry shader. Preserve the kind, root bytes, stage order, empty stages, length prefixes and state text. Build `g.describe()` on first key use and reuse it if the driver rejects the rectangle variant. The fallback still gets its distinct graphics key.
 
 ## Before and after
 
-For S nonempty stages totaling B bytecode bytes per name, both paths hash B bytes. The change eliminates S temporary allocations and B bytes copied. Peak temporary bytecode falls from O(B) to O(1) for the bounded number of stage references.
+Without a library, creation needs no key hash, key-specific state formatting or UTF-16 name. With a library, S nonempty stages totaling B bytes still contribute B bytes to each hash, but the S temporary vectors and B copied bytes disappear. Driver creation and cache identity follow the same paths.
 
 ## Expected impact and confidence
 

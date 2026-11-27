@@ -10,7 +10,7 @@ Every qualifying recording allocates footprint and row vectors, asks the device 
 
 ## Proposed redesign
 
-Share immutable footprints, row counts and padded size in a bounded, per-device cache keyed by the complete host description. Have each recorded `Back` own one exclusive buffer lease until its deferred recording is reset or dropped after all flights and landings. Landing alone cannot release it because the list may replay. Reuse idle buffers of the required size, cap retained idle bytes, and allocate on a miss without waiting for a busy lease. Perform driver allocation and release outside the pool lock. Keep tickets and title layouts per target.
+Share immutable host footprints, row counts and the padded extent in a bounded per-device cache keyed by the complete host description. On the guest side, `title_texture` owns the freshly computed `Texture`. Move its sole plane's layout into the target after the existing single-plane check, avoiding a deep clone just before the temporary dies. Keep the allocation address and invalidation ticket specific to each target. Lease one exclusive readback buffer of the required size to each recording until reset or drop after all flights and landings. A list can replay after landing. Cap idle bytes, allocate on a miss without waiting for a busy lease, and perform driver allocation and release outside the pool lock.
 
 ## Before and after
 

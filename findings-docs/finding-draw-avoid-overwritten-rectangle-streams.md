@@ -10,12 +10,14 @@ For each stream replaced on this path, the normal IA view has no draw consumer. 
 
 ## Proposed redesign
 
-For direct CPU-expanded rectangles, use the pipeline already resolved in `prepare_for` and a per-pipeline mask of slots with any per-vertex element. Populate one final IA view array: expand those slots into scratch and prepare instance-only slots normally. This preserves the existing whole-slot replacement on mixed layouts and avoids a second layout scan just to choose the path. Keep the expansion’s bounds and shadow checks, scratch lifetime, and `defer_host_read` of the used guest bytes at the existing submission-order boundary. Bind the completed array once on success and drop the draw on failure. Ordinary, indexed, indirect and geometry-stage draws keep their current preparation.
+Have the pipeline own the expansion layout. When `GraphicsState::elements` resolves appended offsets, include instance elements in offset progression and record per-vertex slots in a mask. Group their `(offset, format)` pairs in declaration order once for CPU expansion, using shared ownership so deferred reads outlive draw recording. The indirect check can use the same mask. For direct CPU rectangles, prepare one final IA array from the resolved pipeline. Expand each marked slot, including mixed slots, and prepare instance-only slots normally. Preserve bounds and shadow checks, scratch lifetime and submission-time guest reads. Keep the layout available when rectangle topology is selected dynamically.
+
+Make the deferred CPU read's dependency explicit before dropping its ordinary refresh. `blocked_by` skips `Step::Host`, `stale_under_flights` examines only refreshes, and `card_steps::does_of` marks a ranged host read as unblocked. At submission, check the exact bytes the expansion will read against outstanding flight writes in both the wait decision and the card-step planner. An overlap must wait for those bytes to land even if unrelated fills can run on the GPU. Retain the existing placed-copy reader check.
 
 ## Before and after
 
-For R replaced streams the ordinary shadow lookups, refresh registrations and overwritten binding work can be removed for those streams. Physical bytes avoided range from zero on an existing refresh to the affected dirty shadow ranges. Scratch generation and the required guest reads remain proportional to expanded vertices.
+Today `rectangles` filters E input elements for each of 32 slots and builds a vector for each replaced stream on every fallback draw. Grouping once moves this layout work to the pipeline and allows each deferred read to share its slot's elements. For R replaced streams, the draw also avoids R ordinary shadow lookups and refresh registrations. Avoided transfer bytes depend on dirty ranges and other list uses. Scratch and expansion still scale with the vertices drawn.
 
 ## Expected impact and confidence
 
-Medium to high on titles exercising the fallback with large declared vertex buffers. The overwrite is explicit; successful geometry-stage pipelines receive no benefit. Count fallback draws, replaced streams, otherwise unique refresh bytes and submission CPU before estimating frame-time gains.
+Measure fallback draws, otherwise unique refresh bytes and time spent waiting for overlapping writers. Check expanded vertex contents when a prior flight writes the source, and check that a disjoint declared write adds no wait for that read. Successful geometry-stage draws see no saving.
