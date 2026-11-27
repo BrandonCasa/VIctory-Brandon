@@ -1,0 +1,7 @@
+interface:
+  display_name: "Verify GPU Synchronization"
+  short_description: "Check GPU ordering and resource reuse"
+  default_prompt: "Use $verify-gpu-synchronization to check whether this upload buffer can be reused safely."
+
+policy:
+  allow_implicit_invocation: true
