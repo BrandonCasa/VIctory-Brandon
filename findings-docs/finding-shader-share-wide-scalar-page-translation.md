@@ -10,7 +10,7 @@ Each chunk emits page-index arithmetic, a clamped directory load, a conditional 
 
 ## Proposed redesign
 
-Prove page containment from known alignment when possible. Otherwise specialize on a uniform same-page check only if the added branch pays off. Translate the effective base once and increment its byte offset for later chunks. Use the original lowering for crossings or address wrap. Preserve register results, coherent handles, clamp and missing-page behavior; coalesce identical fault-slot writes only when equivalent under the fault-reporting protocol.
+Reuse the first chunk’s lookup for x8/x16 only when the effective address, including both offsets and carry, is statically known to keep the 32/64-byte span in one 64 KiB page. Sufficient alignment of the final address proves this even when the page number is unknown. Emit the original vector payload loads and advance only the translated byte offset. Keep the clamped page number, null/coherent handle and missing-page reporting semantics. The host reads and clears hashed fault slots asynchronously, so retain the original fault stores if coalescing them would change reporting. Leave unresolved addresses on the current lowering, avoiding a runtime branch, duplicate shader paths and result merges.
 
 ## Before and after
 

@@ -10,7 +10,7 @@ Codebooks are shared already. Searching their sorted left-aligned codes still co
 
 ## Proposed redesign
 
-Build a fixed-width first-level lookup as each `Vlc` is initialized. A prefix whose completions all resolve to the same short code stores its symbol and exact consumed length; ambiguous prefixes retain the original full-width lookup. Preserve `peek32` zero padding, position advancement and eventual overread/error behavior on truncated input. Validate every code's prefix boundaries against the existing decoder.
+Build a shared 8-bit prefix table as each `Vlc` is initialized. Pack each entry into four bytes (7 KiB across the seven codebooks). A resolved entry holds the signed symbol and consumed length. For an ambiguous prefix, store the first and last candidate indices from the existing search at the prefix's two extremes. Read `peek32` once and search only that slice on a miss. Advance by the decoded length in both paths, preserving zero padding and overread behavior. Check each code boundary against the existing lookup.
 
 ## Before and after
 

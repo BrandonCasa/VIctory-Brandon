@@ -10,7 +10,7 @@ For L levels, even an operation known to belong to just one level is tested L ti
 
 ## Proposed redesign
 
-After resolving operations in their existing order, build stable per-level index lists and append each slot operation to its existing `(slot_index / 4) % partitions` bucket. Use those buckets for recording and worker dispatch. Retain first-level barriers, all reads before writes within each level, one read per staging place/level, and ordering for repeated writes to a slot. Keep the tiny-plan single-pass variant where cheaper.
+Resolve holders and destinations in the original order. For a single level, record directly from `ops`. For multiple levels, group accepted operation indices by level in stable order using contiguous storage, so a long dependency chain does not allocate a list per level. Keep the first-level barrier, one read per staging place and level, and all reads before writes. Handle descriptor updates separately: keep the direct scan for one partition; for eight, append only slot writes to their `(slot_index / 4) % 8` bucket during an existing pass over the resolved ops. Preserve order inside each bucket and skip worker dispatch when there are no slot writes.
 
 ## Before and after
 

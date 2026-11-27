@@ -10,7 +10,7 @@ The dense vector extends to the highest retained slot index, including holes. A 
 
 ## Proposed redesign
 
-Update span contributions when a slot changes. A simple bounded option is to maintain a summary per periodic partition and rebuild only partitions touched by writes or revalidation, then merge their per-shadow summaries. For heaps with scattered changes, maintain counted per-shadow endpoints instead. Remove an old contribution when its slot becomes empty or points elsewhere, so extrema can shrink. Preserve `Arc` identity/lifetime, first-pass rebuilding, periodic stale-view detection, optional unordered-view reporting, and unwatched-frame policy. If refresh coverage is later tracked as disjoint intervals, maintain their union per shadow and let the output cost scale with its interval count. Emit a refresh for every active shadow that currently qualifies, even if its view span is unchanged.
+For large alias-heavy heaps, cache one summary per existing sweep partition. Rebuild the scheduled partition from its resolved slots, including slots that disappeared. In the other partitions compare each write with its retained shadow and endpoints; mark a partition dirty only on an actual change and rebuild it once after all writes. Merge the 16 summaries into reusable output storage, retaining live `Arc`s and emitting every refresh due under the unwatched-frame policy. Keep the direct fold for small heaps. Counted endpoints are worthwhile only if scattered changes routinely force most partitions to rebuild. Preserve full-pass rebuilding and the existing UAV reports. If sparse refreshes are supported, retain their runs within each partition; taking extrema here would discard the holes before submission.
 
 ## Before and after
 

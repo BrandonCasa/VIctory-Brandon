@@ -10,7 +10,7 @@ Two adjacent indexed draws with the same resolved streams and index buffer still
 
 ## Proposed redesign
 
-Keep the last emitted host vertex view per slot and index view per recording. Compare resolved GPU address, size and stride or format after the existing shadow lookup and refresh. Emit only changed bindings, including newly empty slots within the supplied range. Apply the same tracking to direct IA calls or invalidate it there, especially the expanded rectangle streams at 3793–3849. Invalidate on list reset and replay into a fresh host list (1018, 1252). Preserve slots outside a partial update and the current failure on an unresolved index view.
+Keep the last emitted vertex views and index view on the recording. Continue resolving and registering every shadow refresh, then compare the supplied vertex prefix by address, size and stride, including zero views. Skip an equal prefix; on a mismatch issue one call for the prefix and update the cache, preserving slots outside it. This caps the changing-stream path at its current one vertex call. Handle the index view independently, including its format and unresolved-view failure. Track or invalidate only the slots overwritten by rectangle expansion, even if expansion later fails. Mark the cache unknown on list reset or replay into a fresh list.
 
 ## Before and after
 

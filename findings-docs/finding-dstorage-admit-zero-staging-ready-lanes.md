@@ -10,7 +10,7 @@ When the winning head exceeds the available staging allowance, `start` returns n
 
 ## Proposed redesign
 
-On staging refusal, reserve the blocked head's next opportunity for staged work and select the highest-ranked eligible zero-staging head from another lane. Preserve FIFO inside each lane, normal virtual-time accounting for actual starts, the oversized-alone exception and completion sequencing. Intentional change: eligible work on an independent lane may start earlier. Keep per-lane head order even if a later raw read could fit.
+Keep the usual winner when it fits, including any head with `staging_bytes == 0` even during an oversized request. Only when a positive reservation is refused, consider other lane heads with zero charge using the same class, lane and sequence tie-breaks. Charge the actual start, but derive the arrival-time baselines from the minimum clocks of waiting classes and lanes so bypassing a blocked head cannot inflate those baselines. Reconsider the normal winner on every start. Wake capacity waiters when staged bytes are released or the limit increases, rather than on every zero-byte completion.
 
 ## Before and after
 

@@ -10,7 +10,7 @@ A plan declaring P pieces pays for P triples even if only one piece changed. Ove
 
 ## Proposed redesign
 
-In the first phase insert only wanted (shadow, piece) pairs directly into per-plan membership. A sparse set suits low flag density; grouped bitsets suit dense ranges. Then run the existing range-order pass against that membership. Preserve the forced fetch for unexamined/missing results, suspect-piece policy, picked-view discovery, cross-plan deduplication of exact byte intervals, and the check for bytes already fetched. The iteration order for output continues to come from the original ranges.
+Accumulate a local 64-bit mask for each aligned group of pieces visited within a range. OR only nonzero masks into a per-plan map keyed by (shadow identity, group), so dense runs require one table update per word and widely separated ranges allocate no intervening words. Keep the existing rules for unexamined, missing and suspect pieces. After all ranges have contributed, revisit each non-picked range in order, intersect its bounds with each stored mask and enumerate set bits in ascending order. This preserves overlapping partial ranges, picked-view discovery, per-range counters, exact-byte deduplication across plans and the check for bytes already fetched.
 
 ## Before and after
 

@@ -10,7 +10,7 @@ After freshness checks select a page, a full update calls `copy_mapped` sixteen 
 
 ## Proposed redesign
 
-Give the locked memory worker reusable page-sized scratch. Read the selected title span once via `copy_mapped`, then retain the existing per-piece merge, notification and whole-resend logic over the scratch. Use the helper's existing zero-fill and sparse fallback for inaccessible source bytes. Check behavior on remaps and keep per-frame/watch gating.
+On the first `bring` for a page, `merge(..., never = true)` overwrites the entire arena page. Use `copy_mapped` directly into that arena page with `title_dst = false`, count the full page as changed, and keep the full resend. Preserve the diagnostic no-copy behavior separately. For later merges and `take`, the default safe-copy path uses `rep movsb`, and a 4 KiB scratch is immediately reused; fewer calls alone do not justify a 64 KiB scratch there. Target bulk scratch reads first at multi-piece spans using the `ReadProcessMemory` backend. Read exactly the selected span into reusable scratch, retain the current piece boundaries for comparisons and watch notifications, and preserve sparse zero-fill and whole-resend behavior.
 
 ## Before and after
 

@@ -10,7 +10,7 @@ Each composed frame performs three driver descriptor creations. The two source d
 
 ## Proposed redesign
 
-Keep the last resource identity and format for each of the slot's two SRVs, updating only changed entries after fence-safe reuse. Use lifetime-safe identity to handle resource destruction and pointer reuse. Allocate persistent RTV slots per swap-chain buffer, invalidating them and releasing resource references before resize/recreation. Preserve the transient RTV ring for other callers.
+Carry each source’s `HostTexture::serial` and view format with the resource from both present paths. Compare these two scalar keys in the selected presenter slot after its fence completes (slot zero for synchronous presents). Recreate only changed SRVs, preserving the existing command-list lifetime holds. This avoids both pointer-reuse errors and pinning large textures in idle cache slots. On first composition allocate one private CPU RTV heap indexed by swap-chain buffer. Populate each RTV on first use and invalidate all entries on every successful resize, including size-only changes. Keep the existing RTV ring available if the private heap cannot be allocated.
 
 ## Before and after
 

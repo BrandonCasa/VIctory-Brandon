@@ -10,7 +10,7 @@ N outstanding delays create N timer threads and N stack reservations. Terminatin
 
 ## Proposed redesign
 
-Put positive delays on a process-wide deadline queue serviced by one timer thread. Wake it when an earlier deadline arrives. Retain the owning queue while the callback is live and use the existing queue-local claim-by-ID protocol for cancellation versus delivery. Hand due deliveries to runnable workers. Immediate-port callbacks and monitors can block or re-enter, so they must run outside the timer lock and must not delay unrelated expirations. Keep zero-delay delivery, port semantics and queue termination order.
+Start one timer on the first positive delay. Key timers by monotonic deadline and submission ID, retaining the queue until expiry or cancellation. Record the deadline beside the queue-local task so termination can unlink timers directly and cancel in submission order. Publish both records under the queue lock with its termination recheck. Wake the timer when the earliest deadline changes and release its lock before taking queue locks. For a non-immediate port with no monitors, hold the monitor lock across the claim by ID and port submission to avoid a second dispatch. For other expirations, let reusable workers claim by ID and call the existing `deliver`, preserving monitor order and allowing blocking callbacks to run concurrently. Retire excess idle workers after bursts. Leave zero-delay delivery direct.
 
 ## Before and after
 

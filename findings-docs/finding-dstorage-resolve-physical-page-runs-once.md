@@ -10,7 +10,7 @@ A known list is validated under the page-table lock, then looked up again to bui
 
 ## Proposed redesign
 
-Return owned section runs and a mapping generation from the successful validation attempt. Use them to choose the single-window path or write buffered output over the same runs. If mappings changed during decode, resolve again at the point the existing writer would. Bound the scatter to the actual filled prefix. Preserve page-list rereads and up to three changing destinations, unknown-page retries and notification using current visible aliases (`xmem.rs:957–966`).
+Resolve the list and validate ownership in one page-table read. Hold a single run inline and allocate extra descriptors only on fragmentation. Record an epoch under that same lock and advance it on physical-page removal: allocation uses fresh IDs, and virtual remaps change only the aliases. Open the single-run window as today. Before a buffered scatter or retry, check the epoch under the table lock and re-resolve the filled prefix if it changed or the earlier lookup failed. Clip both mapping and copying to the prefix; a short inflate must not commit untouched suffix pages. Drop the lock before mapping or writing. Preserve list polling, refills for changed lists, and the separate lookup of current aliases for notifications.
 
 ## Before and after
 

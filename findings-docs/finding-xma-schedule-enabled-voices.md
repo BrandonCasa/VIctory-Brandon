@@ -10,7 +10,7 @@ Every pass takes the XMA read guard and visits and locks every allocated slot ju
 
 ## Proposed redesign
 
-Maintain a compact set of enabled indices as part of the context array. Update membership together with the slot on enable/disable, including bulk commands. Have the worker snapshot membership, release the membership lock, then check each slot under its existing voice lock. Keep the array read guard while using indices. Publish membership before waking the worker and use a wake token or predicate so an enable racing the transition to idle is observed. When the set is empty, park until signaled. Clear membership with the array on release.
+Keep an ordered set of enabled indices with the context array. Change membership under the voice lock only when a slot crosses between enabled and disabled. Give the worker a reusable index vector and mark it stale on membership changes or array replacement. Refresh it under the membership lock, then release that lock before locking and rechecking each listed slot. Hold the array read guard only through the pass. Park indefinitely after an empty snapshot and retain the 2 ms poll otherwise. Publish enables before the existing `unpark` so a racing enable leaves a wake token. Only an enabled voice needs a read-advance wake.
 
 ## Before and after
 

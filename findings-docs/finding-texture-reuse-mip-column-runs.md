@@ -10,7 +10,7 @@ On each non-linear invocation, the converter walks every x coordinate, discovers
 
 ## Proposed redesign
 
-Lazily build a mip's column-run list and common chunk size in an object that owns an immutable layout for a staging or readback batch. Pass the plan into the shared walker on repeated calls. Keep the unprepared single-call interface for other consumers. Public `Layout` and `Mip` fields can be mutated (139–181), so a plan must correspond to the exact layout used. Keep pitch and extent validation, per-row alignment checks, the last partial run, mip-tail offsets and the linear row-copy path.
+For a non-linear array conversion, build each selected mip's runs and common chunk size on its first slice and reuse them across subsequent slices in footprint order. Keep plans scoped to the batch and borrowed from its exact immutable layout. Retain plans across refreshes only for staging objects that actually repeat the conversion, with a byte limit on retained runs. Single-use, single-slice conversions and linear layouts need no cache. Keep per-call pitch and extent checks, per-row alignment, the last partial run and mip-tail offsets in the shared walker.
 
 ## Before and after
 

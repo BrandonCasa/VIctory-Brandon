@@ -10,7 +10,7 @@ The ahead planner writes one `Touch` for every visited step, including `Nothing`
 
 ## Proposed redesign
 
-Expose incremental reducers that accept each event as the recorder walks a list. For ahead planning, preserve its stop at untaken copies, runs and placed operations; preserve exactly how a write before the first refresh is treated. For front planning, handle each part boundary, order of first touches and texture-due collection. Hold only one list mutex at a time, stage the resulting ownership references, then release locks before updating shadows. The separate parallel `list_front` already streams its per-list events (8109–8131).
+Fold steps during submission. In `refresh_ahead`, keep one map entry per refreshed shadow with its owning reference, span and written flag. Ignore writes before its first refresh, freeze the span on the next write, and stop the entire walk at the first untaken copy, run or placed operation. Move the flagged entries into the work list. In sequential `refresh_front`, feed the existing first-touch order, part-generation and last-shadow logic directly from the loop, retaining texture-due collection in place. Keep one list lock at a time and do shadow updates after releasing it. The parallel `list_front` path already folds its events.
 
 ## Before and after
 

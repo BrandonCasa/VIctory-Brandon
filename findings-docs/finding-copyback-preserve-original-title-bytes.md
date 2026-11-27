@@ -10,7 +10,7 @@ The merge already has the original title data and writes the merged bytes into t
 
 ## Proposed redesign
 
-Leave the read scratch unchanged. While merging, write the result into the host interval as today and accumulate a boolean indicating any change from the title. Pass the original scratch and merged host interval directly to `put_changed`; if reading that host mapping a second time is expensive, use reusable, cacheable merged scratch. Preserve host updates even when no guest write is needed, the first/last-difference trimming and the title-wins rule for concurrent changes. Keep the exact dword writes, safecopy retry behavior and optional whole-write behavior in the existing writer.
+Keep the title bytes from the trimmed read in reusable scratch. After a successful read, merge into the host interval with the existing branchless title-wins rule and OR-reduce `merged ^ original` in the same pass. Always update the host, even when the reduction is zero. For a nonzero result, pass the original scratch and merged interval directly to `put_changed` on ordinary write-back system memory. For a `Shadow::mapped` GPU-upload window, also emit the merged bytes into reusable CPU scratch during the merge so the writer and its retries never reread the mapping across the bus. Reuse scratch across pieces and leave dword selection, retries and whole-write mode to the existing writer.
 
 ## Before and after
 

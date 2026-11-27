@@ -10,7 +10,7 @@ A write confined to a small mip or one array layer incurs CPU reads, detiling, s
 
 ## Proposed redesign
 
-On the reliable write-watch branch, map newly dirty pages to a conservative set of mip/slice storage extents derived from the actual layout. Read and detile those subresources, accumulate pending dirty footprints across refreshes, and claim their set for the exact prelude that submits them. The converter must support reads from the selected source extents without silently zeroing adjacent data. Include every mip sharing a tail block or a dirty page and every relevant slab of a 3D mip. Preserve full initialization on first use, host-copy replacement, forgotten state and changed tile residency, including zero/prefill behavior. Keep the alias-detection hash fallback for guarded memory whose writes may bypass the guard (1257–1304).
+Start with initialized, repeatedly refreshed 2D textures and arrays on the reliable write-watch path. Intersect newer absolute pages with the actual mip/slice storage intervals, including all users of a shared tail. Coalesce adjacent source reads and detile from checked, offset-aware slices into existing staging footprints. Use the full path for scattered or near-full coverage, 3D, on-demand residency, missing baselines and guarded memory. Merge pending footprints across refreshes and claim them for the submitting prelude. Skip a GPU copy only when that host copy still holds this staging object's last upload for the omitted footprints. Another staging object or GPU writer can invalidate that assumption even with the same host serial. Otherwise retain the full GPU upload, including first-use barriers and prefill.
 
 ## Before and after
 

@@ -10,7 +10,7 @@ Two pipelines with identical shaders and stage visibility but different raster, 
 
 ## Proposed redesign
 
-Cache the successful root signature, serialized blob and immutable binding layout per host device, keyed before serialization by the ordered, lifetime-safe identities of translated stages, visibility, compute/graphics flags and binding options. Use the cached parameter numbering when constructing each pipeline's stage bindings. Keep graphics state, PSO creation, rectangle geometry fallback and per-shader metadata distinct. Preserve device-specific sampler capability and exact blob bytes for library naming. Publish successful entries without holding a global cache lock across driver calls or leaving waiters stranded on worker failure.
+Key a bounded per-device cache by the ordered identities of the interned `Shader` objects, stage visibility and compute/graphics mode. Binding mode is fixed for the process. Read the static-sampler capability once per device. On a hit, share the root signature and immutable `Stage` array and borrow the original serialized bytes for PSO naming. This avoids hashing DXIL or copying binding vectors on a hit. Build misses outside the cache lock and publish only completed entries, accepting duplicate concurrent builds so a lost worker cannot strand another. Eviction releases the cache’s references while live PSOs keep their root and stages. Keep graphics state and rectangle fallback in the individual PSO.
 
 ## Before and after
 

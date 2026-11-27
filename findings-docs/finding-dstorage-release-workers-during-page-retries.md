@@ -10,7 +10,7 @@ A sleeping request keeps its worker. Several unavailable destinations can occupy
 
 ## Proposed redesign
 
-Represent these two waits as delayed request states. Keep the original destination-list address and deadline for the pre-fill wait, and retain the decoded prefix for a physical-write retry. Requeue a continuation at its deadline or on a relevant mapping change. Preserve retry limits, staging reservation, running-sequence membership, queue-close lifetime protection and status/notification ordering. Bound retained output bytes to avoid turning released workers into unbounded pending allocations.
+Keep the ready path synchronous. On a retry, park the job until its next poll or backoff using a scheduler deadline and a timed condition-variable wait. Page-list polling must reread the guest list until the original deadline, then use its last contents. A failed scatter retries the same page IDs and filled prefix without rereading or decoding. Keep any source or intermediate needed to refill a changed list independently of worker scratch. Cap parked jobs and their total owned allocation capacity, including zero-staging memory requests; fall back to the current in-worker retry when full. Keep the original staging charge and running sequence until final notification and completion, so queue close still waits.
 
 ## Before and after
 

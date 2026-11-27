@@ -10,7 +10,7 @@ One ordinary job can wake every idle compiler worker. Each awakened worker reacq
 
 ## Proposed redesign
 
-Keep the existing priority queues and claim state. Give ordinary and screen-only waiters distinct wake channels under the queue mutex, with idle counts. Signal one eligible idle ordinary worker for ordinary work. For screen work, prefer an idle screen worker and otherwise wake an ordinary one. On release of slow capacity, worker replacement or promotion, notify according to the newly runnable jobs and worker classes. The job remains discoverable to an arriving worker even if no one was waiting. Leave draw completion and frame wait budgets on their existing protocol.
+Use separate condition variables for ordinary and screen-only workers under the existing queue mutex. Signal an ordinary sleeper for newly eligible ordinary work. For screen work, prefer a screen-only sleeper that has not already been signaled, then an ordinary sleeper. Account for outstanding signals under the mutex so a burst can wake additional eligible workers before the first has reacquired the lock. Keep the existing priority/claim loop on wake and on worker entry. When a slow slot is released on completion or in `lost`, signal one ordinary sleeper if slow work is pending. A capped slow enqueue alone needs no wake. Leave `DONE` and frame wait budgets unchanged.
 
 ## Before and after
 

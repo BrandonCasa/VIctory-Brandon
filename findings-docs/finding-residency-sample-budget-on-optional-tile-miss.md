@@ -10,7 +10,7 @@ The budget argument is evaluated even when every named level is backed or the on
 
 ## Proposed redesign
 
-Check missing optional grants including the shared packed tail before sampling. Use fixed-limit accounting directly where configured. Keep the latest residency state authoritative at grant time and avoid holding the tile lock across driver calls. Preserve held/shown changes, mandatory card-write grants, failure retries and independent budget telemetry. Skipped upload-triggered samples change the timing of budget-change diagnostics.
+Use the existing filled-byte accounting directly for a fixed limit. In automatic mode inspect the missing standard levels and shared packed tail under `given`. A missing tail needed by a card-written level is mandatory as a group. If no grant depends on budget, finish the held/shown update and mandatory grants under the same lock. Only for an optional miss, unlock to evaluate `room(video_memory())`, including its pool accounting. Reacquire `given` and recompute grants from current state before publishing this upload’s held mask and applying the sampled decision. Preserve retries and independent telemetry. The all-backed path takes the tile lock once.
 
 ## Before and after
 

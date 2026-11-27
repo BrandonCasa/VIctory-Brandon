@@ -10,7 +10,7 @@ Two small views can expose opposite ends of a large unwatched shadow. Under the 
 
 ## Proposed redesign
 
-Carry a union of read intervals per shadow through heap recording, deferred batching, write boundaries and the ahead-of-time freshness test. Merge adjoining intervals and optionally tiny gaps where a second copy costs more. Include independently declared table reads, direct root reads to the end of a buffer (`draw.rs:2002`) and whole-buffer by-address reads (`memory.rs:744–752`). A new request in an earlier hole must trigger a refresh, including when the optional multi-frame interval is enabled. Retain pending GPU-write exclusions.
+For known unwatched, non-placed shadows, keep a single span inline and split only across large gaps. Bound the run count by coalescing small gaps or copying the enclosing span when fragmented. Carry those same runs through deferred, front and ahead-of-write planning. Union them with table, root and whole-buffer by-address reads within each existing write boundary. Refresh all runs of one shadow on one worker, excluding pending GPU writes. The ahead map must test scheduled coverage. When the multi-frame throttle encounters a newly requested hole, schedule the current union before advancing its single refresh timestamp. Keep the enclosing-span path for watched and placed shadows.
 
 ## Before and after
 

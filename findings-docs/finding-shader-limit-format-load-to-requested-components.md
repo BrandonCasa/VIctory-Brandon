@@ -10,7 +10,7 @@ A one-channel instruction on a four-word format emits a four-word raw load mask.
 
 ## Proposed redesign
 
-Compute the bit extent of the requested component prefix. Request the covering dwords and generate conversions for only that prefix. Keep the original element addressing, sub-dword alignment, conversion rules, channel defaults and d16 packing. Verify resource-end and partially out-of-bounds behavior for each narrower mask before enabling it there.
+Decode and convert only the first `min(channels, bits.len())` fields, then apply the existing zero/one defaults and d16 packing. Choose the byte/half alignment path from the full element width, even when only an eight- or sixteen-bit prefix is wanted. For a dword-aligned element, the required mask covers the prefix bit count rounded up to whole dwords. Narrow it only where the raw view returns the same requested values at the resource boundary. Else retain the full mask and extract only the needed words. Make this decision while lowering so it adds no per-lane bounds test.
 
 ## Before and after
 

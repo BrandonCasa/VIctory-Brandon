@@ -10,7 +10,7 @@ A list rich in copies, refreshes or CPU callbacks but with few shader writes sti
 
 ## Proposed redesign
 
-Maintain a compact list-level summary of distinct (shadow identity, address, length) declarations in first-occurrence order over the lifetime of the recording. Publish it with the sealed list and merge summaries for the submission. Keep the ordered GPU-write steps in place for snapshot and refresh behavior. Use the summary for pre-submit join decisions as well. Cover resets, split recordings, repeated references to a list, and submissions combining several lists; retain cross-list deduplication and the shadow lifetime.
+Reuse the lookup already paid by `defer_gpu_write`. Map each (shadow identity, address, length) to its last title-write generation and append a declaration to an ordered summary only on first insertion. Advance the generation where `title_written` currently clears `gpu_written`. Emit the ordered step on the first declaration in each generation, or on every call with `VICTORY_DECLARE_ONCE=0`. Reset both structures with `Deferred`. Merge the summaries in run order for `declared_writes` and `joinable`, retaining submission-wide deduplication and shadow ownership. This avoids an additional recording-time hash lookup or a close-time scan, while retaining keys across title writes costs space proportional to distinct declarations in the whole recording.
 
 ## Before and after
 

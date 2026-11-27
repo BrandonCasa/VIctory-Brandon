@@ -10,7 +10,7 @@ File payloads and combined-codec intermediates are both discarded at job complet
 
 ## Proposed redesign
 
-Give each worker bounded reusable source and intermediate scratch, borrowing separate live slices while both stages need them. Reuse initialized capacity without clearing the portion guaranteed to be overwritten. Expose the source only after an exact successful read and pass only the initialized byte count returned by inflate. Preserve retry offsets, short output, errors, and the input-borrowing and direct-to-destination paths. Discard oversized allocations or enforce a shared retained-byte budget across workers.
+Give each worker separate, lazily allocated file-input and inflate buffers. Keep their initialized lengths at the retained high-water marks, grow only the missing tails and lend slices of the exact requested lengths. Decode file input only after `read_into` succeeds and pass only the prefix `inflate` returns. Divide a total retention allowance across workers and count both buffers' capacities against each share. Use a request-local allocation for an oversized buffer so one outlier cannot displace the usual scratch or inflate idle RSS. Borrow memory inputs and keep raw reads direct. A suspended request must own any bytes it still needs before another job reuses that worker.
 
 ## Before and after
 

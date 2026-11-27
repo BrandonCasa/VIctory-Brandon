@@ -10,7 +10,7 @@ Each recorded texture is cloned into a scratch vector before the refresh result 
 
 ## Proposed redesign
 
-Keep an immutable list of texture-step indices with the sealed recording. After `batch.refresh_textures()` borrow those records in original order, claim each with `finish_refresh` and clone only successful claims for the prelude. Tie the index view to the recording generation and rebuild on reset. Keep locks released during provider refresh and prelude execution. Continue to register due staging and honor intervening title writes in their existing order.
+Store each `PreludeUpload` once in an ordered, recording-owned vector and put its vector index in `Step::Texture`. A refresh inserted by `take_coming` then cannot invalidate an index. Share the nonempty vector as a unit once the list closes. Use its entries for the existing ordered staging checks and refreshes around title writes. After the final `batch.refresh_textures()`, walk the vector outside the list mutex, call `finish_refresh` in order and clone only successful claims. This keeps descriptor and residency callbacks out of the list lock and needs neither a close-time scan nor a per-submit vector of candidates. Reset drops the recording's ownership.
 
 ## Before and after
 

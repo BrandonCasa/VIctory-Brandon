@@ -10,7 +10,7 @@ Adding a flight sorts and recopies the existing union even if the flight contrib
 
 ## Proposed redesign
 
-First bypass empty additions. Maintain list totals and reference-counted interval coverage from each flight's contributed ranges. Remove only the completed contributions when current landing visibility ends, after readbacks, writes and signals. Serialize updates with new enqueues and retain the existing `settling`, `in_hand` and `landing` protection. An address must remain hazardous until its last contributor leaves.
+Keep the sorted union that `touches`, `late_blocked` and submission snapshots already consume. Skip empty additions and ranges wholly covered by an existing interval before sorting or copying the union. Count each flight's `order.len().max(1)` and whether it contributes any nonempty shader or texture range. After readbacks, writes and signals finish, subtract the landed counts under the line lock. Keep the union if no writer landed, clear it if no writer survives, and rebuild from surviving flights only for a mixed removal. This includes enqueues during landing and preserves `settling`, `in_hand`, `landing` and the non-relay full drain. Consider a counted interval index only if those mixed rebuilds dominate after accounting for fragmented overlaps and the cost of supplying sorted snapshots to readers.
 
 ## Before and after
 

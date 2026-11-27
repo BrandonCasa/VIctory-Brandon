@@ -10,7 +10,7 @@ A single-mip texture can never produce a smaller-mip lookup key. Nor can a textu
 
 ## Proposed redesign
 
-Check the cheap size and mip-count exclusions before building footprints. Determine and cache qualifying levels from immutable shape/layout metadata when the staging object first needs the store. Enqueue only eligible jobs and pass their levels to the worker. Preserve the prefix-addressability, minimum-length and strict-size rules used by readers. Intentional behavior change: an ineligible shape will no longer mark a content-only digest as seen and suppress a later eligible shape with identical bytes.
+After the store and whole-texture gates, reject a single mip or a size at most `MIN_PREFIX` before building the parts vector. For other layouts, use an iterator shared with `key_levels` to stop at the first qualifying prefix and remember that eligibility only if the staging object is reused. Keep full key enumeration and prefix hashing on the worker. For eligible content, build job parts and clone bytes only after the digest wins the existing seen check. Keyless layouts then leave the seen set available for eligible shapes with identical bytes.
 
 ## Before and after
 

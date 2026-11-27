@@ -10,7 +10,7 @@ For each copy, the planner iterates over every earlier operation, checking for c
 
 ## Proposed redesign
 
-After the existing dependency closure and refusals, coordinate-compress the selected half-open range endpoints. In original operation order, query the maximum prior write level on the current read and write spans and maximum prior read level on the current write span. Use level zero if all are empty, otherwise one greater than the maximum. Update separate range-maximum structures for this operation. Keep empty ranges, placed-copy ordering, eligibility and refusal paths intact. Use the simple scan for tiny plans.
+Keep the linear all-fill path. Use the existing scan for zero-length steps and when the estimated pair comparisons are cheaper than building an index. For copy-heavy plans, sort and deduplicate just the endpoints of nonempty copy destinations. Each write covers whole cells between those endpoints; a read queries or updates every cell it intersects, including partially covered boundary cells. In original order, query prior writes against each read and write, and prior reads against each write. Then apply range-maximum updates to separate read and write trees. Store level plus one so an untouched cell yields level zero for the current operation. Preserve closure, placed-copy checks and refusals, including zero-length steps.
 
 ## Before and after
 

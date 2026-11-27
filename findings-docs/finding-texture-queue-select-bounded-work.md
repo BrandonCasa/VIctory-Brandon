@@ -10,7 +10,7 @@ In `crates/victory-gpu/src/draw.rs`, the once-per-frame stride-heap pass calls `
 
 ## Proposed redesign
 
-Collect the census and due candidates in one locked traversal. Release the lock before ordering. Select the K newest retries first using their unique write numbers. If capacity remains, select exactly the newest and oldest fresh subsets needed to alternate from the two ends, starting with newest. Sort only those retained subsets. Use ordinary sorting when the request already covers essentially the whole input. Keep the snapshot's write tokens for stale-result checks, the full census, on-time-before-lookahead ordering and the bake's duplicate suppression.
+Collect the census and due `(slot, write)` pairs in one locked traversal. Use the write frame for the census only. A zero cap needs no candidates, and the bake's lookahead caller discards its census. After unlocking, partition retries in place by write number when only the newest K fit. For R remaining slots, take up to R fresh entries, half from each end with the extra entry from the newest end. Sort only the selected subsets and interleave newest-first and oldest-first. Sort a category directly when it fits. Keep both bake windows' existing caps, ordering and slot deduplication, and return each original write token for stale-result checks.
 
 ## Before and after
 

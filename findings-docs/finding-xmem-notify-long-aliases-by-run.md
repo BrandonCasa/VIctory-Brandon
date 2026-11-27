@@ -10,7 +10,7 @@
 
 ## Proposed redesign
 
-Resolve consecutive indices of the same section into runs at notification time. Index long views by section and physical index range in `Shown::note` and `forget`, then intersect each run once. For short aliases, append matches from existing buckets. Preserve exact leading/trailing byte offsets, missing pages, aliases and repeated page IDs, output sort and adjacency semantics. Retain separate lock acquisition and resolve current mappings after writing; a decode-time snapshot can be stale.
+In `shown_at`, resolve consecutive slices of one section as a run, retaining input offsets across missing pages. Under the separate `SHOWN` read lock, intersect each run once with the existing long views and collect short aliases from their page buckets. Clip spans to the written bytes. Release the lock, sort by address and join adjacent spans. If any spans overlap, first split the unmerged spans at their original page boundaries and use the existing sort-and-join rule to preserve the output for repeated pages. Long-view probes then fall from P × L to R × L without adding work on remaps. Keep alias resolution after the physical write.
 
 ## Before and after
 

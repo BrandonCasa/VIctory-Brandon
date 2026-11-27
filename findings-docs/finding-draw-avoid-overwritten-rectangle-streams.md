@@ -10,7 +10,7 @@ For each stream replaced on this path, the normal IA view has no draw consumer. 
 
 ## Proposed redesign
 
-Decide which per-vertex slots the fallback will replace before ordinary IA preparation. Skip the ordinary refresh/binding only for slots whose final source is expansion scratch. Keep checks that establish source validity, and keep `defer_host_read` (`host.rs:7596`) so expansion observes submission-time bytes and outstanding writes. Preserve per-instance streams, mixed-layout slot semantics, skipped draws on failure, resource lifetimes, and independent consumers of the shadow. Leave indexed, indirect and geometry-stage draws on their existing paths.
+For direct CPU-expanded rectangles, use the pipeline already resolved in `prepare_for` and a per-pipeline mask of slots with any per-vertex element. Populate one final IA view array: expand those slots into scratch and prepare instance-only slots normally. This preserves the existing whole-slot replacement on mixed layouts and avoids a second layout scan just to choose the path. Keep the expansion’s bounds and shadow checks, scratch lifetime, and `defer_host_read` of the used guest bytes at the existing submission-order boundary. Bind the completed array once on success and drop the draw on failure. Ordinary, indexed, indirect and geometry-stage draws keep their current preparation.
 
 ## Before and after
 

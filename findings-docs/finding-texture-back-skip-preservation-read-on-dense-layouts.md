@@ -10,7 +10,7 @@ One eligible shape is a 256 × 256 format-41, single-mip, single-slice linear te
 
 ## Proposed redesign
 
-Cache a conservative full-coverage predicate for the actual layout and recorded footprint set. Initially restrict it to validated, tightly packed linear rows with an exact ticket extent. Map the readback, tile into owned scratch and validate before publishing. Preserve the current skip-on-unreadable-page gate with reliable whole-range readability under the same mapping/ticket guards. Fall back to the existing full read for uncertain protection, partial coverage, metadata mismatch or padding. `host.rs:8840–8862,8944–8946` shows why attempting the final write alone cannot substitute for the read gate.
+Start with one linear mip and slice whose guest rows and mapped footprint are byte-for-byte identical. Check format, offsets, row width and pitch, row count, depth and exact ticket length before publishing directly from the mapped footprint with `copy_mapped`. Keep the mapping and ticket locks through publication. Skip the old read only with cheap, current proof that every destination page is readable. The resident bit in `texture::committed` cannot establish protection. Without that proof, keep `read_into` as the gate and still save the intermediate tiling pass on identical layouts. Keep the preservation path for padding or mismatched layouts.
 
 ## Before and after
 

@@ -10,7 +10,7 @@ On a normal composed frame with no capture and no HUD draw, the back buffer goes
 
 ## Proposed redesign
 
-Track the back buffer's current state through this short sequence. After composition, restore the two source textures as today. Transition the output to copy source only for actual capture, then to copy destination only when the HUD is going to copy into it. Have `Panel::draw` request that transition just before its back-buffer copy, after the early returns in `host/panel.rs:867–889`. End in present state. Preserve capture-before-HUD ordering, fallback to the base plane on composition failure and the single-plane copy-destination state.
+Keep the composed output in render-target state until its next use. Use a local current-state value for the back buffer. Switch it to copy source before capture and leave it there afterward, including if readback allocation fails. Let `Panel::draw` switch it to copy destination only when it reaches the back-buffer copy. At the end, batch both source-plane restorations with the transition from the actual output state to present in one barrier call. The single-plane path starts from the copy destination already established by `CopyResource` and captures the original source. Preserve capture-before-HUD order and discard the unsubmitted list on composition failure.
 
 ## Before and after
 

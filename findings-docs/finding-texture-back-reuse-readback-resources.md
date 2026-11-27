@@ -10,7 +10,7 @@ Every qualifying recording allocates footprint and row vectors, asks the device 
 
 ## Proposed redesign
 
-Cache footprints, row counts and padded allocation size per complete host description and device. Lease a size-compatible readback buffer per recording. Return it only when the command list can no longer be replayed and every referencing flight and CPU landing has retired. Preserve ticket validation, padded final rows, tiling and existing failure handling. Bound the pool by bytes and evict idle leases.
+Share immutable footprints, row counts and padded size in a bounded, per-device cache keyed by the complete host description. Have each recorded `Back` own one exclusive buffer lease until its deferred recording is reset or dropped after all flights and landings. Landing alone cannot release it because the list may replay. Reuse idle buffers of the required size, cap retained idle bytes, and allocate on a miss without waiting for a busy lease. Perform driver allocation and release outside the pool lock. Keep tickets and title layouts per target.
 
 ## Before and after
 
