@@ -1163,6 +1163,8 @@ struct Resource {
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    /// Its native allocation is a placement in a reusable texture-pool block.
+    pub(crate) pooled: bool,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// The bytes the host gives it.
     bytes: u64,
@@ -1669,7 +1671,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
-                .and_then(|(t, host)| crate::tiles::Tiled::make(&host.device, t, u32::from(r.desc.mip_levels)));
+                .and_then(|((t, _), host)| crate::tiles::Tiled::make(&host.device, t, u32::from(r.desc.mip_levels)));
             // (Both or neither: a reserved texture the card will not cut
             // into tiles is dropped here, and the old kind is made below.)
             if cut.is_some() {
@@ -1710,7 +1712,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 host_texture_as(&d, r.host.state, clear, false, r.host.placed.load(Relaxed))
             }
         };
-        let Some(texture) = texture else {
+        let Some((texture, pooled)) = texture else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1732,6 +1734,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => HostTexture::new(texture, state),
         };
         host.base = base;
+        host.pooled = pooled;
         *host.prefill.get_mut().unwrap_or_else(|e| e.into_inner()) = prefill;
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
         if base > 0 {
@@ -2407,6 +2410,7 @@ impl HostTexture {
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
             texture,
+            pooled: false,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
@@ -2434,6 +2438,7 @@ impl HostTexture {
         let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
         HostTexture {
             texture,
+            pooled: false,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes: 0,
             filled: false,
@@ -2557,7 +2562,7 @@ fn host_texture_as(
     clear: *const c_void,
     reserved: bool,
     placed_views: bool,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, bool)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -2619,7 +2624,7 @@ fn host_texture_as(
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
     // in no texel).
-    if fills(desc)
+    if !reserved && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -2635,7 +2640,7 @@ fn host_texture_as(
         crate::host::name(&t, || {
             format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
         });
-        return Some(t);
+        return Some((t, true));
     }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
@@ -2687,7 +2692,7 @@ fn host_texture_as(
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
     }
-    texture
+    texture.map(|t| (t, false))
 }
 
 /// The host copy of title texture `this` if it is made and was made
