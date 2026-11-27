@@ -8,7 +8,7 @@ N outstanding delays create N timer threads and N stack reservations. Terminatin
 
 ## Change
 
-Use a shared monotonic timer ordered by deadline and submission ID. Retain the queue until expiry or cancellation, unlink canceled tasks promptly, and wake the timer when the earliest deadline changes. Release timer locks before queue locks. Let reusable workers call the existing delivery path so blocking callbacks can progress independently. Keep zero-delay delivery direct. The EXE schedules at zero delay on begin (RVA 0x55f91c9) and can retry after 10 ms.
+Use a shared monotonic timer ordered by deadline and submission ID. Keep the callback owned by its queue until the port claims it. Pop due IDs in order, release the timer lock, and use the queue’s synchronized handoff to publish them to their ports. A canceled ID becomes a no-op. Keep blocking guest callbacks and monitor calls off the timer thread, and preserve FIFO publication order for callbacks due on the same port. Unlink canceled deadlines promptly and wake the timer when its earliest deadline changes. Keep zero-delay delivery direct. The EXE schedules at zero delay on begin (RVA 0x55f91c9) and can retry after 10 ms.
 
 ## Expected result
 

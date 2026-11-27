@@ -10,7 +10,7 @@ The November 27 run recorded no page-list wait or scatter retry. The benefit app
 
 ## Change
 
-Keep the ready path synchronous. When a post-submit page-list poll or scatter retry would sleep, suspend the job until its next poll or backoff. Page-list polling rereads the list until the original deadline. A failed scatter retries the same page IDs and filled prefix without repeating I/O or decode. Suspended jobs own their buffers and retain the staging charge and sequence through final notification. Bound their count and allocation capacity, including zero-staging requests, and use the current in-worker retry when the limit is reached.
+Keep the ready path synchronous. When a post-submit page-list poll or scatter retry would sleep, suspend the job until its next poll or backoff. Page-list polling keeps its original deadline. A failed scatter retries the same page IDs and filled prefix without repeating I/O or decode. Keep the job in `lane.running` through final notification so status publication and queue closure wait for it. A due retry can resume on an idle worker using its original staging reservation, including when that reservation fills the budget. Bound suspended buffer capacity and job count, including zero-charge jobs, and use the current in-worker retry at the limit.
 
 ## Expected result
 

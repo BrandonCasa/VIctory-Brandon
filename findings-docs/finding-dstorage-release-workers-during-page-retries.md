@@ -6,7 +6,7 @@ The archive builder at EXE RVA `0x4ffd520` enqueues a pointer into a live page t
 
 ## Change
 
-Remove half-full implicit submission on this title path. Leave requests pending until explicit Submit, preserving the separate full-queue liveness fallback. On the submitted path, publish status only after the last destination write, required GPU notification and request result. The title recycles the batch when IsComplete(0) succeeds at `0xe8960`.
+Remove the opt-in half-full submission on this title path. The default already waits for explicit Submit, and the observed 4,095-request batches fit the 4,159-entry queues. Keep the separate full-queue liveness fallback and the existing `Lanes::finish` / `Lane::flush` ordering. The title releases its page references after IsComplete(0) succeeds in the routine at `0xe8960`.
 
 ## Expected result
 

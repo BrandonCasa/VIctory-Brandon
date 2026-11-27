@@ -8,7 +8,7 @@ A write confined to a small mip or one array layer incurs CPU reads, detiling, s
 
 ## Change
 
-For initialized 2D textures with verified producer coverage, intersect changed absolute pages with each mip and slice, including all users of a shared tail. Coalesce adjacent reads and detile only affected footprints. Merge pending footprint masks across refreshes and claim them for the submitting prelude. Omit a GPU copy only when the destination still contains the last upload for that footprint. Keep the full path for missing baselines, near-full coverage, guarded memory, 3D and on-demand residency. Preserve first-use barriers and prefill.
+For initialized 2D textures with verified producer coverage, intersect changed absolute pages with each mip and slice, including all users of a shared tail. Read the full tiled spans needed by each affected footprint and coalesce overlaps. Preserve layout-relative offsets: `Layout::walk` indexes from the texture origin and checks `bytes_from(mip)`. A compact slice requires translating those offsets. Merge pending footprint masks across refreshes and retain immutable staged bytes for each in-flight copy. Clear only the version successfully queued for that footprint so a failed prelude or newer write remains pending. Omit a GPU copy only when the destination still contains the last upload for that footprint. Keep the full path for missing baselines, near-full coverage, guarded memory, 3D and on-demand residency. Preserve first-use barriers. Apply prefill only to finer levels whose bytes are established for this allocation. Matching smaller mips alone cannot identify those finer texels.
 
 ## Expected result
 

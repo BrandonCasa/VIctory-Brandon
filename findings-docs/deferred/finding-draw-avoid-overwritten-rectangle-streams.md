@@ -8,7 +8,7 @@ For each stream replaced on this path, the normal IA view has no draw consumer. 
 
 ## Change
 
-Precompute eligible per-vertex slot masks and the ordered (offset, format) list on the pipeline. Preserve appended-offset progression across instance elements. On eligible direct CPU rectangles, expand the replaced slots directly into scratch and prepare instance-only slots normally. Share the layout with deferred readers and retain their dependency on the exact guest bytes until submission.
+Precompute eligible per-vertex slot masks and the ordered (offset, format) list on the pipeline. Preserve appended-offset progression across instance elements. Apply the paired correctness finding’s eligibility conditions before skipping any preparation. On eligible direct CPU rectangles, expand the replaced slots directly into scratch and prepare instance-only slots normally. Share the layout with deferred readers and retain their dependency on the exact guest bytes until submission.
 
 ## Expected result
 

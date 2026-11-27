@@ -6,7 +6,7 @@ The single-plane path copies and captures the entire source. The retail caller s
 
 ## Change
 
-Use `CopyResource` only for a compatible full-source, full-destination present with no transformation. Otherwise render using the [owned plane description](finding-present-cache-compositor-descriptors.md). In `Host::present_planes`, capture the resulting back buffer before the HUD, transition it for each consumer, restore source states, and finish in present state. Discard the unsubmitted list on composition failure.
+Use `CopyResource` only for a compatible full-source, full-destination present with no transformation. Otherwise render using the [owned plane description](finding-present-cache-compositor-descriptors.md). In `Host::present_planes`, capture the resulting back buffer before the HUD, transition it for each consumer, restore source states, and finish in present state. On composition failure, discard the unsubmitted list and propagate the failure through the present path. The current recursive base-only retry would expose the wrong image for a transformed present.
 
 ## Expected result
 

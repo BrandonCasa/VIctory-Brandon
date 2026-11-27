@@ -6,7 +6,7 @@ The archive builder at EXE RVA `0x4ffd520` includes a byte offset and length wit
 
 ## Change
 
-Pass the successful writer's section, slice offsets and written extent from DirectStorage to `xmem::pages_written`. Under the alias-table lock, intersect that backing interval with its current virtual aliases, clip both ends, then unlock before notifying. For buffered scatter publish the successfully filled prefix. Preserve the existing conservative extent for a direct fill that can modify guest memory before returning an error.
+Pass the writer's retained section, slice offsets and written extent from DirectStorage to `xmem::pages_written`. Acquire the shared title-mapping guard across alias lookup and GPU notification so a remap cannot reuse a selected virtual address between them. Under `SHOWN`, intersect the written intervals with the current aliases and clip both ends. Release `SHOWN` before calling the GPU. On success publish the produced prefix for either fill path. On direct-fill failure preserve the conservative extent because the guest bytes may already have changed.
 
 ## Expected result
 

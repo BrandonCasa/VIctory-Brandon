@@ -10,7 +10,7 @@ The ahead planner writes one `Touch` for every visited step, including `Nothing`
 
 ## Change
 
-Fold the sequential front scan in place, preserving first-touch order and part boundaries. On the parallel path, build one summary per distinct closed recording after take_coming, then join it at every occurrence. Preserve texture order and evaluate texture_due in the current batch. Fold the live ahead prefix to one entry per refreshed shadow, freezing it on the next write. Stop at the first untaken copy, run or placed operation and respect the builder dependency. Keep all summaries local to front planning.
+Fold the sequential front scan in place, preserving first-touch order and part boundaries. On the parallel path, build one summary per distinct closed recording after `take_coming`, then join it at every occurrence. Store builder landing positions in that summary and resolve their affected ranges anew on each execution. Keep the refresh spans for affected shadows separate across those positions. Preserve texture order and evaluate `texture_due` in the current batch. Fold the live ahead prefix to one entry per refreshed shadow, freezing it on the next write. End lookahead at the first untaken copy, run, placed operation or builder landing. Keep the closed-list summaries local to front planning.
 
 ## Expected result
 

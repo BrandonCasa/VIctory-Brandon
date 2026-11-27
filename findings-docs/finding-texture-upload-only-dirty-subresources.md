@@ -6,7 +6,7 @@ A clean journal at the staging VA can hide writes through the decoder's alias. T
 
 ## Change
 
-Before the clean return in `texture.rs::Staging::refresh_timed`, require coverage of the producer's backing and generation. Propagate dirty spans through the shared backing to its current aliases. For an untracked decoder write, compare source bytes after decode completion or take the existing full-refresh path. Track baselines per slot and plane and invalidate the uploaded baseline on destination replacement, another staging writer or a GPU write.
+Base the upload on the completed decode for the registered frame slot and plane. For a tracked producer, publish dirty spans by backing and generation so every alias sees them. Otherwise take a stable copy of that plane after decode completion and before slot reuse. Compare it with the version installed in the destination or upload the complete plane. Both the one-shot and journal clean returns in `Staging::refresh_timed` must honor that decision. Invalidate the installed version on destination replacement, another staging writer or a GPU write. A timed-out `BinkDoFrameAsyncWait` leaves the decode pending.
 
 ## Expected result
 

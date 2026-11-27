@@ -12,7 +12,7 @@ An N-list submission allocates two N-entry pointer arrays and visits the order i
 
 In a scoped borrow, build the ordered references once, make the split decision and submit immediately when there is no cut. Move ownership into the flight or recursive split only after that borrow ends. Preserve duplicate indices, logical order, part offsets and the existing no-cut fallback when an attempted split cannot transfer ownership.
 
-For large batches, address the earlier duplicate search in `list::detach` too. It scans all previously detached lists for each title list. Index successful detaches by title pointer for the duration of that call, using the index only for lookup and appending occurrences to the original order vector. In `detach_parts`, retain the existing same-entry, single-part replay rule and its handling of a repeated cut list. Keep the linear lookup for small batches. Neither the title's stack array nor pointers borrowed from it can replace the recordings or detached owners.
+For large batches, address the earlier duplicate search in `list::detach` too. It scans all previously detached lists for each title list. Index successful detaches by title pointer for the duration of that call, using the index only for lookup and appending occurrences to the original order vector. Keep the linear lookup for small batches. In `detach_parts`, use the index for single-part replays within the same entry. Leave repeated wait-bearing or cross-entry lists on their existing path. That path can drop an occurrence, a limitation of the fork. The stack loop establishes the lifetime of the caller's array and the callback count, but gives no evidence that the title drops these replays.
 
 ## Expected result
 

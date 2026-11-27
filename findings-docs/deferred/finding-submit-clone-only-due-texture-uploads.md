@@ -8,7 +8,7 @@ Each recorded texture is cloned into a scratch vector before the refresh result 
 
 ## Change
 
-Store each `PreludeUpload` once in an ordered, recording-owned vector and put its vector index in `Step::Texture`. A refresh inserted by `take_coming` then cannot invalidate an index. Share the nonempty vector as a unit once the list closes. Use its entries for the existing ordered staging checks and refreshes around title writes. After the final `batch.refresh_textures()`, walk the vector outside the list mutex, call `finish_refresh` in order and clone only successful claims. This keeps descriptor and residency callbacks out of the list lock and needs neither a close-time scan nor a per-submit vector of candidates. Reset drops the recording's ownership.
+Store each `PreludeUpload` once in an ordered, recording-owned vector and put its vector index in `Step::Texture`. A refresh inserted by `take_coming` then cannot invalidate an index. Share the nonempty vector as a unit once the list closes. Use its entries for the existing ordered staging checks and refreshes around title writes. At the end of **each list occurrence**, after its `batch.refresh_textures()`, walk the vector outside the list mutex, call `finish_refresh` in order and clone only successful claims for that occurrence's prelude. A replay can see a new staging value. This keeps descriptor and residency callbacks out of the list lock and needs neither a close-time scan nor a per-submit vector of candidates. Reset drops the recording's ownership.
 
 ## Expected result
 

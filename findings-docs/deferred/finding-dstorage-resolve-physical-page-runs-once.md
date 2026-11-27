@@ -8,10 +8,10 @@ A known list is validated under the page-table lock, then looked up again to bui
 
 ## Change
 
-Cache contiguous section runs for an accepted page-list snapshot, keeping one run inline. Advance a generation on page removal and actual slice reassignments. Reuse the runs between validation, the direct-window attempt and scatter only while the mapping is still valid and protected during use. Clip the run list to the requested extent on each use. Preserve retries, the post-fill reread and error notifications.
+Cache contiguous section runs for the submitted snapshot, keeping one run inline. Reuse them between validation, the direct-window attempt and scatter while their assignments are reserved. If releasing a reservation for a retry, revalidate before the next write. Clip buffered writes to the produced prefix and carry the actual backing through error or success notification.
 
 ## Expected result
 
-For P physical pages in R runs, stable mappings need one O(P) resolution per accepted list version. Direct mapping, buffered scatter and post-write alias discovery can share O(R) descriptors for that snapshot. Each new write attempt still validates ownership freshness, and current virtual aliases must be looked up after the write. Page-list rereads and retries on mapping failure remain.
+For P physical pages in R runs, a stable submitted list needs one O(P) resolution. Direct mapping, buffered scatter and post-write alias discovery can share O(R) descriptors. Current virtual aliases are looked up after the write. Unknown pages and failed host mappings can still incur retries before publication.
 
 [Related correctness finding](../finding-dstorage-resolve-physical-page-runs-once.md)

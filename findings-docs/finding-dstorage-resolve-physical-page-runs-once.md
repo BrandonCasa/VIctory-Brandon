@@ -6,7 +6,9 @@ The archive builder takes a pointer into the title's shared 64 KiB page table at
 
 ## Change
 
-Read page IDs in `dstorage.rs::into_destination` after submission. Under the mapping lock, resolve the backing slices and reserve their assignments through the direct fill or buffered scatter. Make reassignment wait for the reservation to end. If reservation fails, retry with a fresh mapping before touching guest bytes. Retain post-fill list rereads and retries. Carry the successful attempt's actual backing and written extent into notification, clipping a short fill to its produced prefix.
+Accept one page-list snapshot after submission. The title holds its page references until the status entry completes. Retain the bounded wait for initially unknown pages. Once a fill succeeds, complete that request exactly once. Replaying it onto a changed list can overwrite a second allocation.
+
+Reserve each resolved slice under the page-table lock before allowing a direct fill. Release the lock before I/O. Have `arrange` skip reserved slices, and mark the slices committed by either `Section::window` or the fallback `View::map` before releasing the reservation. The fallback currently leaves the freshness bit clear after a write. If the full direct window is unavailable, fill private scratch, then reserve and map only the runs covering the produced prefix before its first store. A host mapping failure can then retry with the decoded bytes intact. Pass the retained backing and written extent into notification.
 
 ## Expected result
 

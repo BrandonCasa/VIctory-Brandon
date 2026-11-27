@@ -8,7 +8,7 @@ Each successfully framed input allocates a byte vector for packed frame bits and
 
 ## Change
 
-Reuse a packed-frame buffer on the single decoder worker. Clear its logical length on each attempt and retain the owning read_frame wrapper. Expose decoded PCM in bulk, trim and skip as today, and append accepted samples straight to the voice queue. Keep failure silence, queued PCM, flush and overlap lifetimes intact.
+Reuse a packed-frame buffer on the single decoder worker. Clear its logical length on each attempt and retain the owning read_frame wrapper. Compute the accepted sample range from the loop endpoint and outstanding skip, in interleaved channel units. Emit that range directly into the voice queue before the decoder shifts its overlap buffer for the next frame. Keep the public append-to-Vec decoder entry point for existing callers. Keep failure silence, queued PCM, flush and overlap lifetimes intact.
 
 ## Expected result
 

@@ -6,7 +6,7 @@
 
 ## Change
 
-Snapshot the complete descriptor address once per (root slot, descriptor dword) per stage bind. Use that value for page preparation and both low/high user words. Preserve zero addresses, lifetime checks and acceleration-structure SRVs that store the address in words 4 and 5. Discard the snapshots after the bind.
+Snapshot the complete descriptor address once per (root slot, descriptor dword) per stage bind. When `State::tables` materializes or reuses a snapshot for the same entry, take the address from the descriptor generation retained by that snapshot. Otherwise resolve the live record once at the bind. Use that value for page preparation and both low/high user words. Preserve zero addresses, lifetime checks and acceleration-structure SRVs that store the address in words 4 and 5. Discard the snapshots after the bind.
 
 ## Expected result
 

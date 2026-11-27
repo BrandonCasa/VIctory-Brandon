@@ -10,7 +10,7 @@ The 1,119 distinct successful shader hashes in the November 27 launch log all ma
 
 ## Change
 
-In `format_load`, extract and convert only the first `min(channels, bits.len())` fields. Keep the raw-load mask and choose alignment from the entire element width. Apply the same zero/one defaults and d16 packing to the requested outputs.
+In `format_load`, the current identity channel mapping needs only the first `min(channels, bits.len())` fields. If descriptor swizzles are honored, select fields by the requested output selectors before eliminating conversions. An X output mapped to stored W still needs W. Keep the raw-load mask and choose alignment from the entire element width. Apply the same zero/one defaults and d16 packing to the requested outputs.
 
 ## Expected result
 
