@@ -5381,6 +5381,109 @@ mod land_tests {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+struct FirstUse {
+    exclusive_lookups: AtomicU64,
+    exclusive_waiters: AtomicU64,
+    exclusive_wait_us: AtomicU64,
+    allocation_attempts: AtomicU64,
+    allocated: AtomicU64,
+    allocation_failures: AtomicU64,
+    allocation_us: AtomicU64,
+    small_requests: AtomicU64,
+}
+
+#[cfg(feature = "diagnostics")]
+impl FirstUse {
+    const fn new() -> Self {
+        Self {
+            exclusive_lookups: AtomicU64::new(0),
+            exclusive_waiters: AtomicU64::new(0),
+            exclusive_wait_us: AtomicU64::new(0),
+            allocation_attempts: AtomicU64::new(0),
+            allocated: AtomicU64::new(0),
+            allocation_failures: AtomicU64::new(0),
+            allocation_us: AtomicU64::new(0),
+            small_requests: AtomicU64::new(0),
+        }
+    }
+
+    fn wait_for_lock(&self) -> Option<std::time::Instant> {
+        crate::host::gpu_progress().then(|| {
+            self.exclusive_waiters.fetch_add(1, Ordering::Relaxed);
+            std::time::Instant::now()
+        })
+    }
+
+    fn lock_taken(&self, started: Option<std::time::Instant>) {
+        if let Some(started) = started {
+            self.exclusive_wait_us.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            self.exclusive_lookups.fetch_add(1, Ordering::Relaxed);
+            self.exclusive_waiters.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    fn allocating(&self, small: bool) -> FirstAllocation<'_> {
+        let started = crate::host::gpu_progress().then(|| {
+            self.allocation_attempts.fetch_add(1, Ordering::Relaxed);
+            if small {
+                self.small_requests.fetch_add(1, Ordering::Relaxed);
+            }
+            std::time::Instant::now()
+        });
+        FirstAllocation { stats: self, started }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+struct FirstAllocation<'a> {
+    stats: &'a FirstUse,
+    started: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "diagnostics")]
+impl FirstAllocation<'_> {
+    fn stop(&mut self, made: bool) {
+        if let Some(started) = self.started.take() {
+            self.stats.allocation_us.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let outcome = if made { &self.stats.allocated } else { &self.stats.allocation_failures };
+            outcome.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for FirstAllocation<'_> {
+    fn drop(&mut self) {
+        self.stop(false);
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+static REGISTERED_FIRST_USE: FirstUse = FirstUse::new();
+#[cfg(feature = "diagnostics")]
+static LOOSE_FIRST_USE: FirstUse = FirstUse::new();
+
+/// Exclusive slow lookups and ordinary copy allocations; the lock wait is
+/// summed over callers, so waits by several threads may overlap.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_first_use() {
+    for (scope, stats) in [("registered", &REGISTERED_FIRST_USE), ("loose", &LOOSE_FIRST_USE)] {
+        tracing::info!(
+            scope,
+            exclusive_lookups = stats.exclusive_lookups.load(Ordering::Relaxed),
+            exclusive_waiters = stats.exclusive_waiters.load(Ordering::Relaxed),
+            exclusive_wait_us = stats.exclusive_wait_us.load(Ordering::Relaxed),
+            allocation_attempts = stats.allocation_attempts.load(Ordering::Relaxed),
+            allocated = stats.allocated.load(Ordering::Relaxed),
+            allocation_failures = stats.allocation_failures.load(Ordering::Relaxed),
+            allocation_us = stats.allocation_us.load(Ordering::Relaxed),
+            small_requests = stats.small_requests.load(Ordering::Relaxed),
+            "native shadow first use"
+        );
+    }
+}
+
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
@@ -5648,7 +5751,11 @@ fn lookup(address: u64, len: u64, any: bool, root: bool) -> Option<Arc<Shadow>> 
             }
         }
     }
+    #[cfg(feature = "diagnostics")]
+    let lock_started = REGISTERED_FIRST_USE.wait_for_lock();
     let mut map = buffers();
+    #[cfg(feature = "diagnostics")]
+    REGISTERED_FIRST_USE.lock_taken(lock_started);
     let key = containing_buffer(&map, address, end)
         .map(|(k, _)| *k);
     let Some(key) = key else {
@@ -5677,9 +5784,14 @@ fn lookup(address: u64, len: u64, any: bool, root: bool) -> Option<Arc<Shadow>> 
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
+        let host = host()?;
+        #[cfg(feature = "diagnostics")]
+        let mut allocate = REGISTERED_FIRST_USE.allocating(false);
+        let (buffer, data) = host.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         if prefix != 0 {
+            #[cfg(feature = "diagnostics")]
+            allocate.stop(true);
             // The split staging/card path tracks offsets from guest byte zero.
             // Keep one writable allocation when the native origin is skewed.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5710,6 +5822,8 @@ fn lookup(address: u64, len: u64, any: bool, root: bool) -> Option<Arc<Shadow>> 
             }
             None => (buffer, None),
         };
+        #[cfg(feature = "diagnostics")]
+        allocate.stop(true);
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         if len >= 16 << 20 {
@@ -6002,7 +6116,11 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, _root: bool) -> O
             return Some(shadow.clone());
         }
     }
+    #[cfg(feature = "diagnostics")]
+    let lock_started = LOOSE_FIRST_USE.wait_for_lock();
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    LOOSE_FIRST_USE.lock_taken(lock_started);
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
@@ -6042,7 +6160,10 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, _root: bool) -> O
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.window_buffer(len)?;
+    let host = host()?;
+    #[cfg(feature = "diagnostics")]
+    let mut allocate = LOOSE_FIRST_USE.allocating(len <= 1 << 20);
+    let (buffer, data) = host.window_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
     // buffer there, and the one just made is the CPU's side.
@@ -6061,6 +6182,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, _root: bool) -> O
         }
         None => (buffer, None),
     };
+    #[cfg(feature = "diagnostics")]
+    allocate.stop(true);
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     tracing::debug!(

@@ -395,6 +395,22 @@ fn with_shader_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut cra
     with_state(this, f);
 }
 
+#[cfg(windows)]
+fn with_draw_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    // SAFETY: the guest entry point receives one of our command lists. The
+    // thin worker has already set its boundary before replaying this call.
+    if unsafe { this.cast::<List>().as_ref() }.is_some_and(|list| !list.worker) {
+        let mut boundary = false;
+        with_state(this, |host, state| {
+            boundary = !host.untouched() && state.reads_vertex_texture_indices();
+        });
+        if boundary {
+            cut(this, None, CutReason::MaterialSelector);
+        }
+    }
+    with_shader_state(this, f);
+}
+
 /// Whether list `this` recorded a wait for a memory value (with waits cut
 /// into lists).
 #[cfg(windows)]
@@ -1876,7 +1892,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        super::with_shader_state(this, |list, s| {
+        super::with_draw_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
@@ -1921,7 +1937,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        super::with_shader_state(this, |list, s| {
+        super::with_draw_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
     }
@@ -2005,9 +2021,11 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_shader_state(this, |list, s| {
+        let record = |list: &crate::host::HostList, s: &mut crate::draw::State| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
-        });
+        };
+        if matches!(kind, 0 | 1) { with_draw_state(this, record); }
+        else { with_shader_state(this, record); }
     } else {
         #[cfg(windows)]
         with_state(this, |host, _| {

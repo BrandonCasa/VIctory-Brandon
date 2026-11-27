@@ -471,6 +471,7 @@ pub(crate) struct HostPipeline {
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
     pub(crate) vertex_texture_inputs: Vec<(u8, Option<VertexTextureInput>)>,
+    pub(crate) strip_cut_disabled: bool,
     /// Has the geometry stage that completes the console's rectangles
     /// (`victory_shader::emit::rect_list_gs`): its rectangle draws go out
     /// as the title gives them, three vertices a rectangle.
@@ -630,6 +631,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 vertex_texture_inputs: Vec::new(),
+                strip_cut_disabled: true,
                 rects: false,
                 state: String::new(),
             });
@@ -685,6 +687,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 vertex_texture_inputs: Vec::new(),
+                strip_cut_disabled: true,
                 rects: false,
                 state: String::new(),
             });
@@ -809,6 +812,7 @@ impl HostPipeline {
             slots: g.slots(),
             inputs,
             vertex_texture_inputs,
+            strip_cut_disabled: g.strip_cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
             rects: rect_gs.is_some(),
             state: {
                 let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);

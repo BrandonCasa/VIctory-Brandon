@@ -67,6 +67,7 @@ pub(crate) struct Host {
     fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
     fallback_sampler: OnceLock<Option<ID3D12DescriptorHeap>>,
     window_heap: Mutex<crate::pool::WindowHeap>,
+    selector_probe: Mutex<Option<selector_reads::Probe>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -984,6 +985,7 @@ fn card_progress(clock: &'static CardClock) {
             submit_batch_retries = SUBMIT_BATCH_RETRIES.load(Ordering::Relaxed),
             submission_work_us = worked(), "native queue progress"
         );
+        crate::shadow::log_first_use();
         if completed == u64::MAX { break; } // device removed
     }
 }
@@ -1311,6 +1313,7 @@ fn create() -> windows::core::Result<Host> {
             fallback_view: OnceLock::new(),
             fallback_sampler: OnceLock::new(),
             window_heap: Mutex::default(),
+            selector_probe: Mutex::default(),
         })
     }
 }
@@ -3284,6 +3287,53 @@ pub(crate) struct StageSelections {
     entries: std::collections::HashMap<usize, (SampleSelection, std::cell::Cell<bool>)>,
 }
 
+/// A missing selector conservatively covers all views of its own dimension.
+pub(crate) struct SampledReaders {
+    unbounded: u32,
+    inputs: std::collections::BTreeMap<u32, Vec<usize>>,
+}
+
+impl SampledReaders {
+    pub(crate) fn new(opaque: bool, kinds: u32) -> Self {
+        Self { unbounded: if !opaque { 0 } else if kinds == 0 { u32::MAX } else { kinds }, inputs: Default::default() }
+    }
+
+    pub(crate) fn bind(&mut self, kind: u8, input: Option<crate::descriptor::index_words::SampleWords>,
+        words: &mut Vec<crate::descriptor::index_words::SampleWords>) {
+        let kinds = 1 << kind;
+        let Some(input) = input else {
+            self.unbounded |= kinds;
+            return;
+        };
+        let index = words.iter().position(|word| word == &input).unwrap_or_else(|| {
+            words.push(input);
+            words.len() - 1
+        });
+        if kinds & self.unbounded == 0 {
+            let inputs = self.inputs.entry(kinds).or_default();
+            if !inputs.contains(&index) { inputs.push(index); }
+        }
+    }
+
+    pub(crate) fn fully_bounded(&self) -> bool { self.unbounded == 0 }
+
+    fn observe(&self, uses: &mut sample_states::Uses, heap: usize, stage: u8, slots: &crate::descriptor::host::IndexedSlots) {
+        if slots.words_only {
+            uses.observes(heap, slots.texture_kinds[0], stage, Some(&slots.words));
+            return;
+        }
+        if self.unbounded != 0 {
+            let kinds = if self.unbounded == u32::MAX { 0 } else { self.unbounded };
+            uses.observes(heap, kinds, stage, None);
+        }
+        for (&kinds, indices) in &self.inputs {
+            if kinds & self.unbounded != 0 { continue; }
+            let words: Vec<_> = indices.iter().map(|&i| slots.words[i].clone()).collect();
+            uses.observes(heap, kinds, stage, Some(&words));
+        }
+    }
+}
+
 #[cfg(feature = "diagnostics")]
 struct UnresolvedSelector {
     input: usize,
@@ -3294,6 +3344,18 @@ struct UnresolvedSelector {
 }
 
 impl StageSelections {
+    fn all_sampled_slots(&self) -> Option<std::collections::BTreeSet<u32>> {
+        if self.readers.is_empty() { return None; }
+        let selected: Option<Vec<_>> = self.readers.iter().map(|&(_, id)| self.entries.get(&id?)).collect();
+        let selected = selected?;
+        let mut slots = std::collections::BTreeSet::new();
+        for (proof, used) in selected {
+            used.set(true);
+            slots.extend(proof.slots.iter().copied());
+        }
+        Some(slots)
+    }
+
     #[cfg(feature = "diagnostics")]
     fn report_selector_hits(&self, scope: usize, command: u32, pipeline: usize, logical: u32) {
         let Some((words, hits)) = self.selector_hits.get(&scope) else { return };
@@ -9183,7 +9245,8 @@ impl HostList {
         self.sample_uses.lock().unwrap_or_else(|e| e.into_inner()).observes(heap, kinds, stage, None);
     }
 
-    pub(crate) fn observe_view_heap(&self, title: &crate::descriptor::Heap, slots: &crate::descriptor::host::IndexedSlots, stage: u8) {
+    pub(crate) fn observe_view_heap(&self, title: &crate::descriptor::Heap, slots: &crate::descriptor::host::IndexedSlots, stage: u8,
+        sampled_readers: &SampledReaders) {
         if slots.empty() {
             return;
         }
@@ -9191,9 +9254,8 @@ impl HostList {
             return;
         };
         if slots.opaque & 8 != 0 {
-            self.sample_uses.lock().unwrap_or_else(|e| e.into_inner()).observes(
-                std::sync::Arc::as_ptr(heap) as usize, slots.texture_kinds[0], stage, slots.words_only.then_some(slots.words.as_slice()),
-            );
+            sampled_readers.observe(&mut self.sample_uses.lock().unwrap_or_else(|e| e.into_inner()),
+                std::sync::Arc::as_ptr(heap) as usize, stage, slots);
         }
         if slots.opaque & 16 != 0 {
             self.sample_uses.lock().unwrap_or_else(|e| e.into_inner()).observes(
@@ -9595,19 +9657,22 @@ impl HostList {
             };
             let stages = selections(false);
             let uav_stages = selections(true);
+            let selected_by_stage = (forms.opaque & 8 != 0 && selection.is_none()).then(|| stages.all_sampled_slots()).flatten();
+            let sampled_slots = selection.as_ref().or(selected_by_stage.as_ref());
             #[cfg(feature = "diagnostics")]
             drop(scopes_timer);
-            let stable_version = || {
-                #[cfg(feature = "diagnostics")]
-                let _timer = SubmitTimer::start(&SUBMIT_CANDIDATE_EPOCH_US);
-                host.stable_version()
-            };
             // Publishing a missing descriptor or streaming a new set of
-            // textures advances the version. A race requires another pass,
-            // since dropping this list would also lose its completion writes.
+            // textures advances the version. Retry when it may have changed
+            // this pass's candidates. The final reader pins still cover the
+            // whole heap and protect the title's ordered completion writes.
             let mut retries = 0u32;
             loop {
-                let before = stable_version();
+                let observed = {
+                    #[cfg(feature = "diagnostics")]
+                    let _timer = SubmitTimer::start(&SUBMIT_CANDIDATE_EPOCH_US);
+                    host.begin_candidate_observation(&forms, sampled_slots)
+                };
+                let before = observed.before();
                 let mut candidates = LateSamples::default();
                 #[cfg(feature = "diagnostics")]
                 let visit_timer = {
@@ -9619,13 +9684,17 @@ impl HostList {
                 let ready = crate::descriptor::with_heap(title, |heap| {
                     heap.host_owner().is_some_and(|current| {
                         std::sync::Arc::ptr_eq(current, &host)
-                            && host.indexed_resident(heap, &forms, self, false, Some(&mut candidates), selection.as_ref(), Some((&stages,&uav_stages)))
+                            && host.indexed_resident(heap, &forms, self, false, Some(&mut candidates), sampled_slots, Some((&stages,&uav_stages)))
                     })
                 }).unwrap_or(false);
                 #[cfg(feature = "diagnostics")]
                 drop(visit_timer);
-                let after = stable_version();
-                if before == after {
+                let (after, only_disjoint) = {
+                    #[cfg(feature = "diagnostics")]
+                    let _timer = SubmitTimer::start(&SUBMIT_CANDIDATE_EPOCH_US);
+                    observed.finish(Some(title))
+                };
+                if before == after || (ready && only_disjoint) {
                     if !ready { return false; }
                     sampled.merge(candidates);
                     proofs.samples.extend(stages.entries.into_values().chain(uav_stages.entries.into_values())
@@ -9642,7 +9711,7 @@ impl HostList {
                         }
                         proofs.samples.push(SampleSelection { words: forms.words.into(), slots, heap_count: count });
                     }
-                    versions.push((host, before));
+                    versions.push((host, after));
                     return true;
                 }
                 retries += 1;
@@ -9751,13 +9820,20 @@ impl HostList {
             return;
         };
         #[cfg(feature = "diagnostics")]
-        let origin = match view {
-            crate::descriptor::View::Shader(_, Some(words)) if words[1] == 2 && trace_texture_reads() => {
-                let uses = self.sample_uses.lock().unwrap_or_else(|e| e.into_inner());
-                Some((uses.next_command(), *words))
-            }
-            _ => None,
-        };
+        let origin = if trace_texture_reads() {
+            let words = match view {
+                crate::descriptor::View::Shader(_, Some(words)) => Some(*words),
+                crate::descriptor::View::Placed(false, _, words) => words[..10].try_into().ok(),
+                _ => None,
+            };
+            words.filter(|words| words[1] == 2 || trace_required_display_textures()
+                && words[1] == 4 && (27..=32).contains(&words[0])
+                && crate::resource::live_texture_description(resource).is_some_and(|(_, desc)| desc.shape() == [256, 256, 28, 1]))
+                .map(|words| {
+                    let uses = self.sample_uses.lock().unwrap_or_else(|e| e.into_inner());
+                    (uses.next_command(), words)
+                })
+        } else { None };
         let mut d = self.deferred();
         let ranges = d.texture_reads.entry((resource, serial)).or_default();
         if !ranges.contains(&range) {
@@ -10040,12 +10116,13 @@ impl HostList {
                             for (command, view) in origins {
                                 let pipeline = (command < uses.next_command()).then(|| uses.pipeline(command)).flatten();
                                 tracing::warn!(resource = format_args!("{resource:#x}"), serial, command,
+                                    list = format_args!("{:#x}", self.list.as_raw() as usize),
                                     pipeline = ?pipeline.map(|p| format!("{p:#x}")), ?view, ?native, ?range,
-                                    "recorded required Texture1D provenance");
+                                    "recorded required texture provenance");
                             }
                             drop(uses);
                         }
-                        refuse_frame(format_args!("required subresources of texture {resource:#x} image {serial} are unavailable: view {range:?}, first missing {missing:?}, {} staging ranges", staged.len()));
+                        refuse_frame(format_args!("required subresources of texture {resource:#x} image {serial} are unavailable: view {range:?}, first missing {missing:?}, {} staging ranges, native list {:#x}", staged.len(), self.list.as_raw() as usize));
                         return Vec::new();
                     }
                 }
@@ -10076,6 +10153,12 @@ impl HostList {
 fn trace_texture_reads() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_TRACE_TEXTURE_OWNER"))
+}
+
+#[cfg(feature = "diagnostics")]
+fn trace_required_display_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_TRACE_REQUIRED_DISPLAY_TEXTURES"))
 }
 
 /// The numbers of [`HostList::epoch`].

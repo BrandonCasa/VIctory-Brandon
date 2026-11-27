@@ -192,6 +192,7 @@ pub struct VertexInputIndex {
 mod structured_index;
 mod guarded_index;
 mod material_chain;
+mod indirect_record_columns;
 mod packed_material;
 mod scalar_records;
 mod linked_fields;
@@ -205,6 +206,27 @@ pub struct MaterialChain {
     pub records: (u8, u32),
     pub parent: u32,
     pub handle: u32,
+}
+
+/// One indexed texture reached through a byte pointer in a bounded table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IndirectRecordColumn {
+    pub parent: (u8, u32),
+    pub count: u32,
+    pub stride: u32,
+    pub pointer_field: u32,
+    pub records: (u8, u32),
+    pub handle_offset: u32,
+    pub heap_bytes: u32,
+    pub guard: Option<RecordTag>,
+}
+
+/// A parent row can supply a pointer only if this pair of words are equal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecordTag {
+    pub parent_field: u32,
+    pub table: (u8, u32),
+    pub field: u32,
 }
 
 /// A material handle reached through one halfword of a bounded record table.
@@ -294,9 +316,11 @@ pub struct Resources {
     /// Fields selecting the UAV of a typed buffer store waterfall.
     pub buffer_uav_indices: Vec<(Site, BufferIndex)>,
     pub fixed_record_columns: Vec<(Site, FixedRecordColumn)>,
+    pub resolve_record_columns: Vec<(Site, Site, FixedRecordColumn)>,
     pub vertex_inputs: Vec<(Site, VertexInputIndex)>,
     pub packed_material: Vec<(Site, PackedMaterialColumn)>,
     pub scalar_range_columns: Vec<(Site, ScalarRangeColumn)>,
+    pub indirect_record_columns: Vec<(Site, Site, IndirectRecordColumn)>,
     pub chains: Vec<(Site, MaterialChain)>,
     pub scalar_records: Vec<(Site, ScalarRecordChain)>,
     pub pointer_fields: Vec<(Site, PointerField)>,
@@ -502,6 +526,9 @@ pub(crate) fn track_with_used(
     }
     // What follows traces no access of one block.
     t.at.set(None);
+    if let crate::native::StageIo::Cs(cs) = io {
+        out.indirect_record_columns = t.indirect_record_columns(&out, used, cs);
+    }
     for &(site, address) in &out.scalar {
         if t.layout.get(address.param).is_some_and(|p| p.root == RootType::ResourceHeap) {
             if let crate::native::StageIo::Cs(cs) = io
@@ -587,6 +614,18 @@ pub(crate) fn track_with_used(
             out.waterfall.compares.extend(proof.compares);
             out.waterfall.reads.extend(proof.reads);
             out.waterfall.loads.extend(loads);
+        }
+    }
+    if let crate::native::StageIo::Cs(cs) = io {
+        for &(load, address) in &out.scalar {
+            if t.layout.get(address.param).is_some_and(|p| p.root == RootType::ResourceHeap)
+                && let Some((consumer, column)) = t.resolve_record_column(load, &out, used, cs)
+            {
+                out.resolve_record_columns.push((load, consumer, column));
+                if consumer != load && t.image_descriptor_only(load, &out) {
+                    out.resolve_record_columns.push((load, load, column));
+                }
+            }
         }
     }
     for &load in &out.waterfall.loads {
@@ -3220,6 +3259,63 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn indirect_record_column_proves_row_bounds_tag_and_sampled_word() {
+        use crate::native::{ComputeIo, ResourceType, StageIo, UsedResource};
+
+        let recipe = |row_mask: u32, stride: u32, tag_field: u32, early_exit: bool, lane_mask: u32| {
+            let mut words: Vec<u32> = vec![
+                0xbe85_0380, 0xbe8b_0380, 0xbee8_037e, // Address upper dwords and entry EXEC.
+                0xf408_0402, 0xfa00_0480, // Parent SRV s[16:19].
+                0x8700_ff06, row_mask, // s0 = s6 & row_mask.
+                0xb800_0000 | stride, // The SOPK reads its old destination.
+                0x8103_8000 | (tag_field << 8), // s3 = row base + tag field.
+                0xf408_0702, 0xfa00_0680, // Tag source SRV s[28:31].
+                0xf420_01c8, 0x0600_0000, // s7 = parent[row].tag.
+                0xf420_020e, 0xfa00_0710, // s8 = tag source[0x710].
+                0xbf06_0807, 0x8507_807e, // Set s7 to EXEC only on tag equality.
+                0x876a_077e, // vcc = EXEC & s7.
+            ];
+            let branch = words.len();
+            words.push(0xbf86_0000); // Original VCCZ guarded branch.
+            words.extend([
+                0x8106_c000, // s6 = row base + 64.
+                0xf420_0188, 0x0c00_0000, // Read the material's byte pointer.
+                0x8708_7e00 | lane_mask, 0xbe88_1308, // first(EXEC & lane mask).
+                0x7e32_0206, 0xd760_0006, 0x0000_1119, // Broadcast then recover the pointer.
+                0xf408_0502, 0xfa00_0a20, // Record SRV s[20:23].
+                0xf428_060a, 0x0c00_0008, // Material dwords at pointer + 8, output s[24:27].
+                0x8f02_8519, // s2 = the second word << 5.
+                0xf40c_0305, 0x0400_0000, // Load an eight-dword heap entry.
+                0xf000_110a, 0x0003_1600, 0x0000_0003, // Texture2D image load.
+            ]);
+            if early_exit { words[branch] |= (words.len() - branch - 1) as u32; }
+            words.push(S_ENDPGM);
+            let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            let layout = [param(Table, 4, 1), param(ResourceHeap, 10, 1)];
+            let io = StageIo::Cs(ComputeIo { threads: [32, 1, 1], rsrc2: 0 });
+            let srv = |table_offset_dwords, stride| UsedResource {
+                root: Table, kind: ResourceType::Srv, table_offset_dwords, lower_bound: 0,
+                stride, dwords: 4, user_data: 4, slot: 0,
+            };
+            let used = [srv(288, 116), srv(416, 2048), srv(648, 1)];
+            track_with_used(&p, &layout, HwStage::Cs, lanes(&p).as_ref(), &used, &io).unwrap()
+                .indirect_record_columns.into_iter().map(|(_, _, column)| column).collect::<Vec<_>>()
+        };
+        let expected = IndirectRecordColumn {
+            parent: (0, 288), count: 16384, stride: 116, pointer_field: 64,
+            records: (0, 648), handle_offset: 12, heap_bytes: 0,
+            guard: Some(RecordTag { parent_field: 8, table: (0, 416), field: 0x710 }),
+        };
+        assert_eq!(recipe(0x3fff, 116, 8, true, 104), [expected; 2]);
+        assert_eq!(recipe(0x3fff, 116, 12, true, 104), [IndirectRecordColumn { guard: None, ..expected }; 2]);
+        assert_eq!(recipe(0x3fff, 116, 8, false, 104), [IndirectRecordColumn { guard: None, ..expected }; 2]);
+        assert!(recipe(0x7fff, 116, 8, true, 104).is_empty());
+        assert!(recipe(0x3fff, 120, 8, true, 104).is_empty());
+        assert!(recipe(0x3fff, 116, 8, true, 7).is_empty());
+    }
+
+    #[test]
     fn record_index_range_requires_a_dominating_nonempty_arm() {
         let guarded = |skip: u32| {
             let mut words = vec![
@@ -4160,6 +4256,68 @@ pub(crate) mod tests {
         let r = track_words(&words, &layout, HwStage::Cs);
         assert!(!r.waterfall.loads.is_empty());
         assert!(r.buffer_indices.is_empty());
+    }
+
+    #[test]
+    fn resolve_image_load_uses_exactly_the_masked_hit_record_column() {
+        use crate::native::{ComputeIo, ResourceType, StageIo, UsedResource};
+
+        let reflect = |row_mask: u32, stride: u32, field: u32, restore_masked_lanes: bool,
+                       dimensions: bool, entry_may_be_empty: bool| {
+            let mut words = vec![
+                0xbe85_0380, 0xbe8b_0380, // Upper dwords for table and heap roots.
+                0xf408_0302, 0xfa00_0480, // Root 0, dword 288 in s[12:15].
+            ];
+            if restore_masked_lanes || entry_may_be_empty { words.push(0x7da8_0090); } // v_cmpx_gt_u32 exec, 16, v0.
+            words.extend([0x3610_32ff, row_mask]); // v8 = v25 & 0x3fff.
+            if restore_masked_lanes { words.push(0xbefe_03c1); } // Enable lanes that missed the mask.
+            words.extend([
+                0xbe88_037e, 0xbe89_037e, // Save EXEC and the remaining lanes.
+                0xe030_2000 | field, 0x8003_0808, // Raw IDXEN word at v8 * stride + field.
+                0x3410_1085, // v8 <<= 5, the byte offset of one heap descriptor.
+            ]);
+            let head = words.len();
+            words.extend([
+                0x7e18_0508, 0x7da4_100c, // First matching handle and lanes.
+                0xf40c_0305, 0x1800_0000, // Texture1D heap descriptor s[12:19].
+            ]);
+            if dimensions {
+                words.extend([0xd54e_0011, 0x0278_1a0e]); // Read width from descriptor dwords 1 and 2.
+            } else {
+                words.extend([0xf000_1700, 0x0003_1712]); // ImageLoad uses that descriptor.
+            }
+            words.push(0xbe89_4709); // Remove the used lanes from the retry mask.
+            let repeat = ((head as i32 - words.len() as i32 - 1) as u16) as u32;
+            words.extend([0xbf89_0000 | repeat, 0xbefe_0308, S_ENDPGM]);
+            let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 128).unwrap();
+            let layout = [param(Table, 4, 1), param(ResourceHeap, 10, 1)];
+            let io = StageIo::Cs(ComputeIo { threads: [32, 1, 1], rsrc2: 0 });
+            let used = [UsedResource { root: Table, kind: ResourceType::Srv, table_offset_dwords: 288,
+                lower_bound: 0, stride, dwords: 4, user_data: 4, slot: 0 }];
+            track_with_used(&p, &layout, HwStage::Cs, lanes(&p).as_ref(), &used, &io).unwrap()
+        };
+        let reflected = reflect(0x3fff, 116, 60, false, false, false);
+        let [(load, consumer, column), (query, query_site, duplicate)] = reflected.resolve_record_columns.as_slice() else {
+            panic!("native loop not reflected: {:?}", reflected.waterfall);
+        };
+        assert!(reflected.waterfall.loads.contains(load));
+        assert_ne!(load, consumer);
+        assert_eq!((load, load, column), (query, query_site, duplicate));
+        assert_eq!(*column, FixedRecordColumn { table: (0, 288), field: 60, stride: 116,
+            count: 16384, bytes: 0, value_mask: u32::MAX });
+        assert!(reflect(0x7fff, 116, 60, false, false, false).resolve_record_columns.is_empty());
+        assert!(reflect(0x3fff, 112, 60, false, false, false).resolve_record_columns.is_empty());
+        assert!(reflect(0x3fff, 116, 64, false, false, false).resolve_record_columns.is_empty());
+        assert!(reflect(0x3fff, 116, 60, true, false, false).resolve_record_columns.is_empty());
+
+        let numeric = reflect(0x3fff, 116, 60, false, true, false);
+        let [(load, consumer, dimensions)] = numeric.resolve_record_columns.as_slice() else {
+            panic!("live dimension use not reflected: {:?}", numeric.resolve_record_columns);
+        };
+        assert_eq!(load, consumer);
+        assert_eq!(dimensions, column);
+        assert!(reflect(0x3fff, 116, 60, false, true, true).resolve_record_columns.is_empty());
     }
 
     /// [`WATERFALL_JOINED_WAVE32`] with other sources on each path: lanes

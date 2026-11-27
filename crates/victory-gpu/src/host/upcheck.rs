@@ -805,7 +805,7 @@ mod tests {
             exact: [(WRITER, 4 | victory_shader::emit::BUFFER_WRITE_ACCESS)].into_iter().collect(),
             ..Default::default()
         };
-        list.observe_view_heap(views, &writer, 0x40);
+        list.observe_view_heap(views, &writer, 0x40, &super::SampledReaders::new(false, 0));
         let at = data as usize;
         assert_eq!(list.indexed_write_ranges().unwrap(), [(at, at + 16)]);
         assert!(proof.stays_current(Some(&[])), "later same-list writer cannot change an earlier selector");

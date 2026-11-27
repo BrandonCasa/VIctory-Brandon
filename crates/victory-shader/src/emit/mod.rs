@@ -345,6 +345,7 @@ pub struct IndexedAccess {
     pub vertex_inputs: Vec<(crate::resource::VertexInputIndex, u8)>,
     pub packed_material: Vec<(crate::resource::PackedMaterialColumn, u8)>,
     pub scalar_range_columns: Vec<(crate::resource::ScalarRangeColumn, u8)>,
+    pub indirect_record_columns: Vec<(crate::resource::IndirectRecordColumn, u8)>,
     pub chains: Vec<(crate::resource::MaterialChain, u8)>,
     pub scalar_records: Vec<(crate::resource::ScalarRecordChain, u8)>,
     pub pointer_fields: Vec<(crate::resource::PointerField, u8)>,

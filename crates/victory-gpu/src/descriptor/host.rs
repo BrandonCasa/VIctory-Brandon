@@ -137,6 +137,23 @@ impl CandidateIndex {
         shard.rows.get(&slot)?.plain.as_ref()
             .filter(|proof| proof.record == record && proof.topology == topology).cloned()
     }
+
+    fn disjoint_buffer_at(&self, slot: u32, pass: &CandidatePass) -> bool {
+        let Some(shard) = self.shards.get((slot / self.width) as usize) else { return false; };
+        let shard = shard.read().unwrap_or_else(|e| e.into_inner());
+        shard.rows.get(&slot).is_none_or(|row| {
+            !row.pending && row.texture == 0 && pass.disjoint_buffer_form(row.form)
+                && (row.buffer == 0 || pass.disjoint_buffer_form(row.buffer))
+        })
+    }
+
+    fn sampled_record_at(&self, slot: u32, record: u64, kind: u32) -> bool {
+        let Some(shard) = self.shards.get((slot / self.width) as usize) else { return false; };
+        let shard = shard.read().unwrap_or_else(|e| e.into_inner());
+        shard.rows.get(&slot).is_some_and(|row|
+            row.record == record && row.form == 8 && row.texture == 8
+                && row.texture_kind == kind && row.buffer == 0 && !row.pending)
+    }
 }
 
 impl CandidateShard {
@@ -261,6 +278,7 @@ enum PublicationCause {
     Eviction,
     NeutralView,
     TextureFlip,
+    TextureRemake,
     Unmake,
     EmptyCleanup,
     ClearView,
@@ -269,6 +287,70 @@ enum PublicationCause {
     EmptyMirrorSkipped,
     #[cfg(feature = "diagnostics")]
     UnmappedFlipSkipped,
+}
+
+struct MirrorPublication<'a> {
+    slot: u32,
+    shown: u64,
+    handle: u64,
+    key: u64,
+    view: &'a View,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MirrorReason {
+    Buffer,
+    SampledSelection,
+    SampledDimension,
+    Requested,
+    ChangedRecord,
+    SpanOrUnmapped,
+    UnknownOld,
+    CandidateChanged,
+    CompatibleOrUnknown,
+    Pending,
+    JournalFull,
+}
+
+impl MirrorReason {
+    fn sampled(self) -> bool { matches!(self, Self::SampledSelection | Self::SampledDimension) }
+    fn disjoint(self) -> bool { self == Self::Buffer || self.sampled() }
+}
+
+struct MirrorImpact {
+    slot: u32,
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    old: u8,
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    new: u8,
+    reason: MirrorReason,
+}
+
+struct MirrorNote {
+    pass: std::sync::Arc<CandidatePass>,
+    impact: MirrorImpact,
+    handle: u64,
+    key: u64,
+    installed: bool,
+}
+
+impl Drop for MirrorNote {
+    fn drop(&mut self) {
+        if self.impact.reason.sampled() {
+            if !self.installed {
+                self.impact.reason = MirrorReason::Pending;
+            } else if !self.pass.note_sampled_mirror(self.impact.slot, self.handle, self.key) {
+                self.impact.reason = MirrorReason::JournalFull;
+            }
+        }
+        self.pass.note_mirror(&self.impact);
+    }
+}
+
+struct MirrorGuard<'a> {
+    // The note retires before the shared publication pin, including early returns.
+    note: Option<MirrorNote>,
+    _pin: std::sync::RwLockReadGuard<'a, u64>,
 }
 
 #[cfg(feature = "diagnostics")]
@@ -310,10 +392,182 @@ impl PublicationStats {
         let count = |cause: PublicationCause| counts[cause as usize];
         tracing::info!(heap = %format_args!("{heap:p}"), version, frame = crate::frame::current(),
             eviction = count(Eviction), neutral_view = count(NeutralView), texture_flip = count(TextureFlip),
-            unmake = count(Unmake), empty_cleanup = count(EmptyCleanup), clear_view = count(ClearView),
+            texture_remake = count(TextureRemake), unmake = count(Unmake), empty_cleanup = count(EmptyCleanup), clear_view = count(ClearView),
             mirror_view = count(MirrorView), from_indexed_preparation = indexed,
             empty_mirror_skipped = count(EmptyMirrorSkipped), unmapped_flip_skipped = count(UnmappedFlipSkipped),
             "indexed heap publication causes");
+    }
+}
+
+#[derive(Default)]
+struct CandidateObservations {
+    active: Mutex<Option<std::sync::Arc<CandidatePass>>>,
+    watching: std::sync::atomic::AtomicBool,
+}
+
+struct CandidatePass {
+    opaque: u8,
+    requested: Box<[u32]>,
+    sampled_complete: bool,
+    sampled_kinds: u32,
+    sampled_mirrors: Mutex<Vec<(u32, u64, u64)>>,
+    topology: u64,
+    lifetime: u64,
+    mapping: u64,
+    affected: std::sync::atomic::AtomicBool,
+    disjoint: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "diagnostics")]
+    impacts: Option<Mutex<[(u64, u32, u8, u8); MirrorReason::JournalFull as usize + 1]>>,
+}
+
+impl CandidatePass {
+    fn new(slots: &IndexedSlots, selected: Option<&std::collections::BTreeSet<u32>>) -> Option<Self> {
+        const MAX_REQUESTED: usize = 8192;
+        if slots.opaque == 0 || slots.opaque & 32 != 0 || !slots.buffer_writes.is_empty()
+            || slots.exact.len() + selected.map_or(0, std::collections::BTreeSet::len) > MAX_REQUESTED
+        { return None; }
+        let mut requested: Vec<u32> = slots.exact.keys().copied()
+            .chain(selected.into_iter().flatten().copied()).collect();
+        requested.sort_unstable();
+        requested.dedup();
+        Some(Self { opaque: slots.opaque, requested: requested.into_boxed_slice(),
+            sampled_complete: selected.is_some(), sampled_kinds: slots.texture_kinds[0],
+            sampled_mirrors: Default::default(),
+            topology: crate::resource::alias_generation(), lifetime: super::record_lifetime(0), mapping: crate::watch::changes(),
+            affected: Default::default(), disjoint: Default::default(),
+            #[cfg(feature = "diagnostics")]
+            impacts: crate::host::gpu_progress().then(Default::default),
+        })
+    }
+
+    fn may_ignore_slot(&self, slot: u32) -> bool { self.requested.binary_search(&slot).is_err() }
+
+    fn disjoint_buffer_form(&self, form: u8) -> bool {
+        matches!(form, 1 | 2 | 4) && self.opaque & form == 0
+            && (form != 4 || self.opaque & victory_shader::emit::BUFFER_WRITE_ACCESS == 0)
+    }
+
+    fn sampled_reason(&self, slot: u32, old: u32, new: u32) -> MirrorReason {
+        if !self.may_ignore_slot(slot) { return MirrorReason::Requested; }
+        if self.opaque & 8 == 0 || old == 0 || new == 0 { return MirrorReason::CompatibleOrUnknown; }
+        if self.sampled_complete { return MirrorReason::SampledSelection; }
+        if self.sampled_kinds != 0 && self.sampled_kinds & (old | new) == 0 {
+            return MirrorReason::SampledDimension;
+        }
+        MirrorReason::CompatibleOrUnknown
+    }
+
+    fn note_mirror(&self, impact: &MirrorImpact) {
+        self.note(impact.reason.disjoint());
+        #[cfg(feature = "diagnostics")]
+        if let Some(impacts) = &self.impacts {
+            let mut impacts = impacts.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = &mut impacts[impact.reason as usize];
+            if entry.0 == 0 { *entry = (0, impact.slot, impact.old, impact.new); }
+            entry.0 += 1;
+        }
+    }
+
+    fn note_sampled_mirror(&self, slot: u32, handle: u64, key: u64) -> bool {
+        const MAX_SAMPLED_MIRRORS: usize = 64;
+        let mut mirrors = self.sampled_mirrors.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(previous) = mirrors.iter_mut().find(|(old, _, _)| *old == slot) {
+            *previous = (slot, handle, key);
+        } else if mirrors.len() < MAX_SAMPLED_MIRRORS {
+            mirrors.push((slot, handle, key));
+        } else {
+            return false;
+        }
+        true
+    }
+
+    fn note(&self, disjoint: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if disjoint {
+            self.disjoint.fetch_add(1, Relaxed);
+        } else {
+            self.affected.store(true, Relaxed);
+        }
+    }
+
+    fn accounts_for(&self, changes: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        changes != 0 && self.disjoint.load(Relaxed) == changes && !self.affected.load(Relaxed)
+    }
+
+    fn sampled_mirrors_current(&self, current: impl Fn(u32) -> Option<(u64, u64)>) -> bool {
+        self.sampled_mirrors.lock().unwrap_or_else(|e| e.into_inner()).iter()
+            .all(|&(slot, handle, key)| current(slot) == Some((handle, key)) && record_key(handle) == key)
+    }
+
+    fn only_disjoint(&self, changes: u64, heap: &HostHeap, title: Option<&super::Heap>) -> bool {
+        let title = title.filter(|title| title.host.get().and_then(Option::as_ref)
+            .is_some_and(|owner| std::ptr::eq(std::sync::Arc::as_ptr(owner), heap)));
+        self.accounts_for(changes) && self.topology == crate::resource::alias_generation()
+            && self.mapping == crate::watch::changes() && self.lifetime == super::record_lifetime(0)
+            && self.sampled_mirrors_current(|slot| Some((title?.handle(slot)?, heap.made.get(slot)?)))
+    }
+}
+
+/// A single candidate pass watches publications while preparing the heap.
+/// Starting, finishing and unwinding all exclude the publishers' shared pins.
+pub(crate) struct CandidateObservation<'a> {
+    heap: &'a HostHeap,
+    before: u64,
+    pass: Option<std::sync::Arc<CandidatePass>>,
+}
+
+impl CandidateObservation<'_> {
+    pub(crate) fn before(&self) -> u64 { self.before }
+
+    pub(crate) fn finish(mut self, title: Option<usize>) -> (u64, bool) {
+        if let Some(title) = title
+            && self.pass.as_ref().is_some_and(|pass| pass.opaque & 8 != 0)
+            && let Some(result) = super::with_heap(title, |title| self.finish_pinned(Some(title)))
+        {
+            return result;
+        }
+        self.finish_pinned(None)
+    }
+
+    fn finish_pinned(&mut self, title: Option<&super::Heap>) -> (u64, bool) {
+        let pass = self.pass.take();
+        let (after, only_disjoint) = self.heap.stable_publication(|after| {
+            let pass = pass.as_ref()?;
+            self.heap.stop_candidate_observation(pass);
+            Some(pass.only_disjoint(after.wrapping_sub(self.before), self.heap, title))
+        });
+        #[cfg(feature = "diagnostics")]
+        if let Some(pass) = &pass && let Some(impacts) = &pass.impacts {
+            use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+            let impacts = *impacts.lock().unwrap_or_else(|e| e.into_inner());
+            if impacts.iter().any(|impact| impact.0 != 0) {
+                static PASSES: AtomicU64 = AtomicU64::new(0);
+                static SECOND: AtomicU64 = AtomicU64::new(0);
+                let passes = PASSES.fetch_add(1, Relaxed) + 1;
+                let second = crate::host::now_ms() / 1000;
+                if passes.is_power_of_two() || SECOND.fetch_max(second, Relaxed) < second {
+                    use MirrorReason::*;
+                    let reasons = [Buffer, SampledSelection, SampledDimension, Requested, ChangedRecord,
+                        SpanOrUnmapped, UnknownOld, CandidateChanged, CompatibleOrUnknown, Pending, JournalFull];
+                    let examples: Vec<_> = reasons.into_iter().zip(impacts).filter(|(_, impact)| impact.0 != 0).collect();
+                    tracing::info!(passes, before=self.before, after, disjoint=pass.disjoint.load(Relaxed),
+                        only_disjoint=?only_disjoint, opaque=pass.opaque, sampled_complete=pass.sampled_complete,
+                        sampled_kinds=pass.sampled_kinds, frame=crate::frame::current(), ?examples,
+                        "indexed mirror publication impacts (reason, count, logical, old form, new form)");
+                }
+            }
+        }
+        (after, only_disjoint == Some(true))
+    }
+}
+
+impl Drop for CandidateObservation<'_> {
+    fn drop(&mut self) {
+        if let Some(pass) = self.pass.take() {
+            let _pin = self.heap.last_reader.write().unwrap_or_else(|e| e.into_inner());
+            self.heap.stop_candidate_observation(&pass);
+        }
     }
 }
 
@@ -470,6 +724,7 @@ pub(crate) struct HostHeap {
     /// until both ExecuteCommandLists and its signal have been enqueued.
     pub(crate) last_reader: std::sync::RwLock<u64>,
     publication: std::sync::atomic::AtomicU64,
+    candidate_observations: CandidateObservations,
     #[cfg(feature = "diagnostics")]
     publication_stats: PublicationStats,
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
@@ -2450,6 +2705,7 @@ impl HostHeap {
             changes_seen: Default::default(),
             last_reader: Default::default(),
             publication: Default::default(),
+            candidate_observations: Default::default(),
             #[cfg(feature = "diagnostics")]
             publication_stats: Default::default(),
             buffer_sweep: Mutex::default(),
@@ -2710,15 +2966,76 @@ impl HostHeap {
     }
 
     fn publish_views(&self, _cause: PublicationCause) -> Option<std::sync::RwLockReadGuard<'_, u64>> {
+        let (pin, pass) = self.begin_publication(_cause)?;
+        if let Some(pass) = pass { pass.note(false); }
+        Some(pin)
+    }
+
+    fn begin_publication(
+        &self, _cause: PublicationCause,
+    ) -> Option<(std::sync::RwLockReadGuard<'_, u64>, Option<std::sync::Arc<CandidatePass>>)> {
+        use std::sync::atomic::Ordering::{Acquire, Release};
         if self.sampler { return None; }
         let guard = self.last_reader.read().unwrap_or_else(|e| e.into_inner());
         if *guard != 0 {
             crate::host::wait_for_descriptor_reader(*guard);
         }
-        self.publication.fetch_add(1, std::sync::atomic::Ordering::Release);
+        let pass = self.candidate_observations.watching.load(Acquire).then(||
+            self.candidate_observations.active.lock().unwrap_or_else(|e| e.into_inner()).clone()).flatten();
+        self.publication.fetch_add(1, Release);
         #[cfg(feature = "diagnostics")]
         self.publication_stats.note(_cause);
-        Some(guard)
+        Some((guard, pass))
+    }
+
+    fn publish_mirror(&self, mirror: MirrorPublication<'_>) -> Option<MirrorGuard<'_>> {
+        let (pin, pass) = self.begin_publication(PublicationCause::MirrorView)?;
+        let note = pass.map(|pass| {
+            let (handle, key) = (mirror.handle, mirror.key);
+            let impact = self.mirror_impact(&pass, mirror);
+            MirrorNote { pass, impact, handle, key, installed: false }
+        });
+        Some(MirrorGuard { note, _pin: pin })
+    }
+
+    /// Made and the shared publication pin are held. Only ordinary sampled
+    /// views can use the new proof: placing a view may supersede other slots.
+    fn mirror_impact(&self, pass: &CandidatePass, mirror: MirrorPublication<'_>) -> MirrorImpact {
+        use MirrorReason::*;
+        let MirrorPublication { slot, shown, handle, key, view } = mirror;
+        let new = indexed_form(view);
+        let mut old = 0;
+        let span_bit = 1 << (slot % 64);
+        let isolated = self.spanned.0.get(slot as usize / 64).is_some_and(|bits|
+            bits.load(std::sync::atomic::Ordering::Acquire) & span_bit == 0)
+            && !self.superseded.may(slot) && !self.unmapped(slot);
+        let reason = if !pass.may_ignore_slot(slot) {
+            Requested
+        } else if !isolated {
+            SpanOrUnmapped
+        } else if shown == 0 {
+            UnknownOld
+        } else if let Some(previous) = view_at(shown as u32, (shown >> 32) as u32) {
+            old = indexed_form(&previous);
+            let proposed = if pass.disjoint_buffer_form(old) && pass.disjoint_buffer_form(new) {
+                if self.candidates.disjoint_buffer_at(slot, pass) { Buffer } else { CandidateChanged }
+            } else if old == 8 && new == 8 && matches!((&previous, view), (View::Shader(..), View::Shader(..))) {
+                let old_kind = texture_kind(&previous).map_or(0, |(_, kind)| kind);
+                let new_kind = texture_kind(view).map_or(0, |(_, kind)| kind);
+                let reason = pass.sampled_reason(slot, old_kind, new_kind);
+                if !reason.sampled() { reason }
+                else if !self.candidates.sampled_record_at(slot, shown, old_kind) { CandidateChanged }
+                else if !self.quick.get(slot as usize).is_some_and(|record|
+                    record.load(std::sync::atomic::Ordering::Acquire) == shown) { Pending }
+                else { reason }
+            } else {
+                CompatibleOrUnknown
+            };
+            if proposed.disjoint() && record_key(handle) != key { ChangedRecord } else { proposed }
+        } else {
+            UnknownOld
+        };
+        MirrorImpact { slot, old, new, reason }
     }
 
     pub(crate) fn publication_version(&self) -> u64 {
@@ -2727,10 +3044,15 @@ impl HostHeap {
 
     /// Wait for all publishers already inside their shared critical section.
     pub(crate) fn stable_version(&self) -> u64 {
+        self.stable_publication(|_| ()).0
+    }
+
+    fn stable_publication<R>(&self, observe: impl FnOnce(u64) -> R) -> (u64, R) {
         #[cfg(feature = "diagnostics")]
         let report = self.publication_stats.report_due();
         let alone = self.last_reader.write().unwrap_or_else(|e| e.into_inner());
         let version = self.publication_version();
+        let observation = observe(version);
         #[cfg(feature = "diagnostics")]
         let counts = report.then(|| {
             use std::sync::atomic::Ordering::Relaxed;
@@ -2741,7 +3063,34 @@ impl HostHeap {
         if let Some((counts, indexed)) = counts {
             PublicationStats::report(self, version, counts, indexed);
         }
-        version
+        (version, observation)
+    }
+
+    pub(crate) fn begin_candidate_observation(
+        &self, slots: &IndexedSlots, selected: Option<&std::collections::BTreeSet<u32>>,
+    ) -> CandidateObservation<'_> {
+        let pass = CandidatePass::new(slots, selected).map(std::sync::Arc::new);
+        self.stable_publication(|before| {
+            let mut observation = CandidateObservation { heap: self, before, pass: None };
+            if let Some(pass) = pass {
+                let mut active = self.candidate_observations.active.lock().unwrap_or_else(|e| e.into_inner());
+                if active.is_none() {
+                    *active = Some(pass.clone());
+                    self.candidate_observations.watching.store(true, std::sync::atomic::Ordering::Release);
+                    observation.pass = Some(pass);
+                }
+            }
+            observation
+        }).1
+    }
+
+    /// Called with the exclusive publication pin, including on unwind.
+    fn stop_candidate_observation(&self, pass: &std::sync::Arc<CandidatePass>) {
+        let mut active = self.candidate_observations.active.lock().unwrap_or_else(|e| e.into_inner());
+        if active.as_ref().is_some_and(|current| std::sync::Arc::ptr_eq(current, pass)) {
+            *active = None;
+            self.candidate_observations.watching.store(false, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Convert an internal title or list slot to its descriptor heap location.
@@ -3797,6 +4146,7 @@ impl HostHeap {
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 continue;
             };
+            let _publication = self.publish_views(PublicationCause::TextureRemake);
             if let Some(kept) = make(&view, self.at(slot)) {
                 self.put(slot);
                 self.keep(slot, kept);
@@ -5178,7 +5528,7 @@ impl HostHeap {
             return None;
         };
         if shown != key {
-            let publication = self.publish_views(PublicationCause::MirrorView);
+            let mut publication = self.publish_mirror(MirrorPublication { slot: index, shown, handle, key, view: &view });
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -5305,6 +5655,7 @@ impl HostHeap {
             } else {
                 make_twinned_backing(&view, self.at(index), self.twin(index), &mut backing)
             };
+            let installed = kept.is_some();
             if !later && requires_buffer(&view) {
                 self.candidates.buffer(index, if kept.is_none() { indexed_form(&view) } else { 0 });
                 if kept.is_some()
@@ -5338,6 +5689,9 @@ impl HostHeap {
             );
             if self.failed_buffers.may(index) {
                 self.made.set(index, 0);
+            }
+            if let Some(note) = publication.as_mut().and_then(|guard| guard.note.as_mut()) {
+                note.installed = installed && !self.failed_buffers.may(index);
             }
             drop(publication);
             drop(held);
@@ -7319,6 +7673,111 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_publication_requires_disjoint_forms_and_accounts_for_every_change() {
+        let slots = IndexedSlots { opaque: 8 | 2 | victory_shader::emit::BUFFER_WRITE_ACCESS,
+            exact: [(17, 1)].into(), ..Default::default() };
+        let pass = CandidatePass::new(&slots, Some(&[22].into())).unwrap();
+        assert!(!pass.may_ignore_slot(17));
+        assert!(!pass.may_ignore_slot(22));
+        assert!(pass.may_ignore_slot(23));
+        assert!(pass.disjoint_buffer_form(1));
+        for form in [0, 2, 4, 8, 16, 32] { assert!(!pass.disjoint_buffer_form(form)); }
+        assert!(CandidatePass::new(&IndexedSlots { opaque: 32, ..slots }, None).is_none());
+
+        let index = CandidateIndex::new(1024);
+        index.observed(23, 1, 1, 0, None);
+        assert!(index.disjoint_buffer_at(23, &pass));
+        index.pending(23, true);
+        assert!(!index.disjoint_buffer_at(23, &pass));
+        index.pending(23, false);
+        index.observed(23, 2, 8, 4, None);
+        assert!(!index.disjoint_buffer_at(23, &pass));
+        pass.note(true);
+        assert!(pass.accounts_for(1));
+        assert!(!pass.accounts_for(2));
+        pass.note(false);
+        assert!(!pass.accounts_for(1));
+    }
+
+    #[test]
+    fn indexed_sampled_mirrors_require_both_dimensions_or_a_complete_selection() {
+        use MirrorReason::*;
+        let slots = IndexedSlots { opaque: 8 | 2, texture_kinds: [1 << 2, 0],
+            exact: [(17, 2)].into(), ..Default::default() };
+        let dimensions = CandidatePass::new(&slots, None).unwrap();
+        let one = 1 << 1;
+        let two = 1 << 2;
+        let cube = 1 << 4;
+        assert_eq!(dimensions.sampled_reason(23, one, cube), SampledDimension);
+        assert_eq!(dimensions.sampled_reason(23, two, cube), CompatibleOrUnknown);
+        assert_eq!(dimensions.sampled_reason(23, cube, two), CompatibleOrUnknown);
+        assert_eq!(dimensions.sampled_reason(23, 0, cube), CompatibleOrUnknown);
+        assert_eq!(dimensions.sampled_reason(17, one, cube), Requested);
+        let selected = CandidatePass::new(&slots, Some(&[22].into())).unwrap();
+        assert_eq!(selected.sampled_reason(23, two, two), SampledSelection);
+        assert_eq!(selected.sampled_reason(22, one, cube), Requested);
+        let unknown = CandidatePass::new(&IndexedSlots { texture_kinds: [0, 0], ..slots }, None).unwrap();
+        assert_eq!(unknown.sampled_reason(23, one, cube), CompatibleOrUnknown);
+
+        let index = CandidateIndex::new(64);
+        index.observed(23, 13, 8, cube, None);
+        assert!(index.sampled_record_at(23, 13, cube));
+        assert!(!index.sampled_record_at(23, 14, cube));
+        assert!(!index.sampled_record_at(23, 13, two));
+        index.pending(23, true);
+        assert!(!index.sampled_record_at(23, 13, cube));
+        index.pending(23, false);
+        index.buffer(23, 2);
+        assert!(!index.sampled_record_at(23, 13, cube));
+    }
+
+    #[test]
+    fn indexed_sampled_mirror_journal_rechecks_latest_raw_and_native_record() {
+        let pass = std::sync::Arc::new(CandidatePass::new(&IndexedSlots { opaque: 8, ..Default::default() },
+            Some(&Default::default())).unwrap());
+        let mut words = [VIEW_TAG, 19u32, 1, 0];
+        let handle = words.as_mut_ptr() as u64;
+        let key = (1u64 << 32) | 19;
+        let mirror = |key, installed| MirrorNote { pass: pass.clone(), handle, key, installed,
+            impact: MirrorImpact { slot: 23, old: 8, new: 8, reason: MirrorReason::SampledSelection } };
+        drop(mirror(key - 1, true));
+        drop(mirror(key, true));
+        assert!(pass.accounts_for(2));
+        let current = |slot| (slot == 23).then_some((handle, key));
+        assert!(pass.sampled_mirrors_current(current));
+        assert!(!pass.sampled_mirrors_current(|_| None));
+        assert!(!pass.sampled_mirrors_current(|_| Some((handle, key - 1))));
+        // Model a raw title copy, which does not advance the host publication counter.
+        unsafe { super::super::record_bytes::write(words.as_mut_ptr().cast(), [VIEW_TAG, 20, 1]); }
+        assert!(!pass.sampled_mirrors_current(current));
+        drop(mirror(key + 1, false));
+        assert!(!pass.accounts_for(3));
+        for slot in 24..87 { assert!(pass.note_sampled_mirror(slot, handle, key)); }
+        assert!(!pass.note_sampled_mirror(87, handle, key));
+    }
+
+    #[test]
+    fn an_abandoned_indexed_publication_observation_releases_the_heap() {
+        let Some(heap) = HostHeap::new(false, 64) else { return; };
+        let slots = IndexedSlots { opaque: 8, ..Default::default() };
+        let observing = &heap.candidate_observations.watching;
+        use std::sync::atomic::Ordering::Acquire;
+        let first = heap.begin_candidate_observation(&slots, None);
+        assert!(observing.load(Acquire));
+        drop(heap.begin_candidate_observation(&slots, None));
+        assert!(observing.load(Acquire), "a non-owning observation must leave the first in place");
+        drop(first);
+        assert!(!observing.load(Acquire));
+        let first = heap.begin_candidate_observation(&slots, None);
+        {
+            let _publication = heap.publish_views(PublicationCause::TextureRemake);
+        }
+        let before = first.before();
+        assert_eq!(first.finish(None), (before + 1, false));
+        assert!(!observing.load(Acquire));
+    }
 
     #[test]
     fn indexed_candidates_share_unchanged_shards_and_preserve_old_membership() {

@@ -1005,6 +1005,7 @@ fn translate(
         }
         if !skip {
             let draw = drawing;
+            let mut reads_vertex_indices = false;
             if draw
                 || [
                     Plain::DISPATCH as u64,
@@ -1016,7 +1017,10 @@ fn translate(
                 .contains(&op)
             {
                 let mut pending = None;
-                super::with_state(list, |_, state| pending = state.dependency(draw));
+                super::with_state(list, |h, state| {
+                    pending = state.dependency(draw);
+                    reads_vertex_indices = draw && pending.is_none() && !h.untouched() && state.reads_vertex_texture_indices();
+                });
                 if let Some(p) = pending {
                     return (calls, closed, Some((i, p)));
                 }
@@ -1034,6 +1038,11 @@ fn translate(
             // alone needs no new command list after the depth conversion.
             if needs_published_piece(op) {
                 super::finish_depth_plane_piece(list);
+            }
+            if reads_vertex_indices {
+                // The ordered read must see earlier native writes before
+                // this draw, including a GPU author of the vertex stream.
+                super::cut(list, None, CutReason::MaterialSelector);
             }
             let dispatch = op == Plain::DISPATCH as u64 || op == Plain::DISPATCH_X as u64
                 || op == Plain::EXECUTE_INDIRECT as u64 && crate::signature::layout(w[0] as This)

@@ -2089,6 +2089,42 @@ pub fn title_memory_allocated(at: usize, len: usize) {
     }
 }
 
+// A freshly reserved-and-committed private allocation stays committed even
+// when its pages leave the working set. Keep one interval per live allocation.
+static PRIVATE_COMMITMENTS: RwLock<BTreeMap<usize, usize>> = RwLock::new(BTreeMap::new());
+
+/// XMem has successfully reserved and committed a fresh, read-write private
+/// allocation. Its free and decommit entry points revoke this proof before
+/// asking Windows to change the allocation.
+pub fn title_private_memory_committed(at: usize, len: usize) {
+    let Some(end) = at.checked_add(len).filter(|&end| at != 0 && at < end) else { return; };
+    let mut known = PRIVATE_COMMITMENTS.write().unwrap_or_else(|e| e.into_inner());
+    known.retain(|&start, limit| *limit <= at || end <= start);
+    known.insert(at, end);
+}
+
+pub(crate) fn private_commitment_covers(start: usize, end: usize) -> bool {
+    start < end && PRIVATE_COMMITMENTS.try_read().is_ok_and(|known| {
+        known.range(..=start).next_back().is_some_and(|(_, &limit)| end <= limit)
+    })
+}
+
+fn forget_private_commitment(at: usize, len: usize) {
+    // Free rounds the first address down to a kernel page. Zero length
+    // identifies a whole allocation at its base. Forget the entire proof
+    // when any part is affected, including after a failed free or remap.
+    let start = at & !(KERNEL_PAGE - 1);
+    let end = at.saturating_add(len.max(1));
+    let overlaps = |begin: usize, limit: usize| begin < end && start < limit;
+    if PRIVATE_COMMITMENTS.read().unwrap_or_else(|e| e.into_inner())
+        .range(..end).next_back().is_none_or(|(&begin, &limit)| !overlaps(begin, limit))
+    {
+        return;
+    }
+    PRIVATE_COMMITMENTS.write().unwrap_or_else(|e| e.into_inner())
+        .retain(|&begin, limit| !overlaps(begin, *limit));
+}
+
 /// Once a frame: a hundredth of the known holes are looked at, in case one
 /// was filled with nobody telling ([`title_memory_allocated`],
 /// [`title_memory_remapped`]), which no title we know does.
@@ -3686,6 +3722,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    forget_private_commitment(at, len);
     let bytes = if len == 0 { allocation_end(at, at).saturating_sub(at) } else { len };
     crate::memory::mapping_changed(at, bytes);
     if len != 0 {
@@ -3757,6 +3794,9 @@ fn forget_views(first: usize, last: usize) {
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
 fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'static, Guards> {
+    if len != 0 {
+        forget_private_commitment(at, len);
+    }
     crate::memory::mapping_changed(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
@@ -6017,5 +6057,34 @@ mod rearm_tests {
         assert_eq!(NOT_REARMED.load(Relaxed), before + 2);
         // SAFETY: our allocation.
         unsafe { VirtualFree(page as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn bvh_private_commitment_expires_before_decommit_or_release() {
+        let len = 3 * KERNEL_PAGE;
+        // SAFETY: this test exclusively owns the returned private allocation.
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert!(!p.is_null());
+            let at = p as usize;
+            title_private_memory_committed(at, len);
+            assert!(private_commitment_covers(at + 8, at + len));
+            assert!(!private_commitment_covers(at + 8, at + len + 1));
+
+            let middle = at + KERNEL_PAGE;
+            title_memory_freed(middle, KERNEL_PAGE);
+            assert_ne!(VirtualFree(middle as *mut _, KERNEL_PAGE, MEM_DECOMMIT), 0);
+            assert!(!private_commitment_covers(at, at + KERNEL_PAGE));
+            assert!(!crate::texture::committed_declaration(middle, KERNEL_PAGE));
+
+            assert_eq!(VirtualAlloc(middle as *const _, KERNEL_PAGE, MEM_COMMIT, PAGE_READWRITE), middle as *mut _);
+            assert!(crate::texture::committed_declaration(middle, KERNEL_PAGE));
+            assert!(!private_commitment_covers(at, at + len));
+
+            title_private_memory_committed(at, len);
+            title_memory_freed(at, 0);
+            assert_ne!(VirtualFree(p, 0, MEM_RELEASE), 0);
+            assert!(!private_commitment_covers(at, at + len));
+        }
     }
 }

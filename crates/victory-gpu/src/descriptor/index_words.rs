@@ -5,12 +5,16 @@ use std::sync::{Arc, Weak};
 
 use super::{Heap, View};
 use super::host::{HostHeap, buffer_copy};
+mod indirect_records;
 mod material_chain;
 mod scalar_records;
 mod scalar_program;
+mod vertex_input;
 pub(crate) use scalar_program::ScalarPrograms;
 pub(crate) use material_chain::{IndirectGroups, MaterialWords};
-pub(crate) use scalar_records::{DependentWords, FixedRecordWords, PackedMaterialWords, ScalarRangeWords};
+pub(crate) use indirect_records::{IndirectRecordWords, INDIRECT_CHILD_BUDGET, INDIRECT_CHILD_RANGES, INDIRECT_PARENT_BUDGET};
+pub(crate) use scalar_records::{DependentWords, FixedRecordWords, PackedMaterialWords, ScalarRangeWords, is_resolve_handle_column};
+pub(crate) use vertex_input::{VertexIndexView, VertexInputWords};
 
 struct NativeOwner<T>(Weak<T>);
 impl<T> Clone for NativeOwner<T> {
@@ -244,19 +248,22 @@ impl SampleWords {
             #[cfg(feature = "diagnostics")]
             if let Some(bytes) = device {
                 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-                static USES: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+                static USES: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
                 let scalar = matches!(**chain, DependentWords::Scalar { .. });
                 let fields = matches!(**chain, DependentWords::Fields { .. });
                 let program = matches!(**chain, DependentWords::Programs(_));
                 let packed = matches!(**chain, DependentWords::PackedMaterial(_));
                 let fixed = matches!(**chain, DependentWords::FixedRecord(_));
                 let scalar_range = matches!(**chain, DependentWords::ScalarRange(_));
+                let vertex_input = matches!(**chain, DependentWords::VertexInput(_));
+                let indirect_records = matches!(**chain, DependentWords::IndirectRecords(_));
                 let kind = usize::from(scalar) + 2 * usize::from(fields) + 3 * usize::from(program)
-                    + 4 * usize::from(packed) + 5 * usize::from(fixed) + 6 * usize::from(scalar_range);
+                    + 4 * usize::from(packed) + 5 * usize::from(fixed) + 6 * usize::from(scalar_range)
+                    + 7 * usize::from(vertex_input) + 8 * usize::from(indirect_records);
                 let uses = USES[kind * 2 + usize::from(complete)].fetch_add(1, Relaxed) + 1;
                 if uses.is_power_of_two() {
                     tracing::info!(uses, complete, scalar_records=scalar, pointer_fields=fields, scalar_program=program, packed_material=packed,
-                        fixed_record_column=fixed, scalar_range, native_spans=bytes.len(), still_missing=missing.len(),
+                        fixed_record_column=fixed, scalar_range, vertex_input, indirect_records, native_spans=bytes.len(), still_missing=missing.len(),
                         sampled=out.len(), "validated a dependent material selector");
                 }
             }

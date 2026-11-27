@@ -72,6 +72,7 @@ pub(crate) struct Staging {
     on_demand: bool,
     sparse_image: Option<std::sync::Weak<crate::resource::HostTexture>>,
     linear_null: bool,
+    tiled_color_null: bool,
     native_null: std::sync::atomic::AtomicBool,
     null_levels: std::sync::atomic::AtomicU32,
     /// For such a texture: the levels that were the title's at the last
@@ -1301,7 +1302,7 @@ pub(crate) fn missing_view(uploads: &[&PreludeUpload], view: ViewRange) -> Optio
                 let mapping = crate::watch::title_memory_reading_now();
                 let mapping_stable = mapping.is_some();
                 let spans = s.layout.subresource_runs(part.mip, part.slice).map(|runs| {
-                    runs.map(|r| required_backing_span(source + r.start, r.len(), mapping_stable))
+                    runs.map(|r| required_backing_span(source + r.start, r.len(), mapping_stable, s.tiled_color_null))
                         .collect::<Vec<_>>()
                 });
                 drop(mapping);
@@ -1321,7 +1322,7 @@ pub(crate) fn missing_view(uploads: &[&PreludeUpload], view: ViewRange) -> Optio
 }
 
 #[cfg(feature = "diagnostics")]
-fn required_backing_span(start: usize, len: usize, mapping_stable: bool) -> String {
+fn required_backing_span(start: usize, len: usize, mapping_stable: bool, inspect_pages: bool) -> String {
     use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
 
     let shown = crate::inplace::shown_bytes(start, len);
@@ -1334,7 +1335,8 @@ fn required_backing_span(start: usize, len: usize, mapping_stable: bool) -> Stri
     let queried = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) } != 0;
     let region = queried.then(|| format!("state={:#x} protect={:#x} allocation={:#x} base={:#x} size={:#x}",
         info.State, info.Protect, info.AllocationBase as usize, info.BaseAddress as usize, info.RegionSize));
-    format!("address={start:#x} bytes={len} mapped={mapped} shown={shown:?} sparse={sparse} sparse_null={sparse_null:?} region={region:?} backing={backing:?}")
+    let pages = (mapping_stable && inspect_pages).then(|| sparse_texel_pages(start, len));
+    format!("address={start:#x} bytes={len} mapped={mapped} shown={shown:?} sparse={sparse} sparse_null={sparse_null:?} region={region:?} backing={backing:?} pages={pages:?}")
 }
 
 /// A title texture deferred to submission time so `staging.refresh()` runs
@@ -1845,6 +1847,38 @@ fn linear_1d_null_sample(layout: &victory_formats::texture::Layout, format: u32,
         && desc.element_bytes == 4 && desc.block == 1
 }
 
+fn tiled_2d_null_sample(layout: &victory_formats::texture::Layout, format: u32, native_depth: bool) -> bool {
+    use victory_formats::texture::{Dimension, Swizzle};
+    let desc = &layout.desc;
+    // These color layouts store ordinary four-byte texels. Filling a NULL
+    // page before detiling preserves zero RGBA in the typed linear or sRGB view.
+    !native_depth && matches!((format, desc.swizzle), (28, Swizzle::SW_64KB_D) | (29, Swizzle::SW_4KB_S))
+        && desc.dimension == Dimension::Tex2d
+        && desc.mips == 1 && layout.slices == 1 && desc.samples == 1
+        && desc.element_bytes == 4 && desc.block == 1
+}
+
+#[cfg(feature = "diagnostics")]
+fn sparse_texel_pages(start: usize, len: usize) -> Vec<String> {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // The caller holds a mapping read guard. Inspect only the initial pages
+    // so a large or repeated rejection cannot produce unbounded diagnostics.
+    let end = start.saturating_add(len);
+    let mut at = start;
+    let mut pages = Vec::new();
+    while at < end && pages.len() < 8 {
+        let bytes = (0x10000 - (at & 0xffff)).min(end - at);
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: this queries metadata and never dereferences the title address.
+        let queried = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } != 0;
+        let null = crate::inplace::sparse_null_range(at, bytes);
+        pages.push(format!("{at:#x}+{bytes:#x} queried={queried} state={:#x} protect={:#x} sparse_null={null}",
+            info.State, info.Protect));
+        at += bytes;
+    }
+    pages
+}
+
 fn fill_null_blocks(bytes: &mut [u8], block: &[u8]) {
     if bytes.is_empty() { return; }
     if block.iter().all(|&v| v == 0) { bytes.fill(0); return; }
@@ -2322,7 +2356,7 @@ impl Staging {
 
     fn read_sparse_blocks(&self, at: usize, out: &mut [u8]) -> Option<usize> {
         let format = self.shape[2];
-        let block = if self.linear_null { &[0; 4] } else { null_sample_block(format)? };
+        let block = if self.linear_null || self.tiled_color_null { &[0; 4] } else { null_sample_block(format)? };
         let copied = capture_sparse_blocks(self.memory as usize, at, out, block)?;
         #[cfg(feature = "diagnostics")]
         if self.linear_null && copied < out.len() && crate::switch::on("VICTORY_TRACE_TEXTURE_OWNER") {
@@ -2330,6 +2364,21 @@ impl Staging {
             FIRST[(format - 27) as usize].call_once(|| tracing::info!(image = self.serial, format,
                 address = format_args!("{at:#x}"), bytes = out.len(), copied, width = self.layout.desc.width,
                 "staged explicit NULL Tex1D pages as zero texels"));
+        }
+        #[cfg(feature = "diagnostics")]
+        if self.tiled_color_null && copied < out.len() && crate::switch::on("VICTORY_TRACE_TEXTURE_OWNER") {
+            static FIRST: [std::sync::Once; 5] = [const { std::sync::Once::new() }; 5];
+            let desc = &self.layout.desc;
+            let observed_shape = desc.width == 256 && desc.height == 256
+                && out.len() == 4 * 0x10000 && copied == 2 * 0x10000;
+            let category = if format == 29 { 3 + usize::from(copied != 0) }
+                else if observed_shape { 2 } else { usize::from(copied != 0) };
+            FIRST[category].call_once(|| {
+                let pages = sparse_texel_pages(at, out.len());
+                tracing::info!(image = self.serial, format, address = format_args!("{at:#x}"), bytes = out.len(), copied,
+                    width = desc.width, height = desc.height, swizzle = ?desc.swizzle, ?pages,
+                    "staged explicit NULL pages in tiled RGBA8 texture");
+            });
         }
         Some(copied)
     }
@@ -2686,6 +2735,22 @@ pub(crate) fn committed_declaration(at: usize, len: usize) -> bool {
     const BATCH: usize = 256;
     if len == 0 { return true; }
     let Some(end) = at.checked_add(len) else { return false };
+    if crate::watch::private_commitment_covers(at, end) {
+        #[cfg(feature = "diagnostics")]
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static PROGRESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            static HITS: AtomicU64 = AtomicU64::new(0);
+            if *PROGRESS.get_or_init(|| crate::switch::on("VICTORY_GPU_PROGRESS")) {
+                let uses = HITS.fetch_add(1, Ordering::Relaxed) + 1;
+                if uses.is_power_of_two() {
+                    tracing::info!(uses, address = format_args!("{at:#x}"), len,
+                        "BVH declaration covered by committed title allocation");
+                }
+            }
+        }
+        return true;
+    }
     if crate::watch::guarded_readable(at, end) {
         #[cfg(feature = "diagnostics")]
         BVH_COMMIT_CHECKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2926,8 +2991,9 @@ fn staging_for(resource: This, copy: &Arc<crate::resource::HostTexture>, first: 
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(storage.allocated(total), std::sync::atomic::Ordering::Relaxed);
-    let linear_null = !on_demand && linear_1d_null_sample(&layout, desc.shape()[2],
-        d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0);
+    let native_depth = d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0;
+    let linear_null = !on_demand && linear_1d_null_sample(&layout, desc.shape()[2], native_depth);
+    let tiled_color_null = !on_demand && tiled_2d_null_sample(&layout, desc.shape()[2], native_depth);
     let s = Arc::new(Staging {
         storage: Mutex::new(storage),
         footprints,
@@ -2951,6 +3017,7 @@ fn staging_for(resource: This, copy: &Arc<crate::resource::HostTexture>, first: 
         sparse_image: (on_demand && null_sample_block(desc.shape()[2]).is_some()
             && crate::inplace::sparse_range(memory as usize, read)).then(|| Arc::downgrade(copy)),
         linear_null,
+        tiled_color_null,
         native_null: Default::default(),
         null_levels: Default::default(),
         detiled: std::sync::atomic::AtomicU32::new(0),
@@ -3213,6 +3280,113 @@ mod prelude_upload_tests {
                 || VirtualFree(at as *mut _, 0, MEM_RELEASE) != 0));
             assert_eq!(output[..256], [0; 256]);
             assert_eq!(output[256..], [0x5a; 512]);
+        }
+    }
+
+    #[test]
+    fn sparse_display_rgba8_detiles_two_live_pages_and_two_null_pages() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE: usize = 0x10000;
+        let desc = Desc { dimension: Dimension::Tex2d, width: 256, height: 256, depth: 1,
+            mips: 1, element_bytes: 4, block: 1, samples: 1, swizzle: Swizzle::SW_64KB_D };
+        let layout = Layout::new(&desc).unwrap();
+        assert_eq!(layout.subresource_runs(0, 0).unwrap().collect::<Vec<_>>(), [0..4 * PAGE]);
+        assert!(super::tiled_2d_null_sample(&layout, 28, false));
+        assert!(!super::tiled_2d_null_sample(&layout, 28, true));
+        assert!(!super::tiled_2d_null_sample(&layout, 29, false));
+        for other in [Desc { swizzle: Swizzle::LINEAR, ..desc }, Desc { depth: 2, ..desc },
+            Desc { mips: 2, ..desc }]
+        {
+            assert!(!super::tiled_2d_null_sample(&Layout::new(&other).unwrap(), 28, false));
+        }
+        // SAFETY: this private reservation is committed, written, and released only here.
+        unsafe {
+            let bytes = 4 * PAGE;
+            let at = VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!at.is_null());
+            crate::inplace::title_placeholder_reserved(at as usize, bytes);
+            assert_eq!(VirtualAlloc(at.cast(), 2 * PAGE, MEM_COMMIT, PAGE_READWRITE), at.cast());
+            at.write_bytes(0x5a, PAGE);
+            at.add(PAGE).write_bytes(0xa5, PAGE);
+            let mut captured = vec![0xff; bytes];
+            let capture = |out: &mut [u8]| {
+                let _mapping = crate::watch::title_memory_reading();
+                super::capture_sparse_blocks(at as usize, at as usize, out, &[0; 4])
+            };
+            assert_eq!(capture(&mut captured), None, "a plain reservation is insufficient");
+            crate::inplace::title_gpu_mapping_ranges(&[((at as usize + 2 * PAGE) as u64, 0, (2 * PAGE) as u64)]);
+            assert_eq!(capture(&mut captured), Some(2 * PAGE));
+            let mut linear = vec![0xff; bytes];
+            layout.detile(&captured, 0, 0, &mut linear, 4 * 256, bytes).unwrap();
+            for (x, y, value) in [(127, 127, 0x5a), (128, 127, 0xa5), (127, 128, 0), (128, 128, 0)] {
+                let i = (y * 256 + x) * 4;
+                assert_eq!(linear[i..i + 4], [value; 4], "coordinate ({x}, {y})");
+            }
+            for y in 0..256 {
+                for x in 0..256 {
+                    let i = (y as usize * 256 + x as usize) * 4;
+                    let page = layout.offset(0, x, y, 0).unwrap() as usize / PAGE;
+                    assert_eq!(linear[i..i + 4], [[0x5a; 4], [0xa5; 4], [0; 4], [0; 4]][page]);
+                }
+            }
+            let third = at.add(2 * PAGE);
+            assert_eq!(VirtualAlloc(third.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), third.cast());
+            third.write_bytes(0x3c, PAGE);
+            assert_eq!(capture(&mut captured), Some(3 * PAGE));
+            assert!(captured[2 * PAGE..3 * PAGE].iter().all(|&byte| byte == 0x3c));
+            let fourth = at.add(3 * PAGE);
+            assert_eq!(VirtualAlloc(fourth.cast(), PAGE, MEM_COMMIT, PAGE_NOACCESS), fourth.cast());
+            assert_eq!(capture(&mut captured), None, "an inaccessible committed page is not NULL");
+            assert!(crate::inplace::release_title_placeholder(at as usize, 0,
+                || VirtualFree(at.cast(), 0, MEM_RELEASE) != 0));
+        }
+    }
+
+    #[test]
+    fn sparse_standard_rgba8_srgb_detiles_a_small_explicit_null_page() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE: usize = 0x10000;
+        const TILE: usize = 0x1000;
+        let desc = Desc { dimension: Dimension::Tex2d, width: 4, height: 4, depth: 1,
+            mips: 1, element_bytes: 4, block: 1, samples: 1, swizzle: Swizzle::SW_4KB_S };
+        let layout = Layout::new(&desc).unwrap();
+        let format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB.0 as u32;
+        assert_eq!(layout.subresource_runs(0, 0).unwrap().collect::<Vec<_>>(), [0..TILE]);
+        assert!(super::tiled_2d_null_sample(&layout, format, false));
+        assert!(!super::tiled_2d_null_sample(&layout, 28, false));
+        assert!(!super::tiled_2d_null_sample(&layout, format, true));
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_64KB_D] {
+            let other = Layout::new(&Desc { swizzle, ..desc }).unwrap();
+            assert!(!super::tiled_2d_null_sample(&other, format, false));
+        }
+        // SAFETY: only this fixture can change any part of the reservation.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert_ne!(base, 0);
+            let at = base + PAGE - TILE;
+            crate::inplace::title_placeholder_reserved(base, PAGE);
+            let mut tiled = [0xff; TILE];
+            let capture = |out: &mut [u8]| {
+                let _mapping = crate::watch::title_memory_reading();
+                super::capture_sparse_blocks(at, at, out, &[0; 4])
+            };
+            assert_eq!(capture(&mut tiled), None);
+            crate::inplace::title_gpu_mapping_ranges(&[(base as u64, 0, PAGE as u64)]);
+            assert_eq!(capture(&mut tiled), Some(0));
+            let mut rgba = [0xff; 4 * 4 * 4];
+            let pitch = 4 * 4;
+            let bytes = rgba.len();
+            layout.detile(&tiled, 0, 0, &mut rgba, pitch, bytes).unwrap();
+            // RGB zero stays zero under the sRGB transfer; alpha comes
+            // directly from the stored fourth channel under the same view.
+            assert_eq!(rgba, [0; 4 * 4 * 4]);
+            assert_eq!(VirtualAlloc(at as *const _, TILE, MEM_COMMIT, PAGE_NOACCESS) as usize, at);
+            assert_eq!(capture(&mut tiled), None);
+            assert!(crate::inplace::release_title_placeholder(base, 0,
+                || VirtualFree(base as *mut _, 0, MEM_RELEASE) != 0));
         }
     }
 

@@ -163,7 +163,7 @@ impl Tracer<'_> {
         })
     }
 
-    fn scalar_scale(&self, v: Value) -> Option<(Value, u32)> {
+    pub(super) fn scalar_scale(&self, v: Value) -> Option<(Value, u32)> {
         if let Some((_, [Term::Value(input), Term::Const(scale)] | [Term::Const(scale), Term::Value(input)])) =
             self.sop2(v, &["s_mul_i32"])
         {

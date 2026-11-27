@@ -2,6 +2,7 @@ use super::*;
 use crate::gfx10::Valu;
 use crate::ir::VCC;
 use crate::{ResourceType, UsedResource};
+use std::collections::BTreeMap;
 
 pub(super) fn plain(inst: &Inst) -> Option<&Valu> {
     let Fields::Valu(f) = &inst.fields else {
@@ -21,6 +22,64 @@ struct Columns {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wave32_exec_subset(words: &[u32]) -> bool {
+        let code: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 32).unwrap();
+        let t = Tracer::new(&p, &[], HwStage::Cs, None).unwrap();
+        let mask = |reg| p.blocks.iter().flat_map(|block| &block.insts)
+            .find(|inst| inst.write(Reg::V(reg)).is_some()).unwrap().read(Reg::S(EXEC)).unwrap();
+        t.resolve_exec_subset(mask(2), mask(1))
+    }
+
+    #[test]
+    fn wave32_saved_exec_must_restore_the_mask_that_covered_the_producer() {
+        let mut words = [
+            0xbe80_3c01, // s_and_saveexec_b32 s0, s1: save the wider entry mask.
+            0x7e02_0280, // v_mov_b32 v1, 0: mask under which the row is written.
+            0xbe82_3c03, // s_and_saveexec_b32 s2, s3: save the producer's mask.
+            0xbefe_0302, // Restore s2.
+            0x7da4_0080, // v_cmpx_eq_u32 exec, 0, v0.
+            0x7e04_0280, // v_mov_b32 v2, 0: mask under which the row is read.
+            0xbf81_0000,
+        ];
+        assert!(wave32_exec_subset(&words));
+        words[3] = 0xbefe_0300; // Restoring entry can re-enable lanes that skipped the row write.
+        assert!(!wave32_exec_subset(&words));
+    }
+
+    #[test]
+    fn wave32_exec_subset_checks_operand_roles_and_every_join_arm() {
+        let check = |combine| wave32_exec_subset(&[
+            0xbe80_3c01, 0x7e02_0280, // v1 records the initial narrowed EXEC.
+            0x8704_027e, // s4 = exec & s2.
+            0x8a05_037e, // s5 = exec & ~s3.
+            combine,
+            0x7e04_0280, 0xbf81_0000,
+        ]);
+        assert!(check(0x887e_0504)); // exec = s4 | s5.
+        assert!(!check(0x887e_0604)); // exec = s4 | unrelated s6.
+        assert!(!check(0x887e_0406)); // exec = unrelated s6 | s4.
+        assert!(check(0x8a7e_0604)); // exec = s4 & ~s6.
+        assert!(!check(0x8a7e_0406)); // exec = s6 & ~s4.
+        assert!(!check(0xbe87_3f06)); // s_andn2_saveexec_b32 s7, s6 can widen EXEC.
+
+        let join = |second_arm| wave32_exec_subset(&[
+            0xbe80_3c01, 0x7e02_0280,
+            0xbf84_0002, // s_cbranch_scc0 to the second arm.
+            0x877e_027e, 0xbf82_0001, // Narrow EXEC and jump to the join.
+            second_arm,
+            0x7e04_0280, 0xbf81_0000,
+        ]);
+        assert!(join(0x8a7e_037e)); // Narrow EXEC on the other arm too.
+        assert!(!join(0xbefe_0306)); // Replacing EXEC with unrelated s6 can widen it.
+        assert!(!wave32_exec_subset(&[
+            0xbe80_3c01,
+            0x877e_027e, 0x7e02_0280, // Define the producer's EXEC inside a loop.
+            0xbf85_fffd, // Re-enter the producer's defining block.
+            0x877e_037e, 0x7e04_0280, 0xbf81_0000,
+        ]));
+    }
 
     #[test]
     fn wave64_column_requires_both_mask_halves_to_cover_the_entry() {
@@ -844,6 +903,62 @@ impl Tracer<'_> {
         Some(v)
     }
 
+    /// Prove inclusion in a single original Wave32 EXEC snapshot without
+    /// interpreting the conditions that produced its component masks.
+    fn resolve_exec_subset(&self, current: Value, producer: Value) -> bool {
+        if self.p.wave64 { return false; }
+        let i = producer.0 as usize;
+        let definition = self.defs[i].or(self.phis[i]);
+        if let Some((block, _)) = definition {
+            // A loop may give the same SSA name a new dynamic mask.
+            if self.reaches(block, block) { return false; }
+        } else if self.inputs[i] != Some(Reg::S(EXEC)) {
+            return false;
+        }
+
+        fn visit(t: &Tracer<'_>, v: Value, producer: Value, seen: &mut BTreeMap<Value, Option<bool>>) -> bool {
+            if v == producer { return true; }
+            if let Some(&known) = seen.get(&v) { return known.unwrap_or(false); }
+            if seen.len() >= 128 { return false; }
+            seen.insert(v, None);
+            let result = if let Some((b, i)) = t.phis[v.0 as usize] {
+                let args = &t.p.blocks[b].phis[i].args;
+                !args.is_empty() && args.iter().all(|&arg| visit(t, arg, producer, seen))
+            } else {
+                t.def(v).is_some_and(|inst| {
+                    let exec = Reg::S(EXEC);
+                    let writes_exec = inst.write(exec) == Some(v);
+                    let mut covered = |input: Option<Value>| input.is_some_and(|x| visit(t, x, producer, seen));
+                    if writes_exec && inst.name().starts_with("v_cmpx_") {
+                        return covered(inst.read(exec));
+                    }
+                    let Fields::Sop { src, dst: Some(Operand::Scalar { code, dwords: 1 }), .. } = &inst.fields else {
+                        return false;
+                    };
+                    let writes_dst = inst.write(Reg::S(*code)) == Some(v);
+                    let scalar = |op: &Operand| match *op {
+                        Operand::Scalar { code, dwords: 1 } => inst.read(Reg::S(code)),
+                        _ => None,
+                    };
+                    match (inst.name(), src.as_slice()) {
+                        ("s_mov_b32", [a]) if writes_dst => covered(scalar(a)),
+                        ("s_and_saveexec_b32", [a]) if *code != EXEC && (writes_dst || writes_exec) => {
+                            covered(inst.read(exec)) || writes_exec && covered(scalar(a))
+                        }
+                        ("s_and_b32", [a, b]) if writes_dst => covered(scalar(a)) || covered(scalar(b)),
+                        ("s_andn2_b32", [a, _]) if writes_dst => covered(scalar(a)),
+                        ("s_or_b32", [a, b]) if writes_dst => covered(scalar(a)) && covered(scalar(b)),
+                        _ => false,
+                    }
+                })
+            };
+            seen.insert(v, Some(result));
+            result
+        }
+
+        visit(self, current, producer, &mut BTreeMap::new())
+    }
+
     fn root_word(&self, v: Value) -> Option<(u8, u32)> {
         let (p, dword) = self.param_of(self.inputs[v.0 as usize]?)?;
         (self.layout[p].root == RootType::Constants).then_some((self.layout[p].slot, dword))
@@ -1308,5 +1423,151 @@ impl Tracer<'_> {
             records,
             value_mask: u32::MAX,
         })
+    }
+
+    /// The vector fallback loads one texture handle per hit record, then
+    /// retries over the exact lanes sharing that handle. Numeric uses of
+    /// the descriptor also require a nonempty native first iteration.
+    pub(super) fn resolve_record_column(
+        &self, load: Site, resources: &Resources, used: &[UsedResource], cs: &crate::native::ComputeIo,
+    ) -> Option<(Site, FixedRecordColumn)> {
+        if self.p.wave64 || cs.threads != [32, 1, 1] || load.1 != 2 {
+            return None;
+        }
+        let block = &self.p.blocks[load.0];
+        let [reader, select, descriptor, body @ .., retry, repeat] = block.insts.as_slice() else { return None; };
+        if reader.name() != "v_readfirstlane_b32" || select.name() != "v_cmpx_eq_u32"
+            || descriptor.name() != "s_load_dwordx8"
+            || retry.name() != "s_andn2_wrexec_b32" || repeat.name() != "s_cbranch_execnz"
+        {
+            return None;
+        }
+        let image = |inst: &Inst, dim| matches!(inst.fields, Fields::Image { dim: d, .. } if d == dim);
+        let (consumer, kind) = match body {
+            [inst] if inst.name() == "image_load" && image(inst, 0) => ((load.0, 3), 1),
+            [inst] if inst.name() == "image_sample_lz" && image(inst, 1) => ((load.0, 3), 2),
+            [setup, inst] if setup.name() == "s_load_dwordx4" && inst.name() == "image_sample_lz" && image(inst, 1) => {
+                ((load.0, 4), 2)
+            }
+            [inst] if self.resolve_dimensions_word(inst, descriptor) => (load, 1),
+            _ => return None,
+        };
+        let (shift, word, [entry, _], preheader) = self.waterfall_shift(load)?;
+        self.resolve_retry_lanes(load, reader, select, retry, repeat, entry)?;
+        if consumer == load {
+            // The descriptor calculation is scalar. Absent a nonempty first
+            // iteration, readfirstlane may take an inactive lane's old word.
+            let entry = self.saved_mask(entry, &mut 64)?;
+            if !self.exec_is_nonempty((preheader, 0), entry, false) { return None; }
+        } else {
+            if self.inst(consumer).read(Reg::S(EXEC)) != select.write(Reg::S(EXEC))
+                || !resources.descriptors.iter().any(|d| d.site == consumer && d.role == Role::Resource
+                    && matches!(d.source, Source::Loaded { load: from, first: 0 } if from == load))
+            {
+                return None;
+            }
+        }
+        let read_site = self.defs[word.0 as usize]?;
+        let read = self.inst(read_site);
+        let Fields::Buffer {
+            data: Some(Operand::Vector { reg: dest, dwords: 1 }),
+            addr: Operand::Vector { reg: idx, dwords: 1 }, soffset, offset,
+            offen: false, idxen: true, format: None, lds: false, tfe: false, ..
+        } = &read.fields else { return None; };
+        let field = u32::from(*offset);
+        if !matches!((field, kind), (60, 1) | (52 | 108, 2))
+            || read.name() != "buffer_load_dword" || read.write(Reg::V(*dest)) != Some(word)
+            || self.term(read, soffset)? != Term::Const(0) || self.reaches(load.0, read_site.0)
+        {
+            return None;
+        }
+        let exec = |inst: &Inst| self.saved_mask(inst.read(Reg::S(EXEC))?, &mut 64);
+        let entry = self.saved_mask(entry, &mut 64)?;
+        if exec(read)? != entry || exec(shift)? != entry {
+            return None;
+        }
+
+        let index = read.read(Reg::V(*idx))?;
+        let mask_site = self.defs[index.0 as usize]?;
+        let mask = self.inst(mask_site);
+        let [a, b] = plain(mask)?.src.as_slice() else { return None; };
+        let producer_mask = mask.read(Reg::S(EXEC))?;
+        if mask.name() != "v_and_b32"
+            || !(self.raw(mask, a)? == Term::Const(0x3fff) || self.raw(mask, b)? == Term::Const(0x3fff))
+            || mask_site.0 != read_site.0 && self.reaches(read_site.0, mask_site.0)
+            || !(self.active_implies_exec(read_site, producer_mask)
+                || self.resolve_exec_subset(read.read(Reg::S(EXEC))?, producer_mask))
+        {
+            return None;
+        }
+        let table = self.buffer_index_table(read_site, resources)?;
+        let stride = self.record_stride(table.0, table.1, field, used)?;
+        let heap = resources.scalar.iter().find(|(site, _)| *site == load)?.1;
+        if table != (0, 288) || stride != 116 || heap.offset != 0
+            || self.layout.get(heap.param)?.root != RootType::ResourceHeap
+        {
+            return None;
+        }
+        Some((consumer, FixedRecordColumn {
+            table, field, stride, count: 16384, bytes: heap.offset, value_mask: u32::MAX,
+        }))
+    }
+
+    fn resolve_retry_lanes(
+        &self, load: Site, reader: &Inst, select: &Inst, retry: &Inst, repeat: &Inst, entry: Value,
+    ) -> Option<()> {
+        let block = &self.p.blocks[load.0];
+        let Exit::Branch { taken, not_taken } = block.exit else { return None; };
+        if taken != load.0 || not_taken == load.0 { return None; }
+        let back = block.preds.iter().position(|&pred| pred == load.0)?;
+        let exec = Reg::S(EXEC);
+        let offset = self.first_lane_offset(load)?;
+        let shifted = self.first_lane_source(offset)?;
+        let [a, b] = plain(select)?.src.as_slice() else { return None; };
+        let same = |sgpr, lane| self.term(select, sgpr) == Some(Term::Value(offset))
+            && self.raw(select, lane) == Some(Term::Value(shifted));
+        if reader.writes.first()?.1 != offset || !(same(a, b) || same(b, a)) {
+            return None;
+        }
+        if select.read(exec)? != reader.read(exec)? || retry.read(exec)? != select.write(exec)?
+            || repeat.read(exec)? != retry.write(exec)?
+        {
+            return None;
+        }
+        let Fields::Sop { dst: Some(Operand::Scalar { code, dwords: 1 }), src, .. } = &retry.fields else {
+            return None;
+        };
+        if *code >= EXEC || !matches!(src.as_slice(), [Operand::Scalar { code: from, dwords: 1 }] if from == code) {
+            return None;
+        }
+        let saved = Reg::S(*code);
+        let prior = |value: Value, reg, next| {
+            let (b, i) = self.phis[value.0 as usize]?;
+            let p = self.p.blocks[b].phis.get(i)?;
+            (b == load.0 && p.reg == reg && p.args.get(back) == Some(&next)).then(|| p.args[1 - back])
+        };
+        let first = prior(reader.read(exec)?, exec, retry.write(exec)?)?;
+        let saved = prior(retry.read(saved)?, saved, retry.write(saved)?)?;
+        (first == entry && self.saved_mask(saved, &mut 64)? == self.saved_mask(entry, &mut 64)?).then_some(())
+    }
+
+    fn resolve_dimensions_word(&self, inst: &Inst, descriptor: &Inst) -> bool {
+        let Fields::Smem { data: Some(Operand::Scalar { code, dwords: 8 }), .. } = descriptor.fields else {
+            return false;
+        };
+        let word = |operand, field| descriptor.write(Reg::S(code + field))
+            .is_some_and(|value| self.term(inst, operand) == Some(Term::Value(value)));
+        match inst.name() {
+            "v_alignbit_b32" => {
+                let Some([high, low, shift]) = plain(inst).map(|f| f.src.as_slice()) else { return false; };
+                word(high, 2) && word(low, 1) && self.term(inst, shift) == Some(Term::Const(30))
+            }
+            "s_bfe_u32" => {
+                let Fields::Sop { src, .. } = &inst.fields else { return false; };
+                let [value, ctrl] = src.as_slice() else { return false; };
+                word(value, 3) && self.term(inst, ctrl) == Some(Term::Const(0x0004_000c))
+            }
+            _ => false,
+        }
     }
 }

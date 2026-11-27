@@ -8362,6 +8362,15 @@ impl<'a> Lower<'a> {
                     } else {
                         self.indexed_forms.uav_indices.push((*index,kind,store));
                     }
+                } else if form == 8 && *first == 0 && matches!(leaf, Source::Loaded { .. })
+                    && let Some((_, _, column)) = self.x.res.resolve_record_columns.iter()
+                        .find(|(source, consumer, column)| source == load && *consumer == site
+                            && matches!((column.field, props.0 & 0xff), (60, 1) | (52 | 108, 2)))
+                {
+                    let entry = (*column, (props.0 & 0xff) as u8);
+                    if !self.indexed_forms.fixed_record_columns.contains(&entry) {
+                        self.indexed_forms.fixed_record_columns.push(entry);
+                    }
                 } else if form == 8 && *first == 0 && exact && (1..=9).contains(&(props.0 & 0xff))
                     && let Some((_, column)) = self.x.res.fixed_record_columns.iter().find(|(site, _)| site == load)
                 {
@@ -8386,6 +8395,14 @@ impl<'a> Lower<'a> {
                         if !self.indexed_forms.packed_material.contains(&entry) {
                             self.indexed_forms.packed_material.push(entry);
                         }
+                    }
+                } else if form == 8 && *first == 0 && exact && (1..=9).contains(&(props.0 & 0xff))
+                    && let Some((_, _, column)) = self.x.res.indirect_record_columns.iter()
+                        .find(|(source, consumer, _)| source == load && *consumer == site)
+                {
+                    let entry = (*column, (props.0 & 0xff) as u8);
+                    if !self.indexed_forms.indirect_record_columns.contains(&entry) {
+                        self.indexed_forms.indirect_record_columns.push(entry);
                     }
                 } else if form == 8 && matches!(leaf, Source::Loaded { .. }) && (1..=9).contains(&(props.0 & 0xff))
                     && self.x.res.buffer_indices.iter().any(|(site, _)| site == load)

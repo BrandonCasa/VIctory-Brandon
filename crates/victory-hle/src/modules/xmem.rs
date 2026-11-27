@@ -179,6 +179,14 @@ pub extern "system" fn XMemVirtualAlloc(
     }
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
+        // A new private allocation with these flags is committed and
+        // readable throughout. A partial commit or a reserved placeholder
+        // only describes part of an existing allocation and is not a proof.
+        if constrained && flags & ADDRESS_32BIT == 0 && protect == PAGE_READWRITE
+            && kind == (MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH)
+        {
+            victory_gpu::title_private_memory_committed(at as usize, size);
+        }
     }
     if !at.is_null() && kind & MEM_RESERVE_PLACEHOLDER != 0 && kind & MEM_REPLACE_PLACEHOLDER == 0 {
         victory_gpu::title_placeholder_reserved(at as usize, size);

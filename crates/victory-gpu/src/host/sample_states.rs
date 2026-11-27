@@ -395,3 +395,34 @@ fn omitting_an_entire_srv_pins_every_matching_stage() {
     scopes.coverage.get_mut().clear();
     assert!(!scopes.excludes(4, 11));  // unbounded shape
 }
+
+#[cfg(test)]
+#[test]
+fn sampled_readers_preserve_partial_dimensions_and_require_every_proof_for_union() {
+    use super::{SampleSelection, SampledReaders, StageSelections};
+    use crate::descriptor::host::IndexedSlots;
+
+    let mut slots = IndexedSlots::default();
+    let mut readers = SampledReaders::new(true, 1 << 1);
+    readers.bind(2, Some(SampleWords::direct(None, None)), &mut slots.words);
+    readers.bind(5, Some(SampleWords::direct(None, None)), &mut slots.words);
+    readers.bind(5, None, &mut slots.words);
+    let mut uses = Uses::default();
+    readers.observe(&mut uses, 7, 0x40, &slots);
+    uses.issued(1);
+    let mut recorded = uses.readers_for(7, false);
+    recorded.sort_unstable();
+    assert_eq!(recorded, [(4, Some(0)), (34, None)]);
+    let mut stages = StageSelections { readers: recorded, ..Default::default() };
+    stages.entries.insert(0, (SampleSelection { words: Arc::from([]), slots: [5].into(), heap_count: 100 }, false.into()));
+    assert!(stages.all_sampled_slots().is_none());
+    assert!(!stages.entries[&0].1.get());
+    assert!(stages.excludes(4, 8));
+    assert!(!stages.excludes(0, 8));
+    assert!(!stages.excludes(2, 8));
+
+    stages.readers = vec![(4, Some(0)), (32, Some(1))];
+    stages.entries.insert(1, (SampleSelection { words: Arc::from([]), slots: [7].into(), heap_count: 100 }, false.into()));
+    assert_eq!(stages.all_sampled_slots(), Some([5, 7].into()));
+    assert!(stages.entries[&1].1.get());
+}

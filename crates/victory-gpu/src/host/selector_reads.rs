@@ -3,24 +3,52 @@
 use super::*;
 use crate::descriptor::index_words::{
     DependentWords, DeviceBytes, DeviceRanges, SELECTOR_READ_BUDGET, WIDE_SELECTOR_READ_BUDGET,
+    INDIRECT_CHILD_BUDGET, INDIRECT_CHILD_RANGES, INDIRECT_PARENT_BUDGET,
 };
 
 #[cfg(feature = "diagnostics")]
 pub(super) static PROBE_FENCES: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
-// These private fences sit behind the actual selector copy/upload on the
-// direct queue, separately from the native title-list clock.
-fn wait_for_probe(queue: &ID3D12CommandQueue, fence: &ID3D12Fence) -> windows::core::Result<()> {
-    // SAFETY: both COM interfaces are live through this synchronous wait.
-    unsafe {
-        queue.Signal(fence, 1)?;
-        #[cfg(feature = "diagnostics")]
-        PROBE_FENCES[0].fetch_add(1, Ordering::Relaxed);
-        fence.SetEventOnCompletion(1, HANDLE::default())?;
-        #[cfg(feature = "diagnostics")]
-        PROBE_FENCES[1].fetch_add(1, Ordering::Relaxed);
-        Ok(())
+/// The private direct-queue fence retires each copy before the CPU reads or
+/// reuses the readback buffer and command allocator. The occurrence still
+/// owns independent copies of the returned bytes.
+pub(super) struct Probe {
+    fence: ID3D12Fence,
+    value: u64,
+    commands: Option<Prelude>,
+    readback: Option<(usize, ID3D12Resource)>,
+}
+
+impl Probe {
+    fn new(host: &Host) -> Option<Self> {
+        let fence = unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.ok()?;
+        Some(Self { fence, value: 0, commands: None, readback: None })
+    }
+
+    fn wait(&mut self, queue: &ID3D12CommandQueue) -> windows::core::Result<()> {
+        self.value += 1;
+        // SAFETY: both COM interfaces are live through this synchronous wait.
+        unsafe {
+            queue.Signal(&self.fence, self.value)?;
+            #[cfg(feature = "diagnostics")]
+            PROBE_FENCES[0].fetch_add(1, Ordering::Relaxed);
+            self.fence.SetEventOnCompletion(self.value, HANDLE::default())?;
+            if self.fence.GetCompletedValue() == u64::MAX {
+                return Err(windows::core::Error::from_hresult(windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED));
+            }
+            #[cfg(feature = "diagnostics")]
+            PROBE_FENCES[1].fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    fn buffer(&mut self, host: &Host, bytes: usize) -> Option<ID3D12Resource> {
+        if self.readback.as_ref().is_none_or(|(capacity, _)| *capacity < bytes) {
+            let capacity = bytes.max(SELECTOR_READ_BUDGET).next_power_of_two();
+            self.readback = Some((capacity, host.read_back_buffer(capacity as u64)?));
+        }
+        self.readback.as_ref().map(|(_, buffer)| buffer.clone())
     }
 }
 
@@ -137,7 +165,9 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
 }
 
 pub(super) fn read(host: &Host, list: &HostList, plan: &Plan) -> Option<DeviceBytes> {
-    let upload_fence: ID3D12Fence = unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.ok()?;
+    let mut slot = host.selector_probe.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() { *slot = Some(Probe::new(host)?); }
+    let probe = slot.as_mut().expect("initialized selector probe");
     // Gather uploads only once and preserve later dirty bytes until the next
     // occurrence. Every level runs on this direct queue behind those uploads.
     let mut batch = Batch::default();
@@ -155,12 +185,20 @@ pub(super) fn read(host: &Host, list: &HostList, plan: &Plan) -> Option<DeviceBy
         .map(|(&key,shadow)| (key,shadow.clone())).partition(|((_,_,n),_)| *n <= 256);
     let mut bulk = Some(bulk);
     let mut retired = false;
+    let mut record_parents = RecordReadBudget { bytes: INDIRECT_PARENT_BUDGET, ranges: INDIRECT_CHILD_RANGES };
+    let mut record_children = RecordReadBudget { bytes: INDIRECT_CHILD_BUDGET, ranges: INDIRECT_CHILD_RANGES };
+    let mut record_refused = 0usize;
     // Indirect X count, group table, record pointers, then material handles. Each round
     // deduplicates all paths and descriptors before issuing the readback.
     for round in 0..4 {
+        let mut parents = DeviceRanges::new();
+        let mut children = DeviceRanges::new();
         for chain in &plan.chains {
-            chain.evaluate(&plan.writes, 0, &mut Default::default(), Some(&bytes), &mut ranges);
+            chain.plan_ranges(&plan.writes, &bytes, &mut ranges, &mut parents, &mut children);
         }
+        let parent_room = record_parents.bytes;
+        record_refused += record_parents.admit(parents, &mut ranges);
+        record_refused += record_children.admit(children, &mut ranges);
         // Prioritize precise dependent words before a whole table. All
         // accepted bytes belong to this same ordered occurrence.
         if round == 3 || ranges.is_empty() || plan.chains.is_empty() {
@@ -180,18 +218,19 @@ pub(super) fn read(host: &Host, list: &HostList, plan: &Plan) -> Option<DeviceBy
         if ranges.is_empty() { break; }
         // The readback allocation is bounded per copy batch. Many exact
         // draws can share an occurrence without losing their last operands.
+        let batch_budget = (parent_room - record_parents.bytes).max(SELECTOR_READ_BUDGET);
         let mut batch = DeviceRanges::new();
         let mut size = 0;
         for (key,shadow) in std::mem::take(&mut ranges) {
-            if size != 0 && size + key.2 > SELECTOR_READ_BUDGET {
-                if let Some(fetched) = read_ranges(host,&batch) { retired = true; bytes.extend(fetched); }
+            if size != 0 && size + key.2 > batch_budget {
+                if let Some(fetched) = read_ranges(host, probe, &batch) { retired = true; bytes.extend(fetched); }
                 batch.clear();
                 size = 0;
             }
             size += key.2;
             batch.insert(key,shadow);
         }
-        if !batch.is_empty() && let Some(fetched) = read_ranges(host,&batch) {
+        if !batch.is_empty() && let Some(fetched) = read_ranges(host, probe, &batch) {
             retired = true;
             bytes.extend(fetched);
         }
@@ -200,20 +239,57 @@ pub(super) fn read(host: &Host, list: &HostList, plan: &Plan) -> Option<DeviceBy
         // Even an unavailable chain can leave an ordinary upload on the
         // queue. Its allocator and source memory retire after that work.
         if !retired {
-            wait_for_probe(&host.queue, &upload_fence)
+            probe.wait(&host.queue)
                 .unwrap_or_else(|error| fail(format_args!("could not retire the material uploads ({error})")));
         }
         host.card_done(plan);
     }
+    #[cfg(feature = "diagnostics")]
+    if gpu_progress() && (record_parents.bytes != INDIRECT_PARENT_BUDGET
+        || record_children.bytes != INDIRECT_CHILD_BUDGET || record_refused != 0)
+    {
+        static BATCHES: AtomicU64 = AtomicU64::new(0);
+        let uses = BATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+        if uses.is_power_of_two() {
+            tracing::info!(uses, parent_bytes=INDIRECT_PARENT_BUDGET - record_parents.bytes,
+                child_bytes=INDIRECT_CHILD_BUDGET - record_children.bytes,
+                child_ranges=INDIRECT_CHILD_RANGES - record_children.ranges, refused=record_refused,
+                "ordered indirect-record selector readback budget");
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = record_refused;
     Some(bytes)
 }
 
-fn read_ranges(host: &Host, ranges: &DeviceRanges) -> Option<DeviceBytes> {
+struct RecordReadBudget {
+    bytes: usize,
+    ranges: usize,
+}
+
+impl RecordReadBudget {
+    fn admit(&mut self, requests: DeviceRanges, output: &mut DeviceRanges) -> usize {
+        let mut refused = 0;
+        for (key, shadow) in requests {
+            if output.contains_key(&key) { continue; }
+            if key.2 > self.bytes || self.ranges == 0 {
+                refused += 1;
+                continue;
+            }
+            self.bytes -= key.2;
+            self.ranges -= 1;
+            output.insert(key, shadow);
+        }
+        refused
+    }
+}
+
+fn read_ranges(host: &Host, probe: &mut Probe, ranges: &DeviceRanges) -> Option<DeviceBytes> {
     let total: usize = ranges.keys().map(|(_, _, n)| *n).sum();
-    let readback = host.read_back_buffer(total as u64)?;
-    let (allocator, commands) = host.make_prelude()?;
-    // Create all command resources before taking the occurrence's dirty uploads.
-    let fence: ID3D12Fence = unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.ok()?;
+    let readback = probe.buffer(host, total)?;
+    // Keep the cached list empty on a recording error. Only a closed,
+    // completed prelude is eligible for reuse on the next request.
+    let (allocator, commands) = probe.commands.take().or_else(|| host.make_prelude())?;
     unsafe {
         allocator.Reset().ok()?;
         commands.Reset(&allocator, None).ok()?;
@@ -240,13 +316,14 @@ fn read_ranges(host: &Host, ranges: &DeviceRanges) -> Option<DeviceBytes> {
     // Separate ExecuteCommandLists calls give buffers their usual COMMON decay.
     unsafe {
         host.queue.ExecuteCommandLists(&[Some(command)]);
-        wait_for_probe(&host.queue, &fence)
+        probe.wait(&host.queue)
             .unwrap_or_else(|error| {
                 fail(format_args!(
                     "could not complete the material selector readback ({error})"
                 ))
             });
     }
+    probe.commands = Some((allocator, commands));
     let mut bytes = DeviceBytes::new();
     let mut data = std::ptr::null_mut();
     let region = D3D12_RANGE { Begin: 0, End: total };
@@ -314,20 +391,24 @@ mod tests {
         list.defer_refresh(&shadow, at, 4);
         let first = (shadow.id(), at, 4);
         let second = (shadow.id(), at + 4, 4);
-        let ranges = DeviceRanges::from([(first, shadow.clone()), (second, shadow)]);
-        let snapshot = read(
-            host,
-            &list,
-            &Plan {
-                refresh_sources: [first.0].into(),
-                ordinary: ranges,
-                chains: vec![],
-                writes: vec![],
-            },
-        )
-        .unwrap();
+        let plan = Plan {
+            refresh_sources: [first.0].into(),
+            ordinary: DeviceRanges::from([(first, shadow.clone()), (second, shadow.clone())]),
+            chains: vec![],
+            writes: vec![],
+        };
+        let snapshot = read(host, &list, &plan).unwrap();
         assert_eq!(snapshot[&first], 11u32.to_le_bytes());
         assert_eq!(snapshot[&second], 7u32.to_le_bytes());
+
+        let (next, data) = host.upload_buffer(8).unwrap();
+        unsafe { std::ptr::copy_nonoverlapping([29u32, 31].as_ptr().cast::<u8>(), data, 8); }
+        host.copy_preserved_buffers(&[(shadow.buffer.clone(), 0, next, 0, 8)]).unwrap();
+        let next_list = host.new_list().unwrap();
+        let subsequent = read(host, &next_list, &plan).unwrap();
+        assert_eq!(subsequent[&first], 29u32.to_le_bytes());
+        assert_eq!(subsequent[&second], 31u32.to_le_bytes());
+        assert_eq!(snapshot[&first], 11u32.to_le_bytes());
     }
 
     #[test]

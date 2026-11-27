@@ -1,4 +1,5 @@
 use super::*;
+use super::indirect_records::dense_record_chunks;
 use victory_shader::resource::{FixedRecordColumn, PackedMaterialColumn, ScalarRangeColumn, ScalarRecordChain};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -10,6 +11,8 @@ pub(crate) enum DependentWords {
     PackedMaterial(PackedMaterialWords),
     FixedRecord(FixedRecordWords),
     ScalarRange(ScalarRangeWords),
+    VertexInput(VertexInputWords),
+    IndirectRecords(IndirectRecordWords),
 }
 
 /// The device-validated scalar base is extended by the original bounded
@@ -103,27 +106,30 @@ fn scalar_range_rows(base: u32, count: u32, stride: u32) -> [(u32, u32); 2] {
 pub(crate) struct FixedRecordWords {
     source: IndexWords,
     columns: Vec<FixedRecordColumn>,
+    dense: bool,
 }
 
 impl FixedRecordWords {
     pub(crate) fn new(source: IndexWords, mut columns: Vec<FixedRecordColumn>) -> Option<Self> {
         let first = *columns.first()?;
-        if !(1..=512).contains(&first.count) || !first.stride.is_multiple_of(4)
-            || first.count.checked_mul(first.stride)? > 2 * SELECTOR_READ_BUDGET as u32
+        let dense = is_resolve_handle_column(first);
+        if !dense && (!(1..=512).contains(&first.count) || !first.stride.is_multiple_of(4)
+            || first.count.checked_mul(first.stride)? > 2 * SELECTOR_READ_BUDGET as u32)
         {
             return None;
         }
         for column in &columns {
             if column.table != first.table || column.count != first.count || column.stride != first.stride
                 || !column.field.is_multiple_of(4) || column.field.checked_add(4)? > first.stride
+                || (dense && !is_resolve_handle_column(*column))
             {
                 return None;
             }
         }
         columns.sort_unstable_by_key(|column| (column.field, column.bytes, column.value_mask));
         columns.dedup();
-        if columns.len().checked_mul(first.count as usize)? > 512 { return None; }
-        Some(Self { source, columns })
+        if !dense && columns.len().checked_mul(first.count as usize)? > 512 { return None; }
+        Some(Self { source, columns, dense })
     }
 
     fn evaluate(
@@ -131,6 +137,22 @@ impl FixedRecordWords {
         device: Option<&DeviceBytes>, pending: &mut DeviceRanges,
     ) -> bool {
         let first = self.columns[0];
+        if self.dense {
+            if device.is_none() && self.source.device_input().is_some() { return false; }
+            let topology = crate::resource::alias_generation();
+            let mapping = crate::watch::changes();
+            let mut chunks = dense_record_chunks(self.source.size, first.count, first.stride).peekable();
+            if chunks.peek().is_none() {
+                return self.source.validated_bytes((self.source.base as usize, 0), writes, device,
+                    |bytes| decode_fixed_record_rows(&self.columns, bytes, 0, 0, limit, out));
+            }
+            let mut complete = true;
+            for (offset, len, rows) in chunks {
+                complete &= self.source.dependent_bytes(offset, len, writes, device, pending,
+                    |bytes| decode_fixed_record_rows(&self.columns, bytes, 0, rows, limit, out));
+            }
+            return complete && topology == crate::resource::alias_generation() && mapping == crate::watch::changes();
+        }
         let last = self.columns.last().expect("fixed record columns");
         let end = (first.count - 1) * first.stride + last.field + 4;
         let end = u64::from(end).min(self.source.size & !3);
@@ -160,10 +182,19 @@ impl FixedRecordWords {
     }
 }
 
+pub(crate) fn is_resolve_handle_column(column: FixedRecordColumn) -> bool {
+    column.table == (0, 288) && matches!(column.field, 52 | 60 | 108) && column.stride == 116 && column.count == 16384
+        && column.bytes == 0 && column.value_mask == u32::MAX
+}
+
 fn decode_fixed_records(columns: &[FixedRecordColumn], bytes: &[u8], start: u32, limit: u32, out: &mut BTreeSet<u32>) {
+    decode_fixed_record_rows(columns, bytes, start, columns[0].count, limit, out);
+}
+
+fn decode_fixed_record_rows(columns: &[FixedRecordColumn], bytes: &[u8], start: u32, rows: u32, limit: u32, out: &mut BTreeSet<u32>) {
     for column in columns {
         insert_slot(0, column.bytes, limit, out);
-        for row in 0..column.count {
+        for row in 0..rows {
             let offset = (row * column.stride + column.field - start) as usize;
             if let Some(word) = bytes.get(offset..offset + 4) {
                 let slot = u32::from_le_bytes(word.try_into().expect("four-byte field"));
@@ -264,6 +295,8 @@ impl DependentWords {
             Self::PackedMaterial(words) => words.parent.device_input().is_some() || words.records.device_input().is_some(),
             Self::FixedRecord(words) => words.source.device_input().is_some(),
             Self::ScalarRange(words) => words.records.device_input().is_some() || words.base.device_sources().next().is_some(),
+            Self::VertexInput(words) => words.device_sources().into_iter().any(|id| id.is_some()),
+            Self::IndirectRecords(words) => words.device_sources().into_iter().any(|id| id.is_some()),
         }
     }
 
@@ -287,6 +320,11 @@ impl DependentWords {
             ],
             Self::FixedRecord(words) => [words.source.device_input().map(|b| b.id()), None, None],
             Self::ScalarRange(words) => [words.records.device_input().map(|b| b.id()), None, None],
+            Self::VertexInput(words) => {
+                let [vertex, index] = words.device_sources();
+                [vertex, index, None]
+            }
+            Self::IndirectRecords(words) => words.device_sources(),
         }
         .into_iter().flatten().chain(programs.into_iter().flat_map(ScalarPrograms::device_sources))
     }
@@ -305,6 +343,13 @@ impl DependentWords {
             Self::PackedMaterial(words) => words.evaluate(writes, limit, out, device, pending),
             Self::FixedRecord(words) => words.evaluate(writes, limit, out, device, pending),
             Self::ScalarRange(words) => words.evaluate(writes, limit, out, device, pending),
+            Self::VertexInput(words) => words.evaluate(writes, limit, out, device, pending),
+            Self::IndirectRecords(words) => {
+                let mut parents = DeviceRanges::new();
+                let complete = words.evaluate(writes, limit, out, device, &mut parents, pending);
+                pending.extend(parents);
+                complete
+            }
             Self::Scalar { spec, sources } => {
                 scalar_handles(spec, |table, offset| sources[table].dependent_word(offset, writes, device, pending),
                     |slot| insert_slot(slot, 0, limit, out))
@@ -314,6 +359,22 @@ impl DependentWords {
                 read_fields(base, fields.iter().copied(), |word| records.dependent_word(word, writes, device, pending),
                     |slot| insert_slot(slot, 0, limit, out))
             }
+        }
+    }
+
+    pub(crate) fn plan_ranges(
+        &self, writes: &[(usize, usize)], device: &DeviceBytes, ordinary: &mut DeviceRanges,
+        record_parents: &mut DeviceRanges, record_children: &mut DeviceRanges,
+    ) {
+        let mut unused = BTreeSet::new();
+        match self {
+            Self::IndirectRecords(words) => {
+                words.evaluate(writes, 0, &mut unused, Some(device), record_parents, record_children);
+            }
+            Self::FixedRecord(words) if words.dense => {
+                words.evaluate(writes, 0, &mut unused, Some(device), record_parents);
+            }
+            _ => { self.evaluate(writes, 0, &mut unused, Some(device), ordinary); }
         }
     }
 }
@@ -377,6 +438,30 @@ mod tests {
         let mut slots = BTreeSet::new();
         decode_fixed_records(&[column], &bytes, 4, 1024, &mut slots);
         assert_eq!(slots.into_iter().collect::<Vec<_>>(), [0, 37, 91]);
+    }
+
+    #[test]
+    fn resolve_fixed_handle_column_shares_the_exact_dense_parent_chunks() {
+        let column = FixedRecordColumn { table: (0, 288), field: 60, stride: 116, count: 16384,
+            bytes: 0, value_mask: u32::MAX };
+        assert!(is_resolve_handle_column(column));
+        assert!(!is_resolve_handle_column(FixedRecordColumn { bytes: 32, ..column }));
+        assert!(!is_resolve_handle_column(FixedRecordColumn { value_mask: 0xffff, ..column }));
+        let chunks = |size| dense_record_chunks(size, column.count, column.stride).collect::<Vec<_>>();
+        assert_eq!(chunks(1_900_544), [(0, 950_272, 8192), (950_272, 950_272, 8192)]);
+        assert_eq!(chunks(950_272 + 72), [(0, 950_272, 8192), (950_272, 72, 1)]);
+        assert_eq!(chunks(950_272 + 63), [(0, 950_272, 8192), (950_272, 60, 1)]);
+
+        let mut second = [0; 72];
+        second[60..64].copy_from_slice(&0x8000_0025u32.to_le_bytes());
+        second[64..68].copy_from_slice(&9u32.to_le_bytes());
+        let select = |bytes: &[u8]| {
+            let mut slots = BTreeSet::new();
+            decode_fixed_record_rows(&[column], bytes, 0, 1, 64, &mut slots);
+            slots
+        };
+        assert_eq!(select(&second), BTreeSet::from([0, 37]));
+        assert_eq!(select(&second[..63]), BTreeSet::from([0]));
     }
 
     #[test]

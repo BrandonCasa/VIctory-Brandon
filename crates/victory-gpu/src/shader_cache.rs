@@ -302,6 +302,7 @@ fn stale_vehicle_reflection(shader: &HostShader, container: &[u8]) -> bool {
                 | "5588031a7d0dce3d21389f47970e5e9f306c0a800f19ad4e1e5ffc1c5dd2d711"
                 | "5862598309ecead43de02a920f9857470bc4ea09911b8a05a139aa79ccd896b7"
                 | "7333603e0e1b4e905112308f532a7a7afea2d5734ba88d0e65d759a57124c514"
+                | "74d016634e50b80e47b7120eebcb96395544d69af63301e7ddaae63b29bd36c3"
                 | "7778fb128a65511e46c55ac36e0d24f7745d9b0a217df8468934d0115e6441ad"
                 | "81f23cdc52f59a699fe3c17b2b59c263795fe85c142f1b51dc42882bafcbfd16"
                 | "8866d7d19733564c54eb06ca993d514ede63b0613ba619b8878932ba3855adfd"
@@ -359,6 +360,18 @@ fn stale_vertex_input_reflection(shader: &HostShader, container: &[u8]) -> bool 
         && shader.indexed_forms.opaque & 8 != 0
         && blake3::hash(container).to_hex().as_str()
             == "9453de2c1f865e27dfe1c7f7ea312c71edee25dd453af654f0e2dadd807018f3"
+}
+
+// Earlier Resolve translations can leave the entire material pool as a
+// byte-stride selector. Try the bounded original record walk on a new build.
+fn stale_resolve_record_reflection(shader: &HostShader) -> bool {
+    let access = &shader.indexed_forms;
+    shader.stage == HwStage::Cs && access.buffer_indices.iter().any(|(index, _)| {
+            index.table_slot == 0 && matches!((index.table_dword, index.word_step), (648, 1) | (288, 4))
+        })
+        && (access.indirect_record_columns.is_empty()
+            || !access.fixed_record_columns.iter().any(|(column, _)|
+                crate::descriptor::index_words::is_resolve_handle_column(*column)))
 }
 
 fn stale_vehicle_offset_reflection(shader: &HostShader, container: &[u8]) -> bool {
@@ -504,6 +517,7 @@ fn cached_by(
                     || stale_cascade_shadow_reflection(&shader, container)
                     || stale_clustered_compute_reflection(&shader, container)
                     || stale_vertex_input_reflection(&shader, container)
+                    || stale_resolve_record_reflection(&shader)
                     || stale_compute_translation(&shader, container)
                 {
                     tracing::debug!(path = %path.display(), "shader cache entry of an earlier translator; translating again");
@@ -568,6 +582,7 @@ const PACKED_MAGIC: &[u8; 4] = b"VSHL";
 const FIXED_MAGIC: &[u8; 4] = b"VSHM";
 const SCALAR_RANGE_MAGIC: &[u8; 4] = b"VSHN";
 const VERTEX_INPUT_MAGIC: &[u8; 4] = b"VSHO";
+const INDIRECT_RECORD_MAGIC: &[u8; 4] = b"VSHP";
 const INDEXED_BUFFER_WRITE: u32 = 4;
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
@@ -629,7 +644,9 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
     let fixed = &s.indexed_forms.fixed_record_columns;
     let ranges = &s.indexed_forms.scalar_range_columns;
     let vertex_inputs = &s.indexed_forms.vertex_inputs;
-    let magic = if !vertex_inputs.is_empty() { VERTEX_INPUT_MAGIC }
+    let indirect = &s.indexed_forms.indirect_record_columns;
+    let magic = if !indirect.is_empty() { INDIRECT_RECORD_MAGIC }
+        else if !vertex_inputs.is_empty() { VERTEX_INPUT_MAGIC }
         else if !ranges.is_empty() { SCALAR_RANGE_MAGIC } else if !fixed.is_empty() { FIXED_MAGIC }
         else if !packed.is_empty() { PACKED_MAGIC } else { MAGIC };
     let mut out = magic.to_vec();
@@ -776,7 +793,7 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
             }
         }
     }
-    if [FIXED_MAGIC, SCALAR_RANGE_MAGIC, VERTEX_INPUT_MAGIC].contains(&magic) {
+    if [FIXED_MAGIC, SCALAR_RANGE_MAGIC, VERTEX_INPUT_MAGIC, INDIRECT_RECORD_MAGIC].contains(&magic) {
         word(&mut out, fixed.len() as u32);
         for &(column, kind) in fixed {
             for value in [u32::from(column.table.0), column.table.1, column.field,
@@ -786,7 +803,7 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
             }
         }
     }
-    if magic == SCALAR_RANGE_MAGIC || magic == VERTEX_INPUT_MAGIC {
+    if [SCALAR_RANGE_MAGIC, VERTEX_INPUT_MAGIC, INDIRECT_RECORD_MAGIC].contains(&magic) {
         word(&mut out, ranges.len() as u32);
         for (column, kind) in ranges {
             for value in [u32::from(column.records.0), column.records.1, column.count,
@@ -804,6 +821,24 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
                 index.value_mask, u32::from(kind)]
             {
                 word(&mut out, value);
+            }
+        }
+    }
+    if magic == INDIRECT_RECORD_MAGIC {
+        word(&mut out, indirect.len() as u32);
+        for &(column, kind) in indirect {
+            for value in [u32::from(column.parent.0), column.parent.1, column.count, column.stride,
+                column.pointer_field, u32::from(column.records.0), column.records.1,
+                column.handle_offset, column.heap_bytes, u32::from(kind)]
+            {
+                word(&mut out, value);
+            }
+            if let Some(tag) = column.guard {
+                for value in [tag.parent_field, u32::from(tag.table.0), tag.table.1, tag.field] {
+                    word(&mut out, value);
+                }
+            } else {
+                word(&mut out, u32::MAX);
             }
         }
     }
@@ -852,7 +887,8 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
     let mut r = Reader(bytes);
     let magic = r.take(4)?;
     let vertex_access = magic == VERTEX_INPUT_MAGIC;
-    let range_access = magic == SCALAR_RANGE_MAGIC || vertex_access;
+    let indirect_access = magic == INDIRECT_RECORD_MAGIC;
+    let range_access = magic == SCALAR_RANGE_MAGIC || vertex_access || indirect_access;
     let fixed_access = magic == FIXED_MAGIC || range_access;
     let packed_access = magic == PACKED_MAGIC || fixed_access;
     let typed_access = packed_access || magic == MAGIC || magic == b"VSHJ";
@@ -1076,13 +1112,15 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
                 table: (u8::try_from(r.word()?).ok()?, r.word()?),
                 field: r.word()?, stride: r.word()?, count: r.word()?, bytes: r.word()?, value_mask: r.word()?,
             };
-            if !(1..=512).contains(&column.count) || !column.stride.is_multiple_of(4)
+            let kind = u8::try_from(r.word()?).ok().filter(|kind| (1..=9).contains(kind))?;
+            let resolve_column = stage == HwStage::Cs && matches!((column.field, kind), (52 | 108, 2) | (60, 1))
+                && crate::descriptor::index_words::is_resolve_handle_column(column);
+            if (!(1..=512).contains(&column.count) && !resolve_column) || !column.stride.is_multiple_of(4)
                 || !column.field.is_multiple_of(4) || column.field.checked_add(4)? > column.stride
                 || column.count.checked_mul(column.stride).is_none()
             {
                 return None;
             }
-            let kind = u8::try_from(r.word()?).ok().filter(|kind| (1..=9).contains(kind))?;
             fixed_record_columns.push((column, kind));
         }
     }
@@ -1118,7 +1156,35 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
             vertex_inputs.push((victory_shader::resource::VertexInputIndex { row, channel, bytes, value_mask }, kind));
         }
     }
-    let indexed_forms = victory_shader::emit::IndexedAccess { opaque, texture_kinds, offsets, buffer_indices, uav_indices, buffer_uav_indices, packed_material, fixed_record_columns, scalar_range_columns, vertex_inputs, chains, scalar_records, scalar_programs, pointer_fields,input_limits,output_limits };
+    let mut indirect_record_columns = Vec::new();
+    if indirect_access {
+        use victory_shader::resource::{IndirectRecordColumn, RecordTag};
+        let count = r.word()?;
+        if stage != HwStage::Cs || count == 0 || count as usize > r.0.len() / 44 { return None; }
+        for _ in 0..count {
+            let parent = (u8::try_from(r.word()?).ok()?, r.word()?);
+            let (rows, stride, pointer_field) = (r.word()?, r.word()?, r.word()?);
+            let records = (u8::try_from(r.word()?).ok()?, r.word()?);
+            let (handle_offset, heap_bytes) = (r.word()?, r.word()?);
+            let kind = u8::try_from(r.word()?).ok().filter(|kind| (1..=9).contains(kind))?;
+            let valid_field = |field: u32| field.is_multiple_of(4) && field.checked_add(4).is_some_and(|end| end <= stride);
+            if !(1..=16_384).contains(&rows) || !stride.is_multiple_of(4)
+                || !valid_field(pointer_field) || rows.checked_mul(stride).is_none()
+                || !handle_offset.is_multiple_of(4) { return None; }
+            let tag = r.word()?;
+            let guard = if tag == u32::MAX { None } else {
+                if !valid_field(tag) { return None; }
+                let table = (u8::try_from(r.word()?).ok()?, r.word()?);
+                let field = r.word()?;
+                if !field.is_multiple_of(4) { return None; }
+                Some(RecordTag { parent_field: tag, table, field })
+            };
+            indirect_record_columns.push((IndirectRecordColumn {
+                parent, count: rows, stride, pointer_field, records, handle_offset, heap_bytes, guard,
+            }, kind));
+        }
+    }
+    let indexed_forms = victory_shader::emit::IndexedAccess { opaque, texture_kinds, offsets, buffer_indices, uav_indices, buffer_uav_indices, packed_material, fixed_record_columns, scalar_range_columns, vertex_inputs, indirect_record_columns, chains, scalar_records, scalar_programs, pointer_fields,input_limits,output_limits };
     let count = r.word()? as usize;
     if r.0.len() != count.checked_mul(8)? {
         return None;
@@ -1182,6 +1248,7 @@ mod tests {
                 fixed_record_columns: Vec::new(),
                 scalar_range_columns: Vec::new(),
                 vertex_inputs: Vec::new(),
+                indirect_record_columns: Vec::new(),
                 pointer_fields:vec![(victory_shader::resource::PointerField {pointer:(1,56),records:(0,160),pointer_offset:28,field:4},2)],
                 scalar_programs: vec![(vec![victory_shader::resource::ScalarWordOp::Constant(20),
                     victory_shader::resource::ScalarWordOp::Read { table:(1,8),address:0 }],2)],
@@ -1341,6 +1408,17 @@ mod tests {
         assert_eq!(decode(&fixed_bytes), Some((fixed.clone(), b"made by".to_vec())));
         fixed.indexed_forms.fixed_record_columns[0].0.count += 1;
         assert!(decode(&encode(&fixed, "made by")).is_none());
+        fixed.stage = HwStage::Cs;
+        fixed.indexed_forms.fixed_record_columns[0] = (victory_shader::resource::FixedRecordColumn {
+            table: (0, 288), field: 60, stride: 116, count: 16_384, bytes: 0, value_mask: u32::MAX,
+        }, 1);
+        assert_eq!(decode(&encode(&fixed, "made by")), Some((fixed.clone(), b"made by".to_vec())));
+        fixed.indexed_forms.fixed_record_columns[0].1 = 2;
+        assert!(decode(&encode(&fixed, "made by")).is_none());
+        fixed.indexed_forms.fixed_record_columns[0].0.field = 52;
+        assert_eq!(decode(&encode(&fixed, "made by")), Some((fixed.clone(), b"made by".to_vec())));
+        fixed.indexed_forms.fixed_record_columns[0].0.field = 108;
+        assert_eq!(decode(&encode(&fixed, "made by")), Some((fixed.clone(), b"made by".to_vec())));
         let mut range = host.clone();
         range.indexed_forms.scalar_range_columns.push((victory_shader::resource::ScalarRangeColumn {
             base: range.indexed_forms.scalar_programs[0].0.clone(), records: (0, 368),
@@ -1361,6 +1439,18 @@ mod tests {
         assert_eq!(decode(&vertex_bytes), Some((vertex.clone(), b"made by".to_vec())));
         vertex.indexed_forms.vertex_inputs[0].0.channel = 4;
         assert!(decode(&encode(&vertex, "made by")).is_none());
+        let mut indirect = host.clone();
+        indirect.stage = HwStage::Cs;
+        indirect.indexed_forms.indirect_record_columns.push((victory_shader::resource::IndirectRecordColumn {
+            parent: (0, 288), count: 16_384, stride: 116, pointer_field: 64,
+            records: (0, 648), handle_offset: 12, heap_bytes: 0,
+            guard: Some(victory_shader::resource::RecordTag { parent_field: 8, table: (0, 416), field: 0x710 }),
+        }, 2));
+        let indirect_bytes = encode(&indirect, "made by");
+        assert!(indirect_bytes.starts_with(INDIRECT_RECORD_MAGIC));
+        assert_eq!(decode(&indirect_bytes), Some((indirect.clone(), b"made by".to_vec())));
+        indirect.indexed_forms.indirect_record_columns[0].0.pointer_field = 116;
+        assert!(decode(&encode(&indirect, "made by")).is_none());
         let mut legacy = bytes.clone();
         legacy[..4].copy_from_slice(b"VSH8");
         assert!(decode(&legacy).is_none());
