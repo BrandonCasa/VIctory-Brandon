@@ -1,21 +1,15 @@
-# Reuse unchanged compositor descriptors on fence-safe presentation slots
+# Retain the title's plane descriptions across queued presents
 
-## Location and execution path
+## Problem
 
-`crates/victory-gpu/src/host.rs:9754–9785` chooses a completed presenter list for a two-plane present. `crates/victory-gpu/src/compose.rs:130–183` reuses its shader-visible heap but `Composer::record` creates both SRVs each time and calls `Host::rtv` (`host.rs:6430–6444`) for the back buffer.
+The title builds a separate source rectangle and color-space word for each 72-byte retail plane, then passes stack-backed descriptions to the queue (EXE RVAs `0x24822a7–0x24824c1`). `queue::present` retains only the resources and the compositor samples whole textures with identical UVs. Reusing a texture can therefore display the previous or wrong crop.
 
-## Current cost
+## Change
 
-Each composed frame performs three driver descriptor creations. The two source descriptions always have the same layout apart from resource and format. Swap-chain buffers rotate in a finite set. A stable source bound again to the same completed slot receives an identical descriptor.
+At the known retail caller ABI, copy each plane's rectangle, destination and color space before returning to the title. Carry them with the owned resource through `queue::behind::Job::Present` and synchronous present. Use the short caller's own layout at its entry point. Derive UVs from each plane's texture and crop, clamp sampling to the requested texel centers, and apply its placement and supported color treatment.
 
-## Proposed redesign
+## Expected result
 
-Carry each source’s `HostTexture::serial` and view format with the resource from both present paths. Compare these two scalar keys in the selected presenter slot after its fence completes (slot zero for synchronous presents). Recreate only changed SRVs, preserving the existing command-list lifetime holds. This avoids both pointer-reuse errors and pinning large textures in idle cache slots. On first composition allocate one private CPU RTV heap indexed by swap-chain buffer. Populate each RTV on first use and invalidate all entries on every successful resize, including size-only changes. Keep the existing RTV ring available if the private heap cannot be allocated.
+Presenting the same resources with different crops displays the pixels requested by each call, even if the queue consumes both after the caller reuses its stack. Different-sized planes align in their requested destination.
 
-## Before and after
-
-For F composed frames, two SRV creations per frame become one per changed plane/slot binding; RTV creations approach the number of buffers per swap-chain generation. Two small keys per presenter slot and private RTV storage are required. Alternating sources on all slots can still require 2F SRVs.
-
-## Expected impact and confidence
-
-Medium to lower, limited to actual two-plane composition. The per-frame driver calls are explicit; the gain is CPU recording time. Count stable slot bindings, descriptor creates and present-list CPU time across resize and asynchronous presentation.
+[Deferred optimization](deferred/finding-present-cache-compositor-descriptors.md)

@@ -1,23 +1,15 @@
-# Skip ordinary per-vertex shadow preparation for CPU-expanded rectangles
+# Complete rectangle primitives after vertex shading
 
-## Location and execution path
+## Problem
 
-`crates/victory-gpu/src/draw.rs:3745–3767` prepares the normal vertex streams before deciding whether a direct rectangle draw needs CPU expansion. `prepare_for` (1465–1491) resolves and refreshes each ordinary input shadow and binds a vertex view. `rectangles` (3793–3849) queues a separate read of the used guest vertex range, expands it into list scratch and replaces the per-vertex IA bindings before the draw. `pipeline/host.rs:705–716,778–785` shows when geometry-stage expansion succeeds or falls back.
+Topology 17 supplies three vertices per rectangle. Expanding a guest vertex stream before the vertex shader can change the inputs the shader fetches. The original procedural shader `VS_Clear_f05fef9c_Wrapped` (EXE offset `0x688cd3c`) fetches position and varyings from a root SRV using the incoming vertex ID. Resetting the first vertex or issuing six invocations changes those addresses. The indirect fallback also draws only one triangle.
 
-## Current cost
+## Change
 
-For each stream replaced on this path, the normal IA view has no draw consumer. Its full declared range can also cause a deferred shadow refresh in addition to the narrower guest read for expansion. `HostList::defer_refresh` already deduplicates exact ranges (`host.rs:7222–7235`), so redundant transfer bytes depend on other uses in the list.
+Select a rectangle PSO using `rect_list_gs` in `pipeline/host.rs`. Pass the original vertex, index and instance arguments through so the geometry stage constructs the fourth corner from three shaded outputs. In `draw.rs::rectangles`, allow CPU expansion only for a supported layout and shader with equivalent affine outputs, preserved vertex IDs and independent instance streams. Treat other failed rectangle PSOs as unsupported. For CPU expansion, register the exact source byte range with the flight wait and card-step planner before reading it at submit.
 
-## Proposed redesign
+## Expected result
 
-Have the pipeline own the expansion layout. When `GraphicsState::elements` resolves appended offsets, include instance elements in offset progression and record per-vertex slots in a mask. Group their `(offset, format)` pairs in declaration order once for CPU expansion, using shared ownership so deferred reads outlive draw recording. The indirect check can use the same mask. For direct CPU rectangles, prepare one final IA array from the resolved pipeline. Expand each marked slot, including mixed slots, and prepare instance-only slots normally. Preserve bounds and shadow checks, scratch lifetime and submission-time guest reads. Keep the layout available when rectangle topology is selected dynamically.
+With a nonzero first vertex, direct, indexed and indirect rectangles cover both triangles using the original three vertex IDs. An overlapping earlier GPU write supplies the bytes used by the CPU fallback.
 
-Make the deferred CPU read's dependency explicit before dropping its ordinary refresh. `blocked_by` skips `Step::Host`, `stale_under_flights` examines only refreshes, and `card_steps::does_of` marks a ranged host read as unblocked. At submission, check the exact bytes the expansion will read against outstanding flight writes in both the wait decision and the card-step planner. An overlap must wait for those bytes to land even if unrelated fills can run on the GPU. Retain the existing placed-copy reader check.
-
-## Before and after
-
-Today `rectangles` filters E input elements for each of 32 slots and builds a vector for each replaced stream on every fallback draw. Grouping once moves this layout work to the pipeline and allows each deferred read to share its slot's elements. For R replaced streams, the draw also avoids R ordinary shadow lookups and refresh registrations. Avoided transfer bytes depend on dirty ranges and other list uses. Scratch and expansion still scale with the vertices drawn.
-
-## Expected impact and confidence
-
-Measure fallback draws, otherwise unique refresh bytes and time spent waiting for overlapping writers. Check expanded vertex contents when a prior flight writes the source, and check that a disjoint declared write adds no wait for that read. Successful geometry-stage draws see no saving.
+[Deferred optimization](deferred/finding-draw-avoid-overwritten-rectangle-streams.md)

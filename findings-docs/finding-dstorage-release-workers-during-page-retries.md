@@ -1,21 +1,15 @@
-# Let other storage requests run while physical destinations are unavailable
+# Honor the title's submit boundary for live page lists
 
-## Location and execution path
+## Problem
 
-`crates/victory-hle/src/modules/dstorage.rs:775–800` runs `execute` synchronously on each worker until `Lanes::finish`. On page destinations, `page_list` (1717–1734) sleeps and rereads an unknown list every millisecond for up to 1.5 seconds. `into_pages` (1645–1680) can independently back off on failed physical writes.
+The archive builder at EXE RVA `0x4ffd520` enqueues a pointer into a live page table. At `0xe88f0` the title applies mapping changes, increments per-page references, enqueues status index zero and submits. `VICTORY_DSTORAGE_HALF` can start a request earlier while the old allocation's page IDs still pass ownership checks. Retrying later cannot undo that write.
 
-## Current cost
+## Change
 
-A sleeping request keeps its worker. Several unavailable destinations can occupy the worker pool while other queues hold runnable requests. The write retry already owns decoded bytes, so rerunning the entire read or decode on each wake would add work.
+Remove half-full implicit submission on this title path. Leave requests pending until explicit Submit, preserving the separate full-queue liveness fallback. On the submitted path, publish status only after the last destination write, required GPU notification and request result. The title recycles the batch when IsComplete(0) succeeds at `0xe8960`.
 
-## Proposed redesign
+## Expected result
 
-Keep the ready path synchronous. On a retry, park the job until its next poll or backoff using a scheduler deadline and a timed condition-variable wait. Page-list polling must reread the guest list until the original deadline, then use its last contents. A failed scatter retries the same page IDs and filled prefix without rereading or decoding. Keep any source or intermediate needed to refill a changed list independently of worker scratch. Cap parked jobs and their total owned allocation capacity, including zero-staging memory requests; fall back to the current in-worker retry when full. Keep the original staging charge and running sequence until final notification and completion, so queue close still waits.
+With an owned old page in the table at enqueue and a replacement published before Submit, only the replacement receives the payload. The old bytes survive and status index zero completes after publication.
 
-## Before and after
-
-For W workers and S simultaneous sleepers, available execution capacity changes from max(0,W−S) to W while eligible requests exist, subject to staging and memory limits. Polls/retries may still occur. Pending states need scheduling metadata and ownership of any buffered payload.
-
-## Expected impact and confidence
-
-High conditional impact on streaming tail latency when destination pages arrive late. The worker blockage is certain in that case. Quantify simultaneous sleepers, duration, ready work and staged bytes; healthy ready-page requests gain little.
+[Deferred optimization](deferred/finding-dstorage-release-workers-during-page-retries.md)

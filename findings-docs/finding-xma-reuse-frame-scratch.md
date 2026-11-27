@@ -1,21 +1,15 @@
-# Decode XMA frames into the voice's pending sample queue
+# Preserve XMA overlap state across the title's context handoff
 
-## Location and execution path
+## Problem
 
-The XMA worker in `crates/victory-hle/src/modules/audio.rs:495–559` pumps each enabled voice until its output ring fills. Its `decode` function (573–671) calls `read_frame` in `crates/victory-formats/src/xma.rs:128–151`, then `Decoder::decode` in the same file (646–673). Loop trimming and sample skipping happen before the HLE code appends samples to the voice queue.
+The HLE creates a fresh decoder on enable and ignores context word 8. The title zeroes a 512-byte overlap area at EXE RVA `0x785d0`, installs its APU address at `0x787f4`, and copies those bytes between two live contexts at `0x781c6`. Resetting there loses the preceding stream's overlap.
 
-## Current cost
+## Change
 
-Each successfully framed input allocates a byte vector for packed frame bits and a second vector for interleaved PCM. Both die after that frame. At 48 kHz and 512 samples per channel per frame, one continuously decoded voice drives about 94 frames and 188 such allocations per second. The decoder also appends a full frame of silence on decode failure to preserve timing. End-of-input flush creates a separate temporary for the overlap tail.
+Implement this title's explicit handoff in the audio HLE. Associate the outgoing decoder's continuation state with its word-8 backing before an end flush can consume it. At the title’s 512-byte copy call (RVA `0x781c6`, callee `0x5f40560`), keep the original byte copy and transfer an owned snapshot between the two corresponding word-8 areas. Serialize that transfer with the decoder worker so destination decode cannot race snapshot publication. Consume it once for the receiving stream before its first dependent frame. Invalidate snapshots on fresh initialization, backing reuse and teardown. Keep unread PCM with its owning voice, preserve loop and frame trimming, and emit the overlap tail only once across the handoff. Use the existing fresh decoder path for unrelated contexts. This implements the observed copy without assuming a hardware encoding for arbitrary guest edits.
 
-## Proposed redesign
+## Expected result
 
-Add a caller-buffer form of `read_frame` for the worker, clearing the logical length on each attempt, including after an incomplete frame. Keep the public owning `read_frame` as a wrapper for existing callers. Give `Decoder` a bulk output interface that exposes one decoded frame before advancing its overlap, retaining the existing `Vec<i16>` interface as a wrapper. The HLE can apply its loop-end trim, then its outstanding skip, and extend the voice's reserved PCM deque directly with the retained interleaved samples. Use a statically dispatched iterator or bulk writer so the inner loop has no indirect callback per sample. Drain the flush tail into the same deque before resetting the decoder. Keep unread samples already queued, silence and diagnostics on bad frames, guest context update order and the next loop's skip.
+Decode identical input continuously and split at the title's context handoff. The PCM spanning the split must match sample for sample, with no extra flush tail. A newly zeroed or unrelated context starts with fresh state.
 
-## Before and after
-
-For F frames, the packed-byte scratch grows to the largest packetized frame encountered. The F temporary PCM buffers and the copy of each accepted sample into the voice queue disappear. The queue still grows to hold unread output, and each retained sample is still converted and stored once. Decode and overlap processing remain necessary even when a frame is trimmed.
-
-## Expected impact and confidence
-
-Medium for allocator activity in voice-heavy playback, lower for FPS than render-thread changes. High confidence in allocation removal after warmup. Measure allocations per decoded second, worker CPU and ring underruns at representative voice counts. The relative cost depends on how much time the transform takes.
+[Deferred optimization](deferred/finding-xma-reuse-frame-scratch.md)

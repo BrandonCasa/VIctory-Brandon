@@ -1,21 +1,15 @@
-# Resolve long virtual aliases once per physical run
+# Notify current aliases of the physical bytes actually written
 
-## Location and execution path
+## Problem
 
-`crates/victory-hle/src/modules/dstorage.rs:1651–1675` notifies `xmem::pages_written` after writing physical destinations. `crates/victory-hle/src/modules/xmem.rs:540–600,916–966` implements `Shown`, `shown_at` and both GPU-notification branches.
+The archive builder at EXE RVA `0x4ffd520` includes a byte offset and length with the page-list pointer. Two requests can write different intervals on the same page. Re-resolving page IDs after an `arrange` reassignment can notify aliases of different backing, while rounding to full pages invalidates unrelated GPU data.
 
-## Current cost
+## Change
 
-`shown_at` clones a section reference for each destination page and calls `Shown::at` per page. Each call searches all long views, even those of unrelated sections. It materializes page-sized alias pieces, sorts them and joins neighbors. One contiguous write through one long mapping can produce just one final notification.
+Pass the successful writer's section, slice offsets and written extent from DirectStorage to `xmem::pages_written`. Under the alias-table lock, intersect that backing interval with its current virtual aliases, clip both ends, then unlock before notifying. For buffered scatter publish the successfully filled prefix. Preserve the existing conservative extent for a direct fill that can modify guest memory before returning an error.
 
-## Proposed redesign
+## Expected result
 
-Let a DirectStorage fill pass its resolved section runs to `pages_written`, clipped to the notification's byte range. Under the page-table lock, validate the same generation used by the writer. Both page removal and a slice reassignment in `arrange` invalidate the plan. On a miss, resolve the current runs, skipping unknown pages while preserving their positions in the input. Drop that lock, then consult the current `SHOWN` aliases under their own read lock even on a generation hit. Intersect long views once per run and collect short aliases from their page buckets. Release the lock before sorting or notifying. Where alias spans overlap, split them at the original page boundaries before applying the existing sort and adjacency rule.
+Two writes to disjoint portions of one page notify only their corresponding intervals on aliases of the bytes actually written. Rebinding an alias before notification cannot redirect the notification to unrelated backing.
 
-## Before and after
-
-For P pages across R runs and L long mappings, long-view probes fall from P × L to R × L. A current write plan can also avoid P more physical-page lookups and per-page section reference clones. Short aliases still require page-bucket probes, and overlap can still require sorting page-sized pieces. The mapping writer needs no new long-view index.
-
-## Expected impact and confidence
-
-High during page-backed streaming with long mappings. The nested loop is explicit for either notification setting. Measure runs, long views tested, pieces before joining, SHOWN read-lock time and end-to-end completion. Small writes or few aliases limit the gain.
+[Deferred optimization](deferred/finding-xmem-notify-long-aliases-by-run.md)
