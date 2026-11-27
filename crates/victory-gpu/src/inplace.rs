@@ -107,6 +107,9 @@ static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 pub(crate) struct Placed {
     pub(crate) buffer: ID3D12Resource,
     pub(crate) heap: ID3D12Heap,
+    /// A private allocation was opened directly at the title's VA.
+    /// A section-backed import instead has a separate mapping in port::REGIONS.
+    pub(crate) private: bool,
     /// The host GPU address of the title memory's first byte.
     pub(crate) gpu: u64,
     /// Bytes from the buffer's first byte to the title memory's first.
@@ -127,7 +130,7 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, heap, private: true, gpu, bias: start - at })
 }
 
 /// Title memory `[start, start + len)` in place, for a window outside
@@ -284,6 +287,10 @@ struct Views {
     /// page is a write of the bytes every other view shows
     /// (`crate::watch` guards them all).
     pages: BTreeMap<(usize, u64), Vec<usize>>,
+    /// Reverse index of just the virtual pages with another physical alias.
+    shared: BTreeMap<usize, (usize, u64)>,
+    /// Latest alias-set change for physical pages that have ever been shared.
+    alias_generation: BTreeMap<(usize, u64), u64>,
     /// Of those, how many are shown more than once.
     pages_twice: usize,
     /// Sections by handle: bytes, and whether made committed.
@@ -300,6 +307,8 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     generations: BTreeMap::new(),
     next_generation: 1,
     pages: BTreeMap::new(),
+    shared: BTreeMap::new(),
+    alias_generation: BTreeMap::new(),
     pages_twice: 0,
     sections: Vec::new(),
     whole: Vec::new(),
@@ -311,6 +320,80 @@ fn views() -> std::sync::RwLockReadGuard<'static, Views> {
 
 fn views_mut() -> std::sync::RwLockWriteGuard<'static, Views> {
     VIEWS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+// Windows splits an original placeholder into independent allocations as
+// views are mapped. Retain its extent and distinguish a GPU page-table
+// destination from the title's CPU mirror and other uncommitted memory.
+static PLACEHOLDERS: std::sync::RwLock<BTreeMap<usize, (usize, bool)>> =
+    std::sync::RwLock::new(BTreeMap::new());
+
+pub fn title_placeholder_reserved(at: usize, len: usize) {
+    if let Some(end) = at.checked_add(len).filter(|&end| end > at) {
+        PLACEHOLDERS.write().unwrap_or_else(|e| e.into_inner()).insert(at, (end, false));
+    }
+}
+
+pub fn title_gpu_mapping_ranges(ranges: &[(u64, u64, u64)]) {
+    let mut parents = PLACEHOLDERS.write().unwrap_or_else(|e| e.into_inner());
+    for &(to, _, bytes) in ranges {
+        if bytes > 0 && let Some(end) = to.checked_add(bytes)
+            && let Some((&start, (limit, gpu))) = parents.range_mut(..=to as usize).next_back()
+            && !*gpu && end <= *limit as u64
+        {
+            *gpu = true;
+            tracing::info!(at = format_args!("{start:#x}"), end = format_args!("{limit:#x}"), "GPU sparse page-mapping reservation");
+        }
+    }
+}
+
+/// A successful release can remove one split placeholder from an original
+/// reservation. The two still-reserved sides keep their identity, while a
+/// later unrelated reservation at the released address must prove itself.
+pub fn release_title_placeholder(at: usize, len: usize, release: impl FnOnce() -> bool) -> bool {
+    let contains = PLACEHOLDERS.read().unwrap_or_else(|e| e.into_inner())
+        .range(..=at).next_back().is_some_and(|(_, &(end, _))| at < end);
+    if !contains { return release(); }
+    let _changing = crate::watch::title_memory_remapping();
+    let end = if len == 0 { crate::watch::allocation_end(at, at) } else { at.saturating_add(len) };
+    let mut parents = PLACEHOLDERS.write().unwrap_or_else(|e| e.into_inner());
+    if !release() { return false; }
+    let affected: Vec<_> = parents.range(..end).filter(|(_, (limit, _))| *limit > at)
+        .map(|(&start, &entry)| (start, entry)).collect();
+    for (start, (limit, gpu)) in affected {
+        parents.remove(&start);
+        if start < at { parents.insert(start, (at, gpu)); }
+        if end < limit { parents.insert(end, (limit, gpu)); }
+    }
+    true
+}
+
+pub(crate) fn sparse_range(at: usize, len: usize) -> bool {
+    len != 0 && at.checked_add(len).is_some_and(|end| {
+        PLACEHOLDERS.read().unwrap_or_else(|e| e.into_inner())
+            .range(..=at).next_back().is_some_and(|(_, &(limit, gpu))| gpu && end <= limit)
+    })
+}
+
+/// The caller holds title_memory_reading to keep the page mapping stable
+/// while using this result. A partial hole cannot stand in for a whole mip.
+pub(crate) fn sparse_null_range(at: usize, len: usize) -> bool {
+    if !sparse_range(at, len) { return false; }
+    let end = at + len;
+    if views().views.range(..end).next_back().is_some_and(|(&base, &(bytes, _, _))| at < base + bytes) {
+        return false;
+    }
+    let mut page = at;
+    while page < end {
+        let mut info = mem::MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: query only, including when the title VA is inaccessible.
+        if unsafe { mem::VirtualQuery(page as *const _, &mut info, size_of_val(&info)) } == 0
+            || info.State != mem::MEM_RESERVE { return false; }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= page { return false; }
+        page = next;
+    }
+    true
 }
 
 /// The runtime made a section of `bytes` for physical pages; `committed`
@@ -350,11 +433,21 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
         v.generations.insert(at, generation);
         v.views.insert(at, (len, section, offset));
         for k in 0..len.div_ceil(K64) {
-            let shown = v.pages.entry((section, offset + (k * K64) as u64)).or_default();
-            shown.push(at + k * K64);
-            let twice = shown.len() == 2;
-            v.pages_twice += usize::from(twice);
+            let key = (section, offset + (k * K64) as u64);
+            let page = at + k * K64;
+            let shown = v.pages.entry(key).or_default();
+            shown.push(page);
+            let (count, first) = (shown.len(), shown[0]);
+            if count > 1 {
+                v.shared.insert(page, key);
+                v.alias_generation.insert(key, generation);
+            }
+            if count == 2 {
+                v.pages_twice += 1;
+                v.shared.insert(first, key);
+            }
         }
+        crate::resource::aliases_changed();
     }
     // This view is writable from now on: a guard over the same bytes at
     // another view must look at them again, and the pages are noted written
@@ -373,6 +466,9 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     let end = at.saturating_add(len);
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
+    if !gone.is_empty() { crate::resource::aliases_changed(); }
+    let generation = v.next_generation;
+    if !gone.is_empty() { v.next_generation = generation.wrapping_add(1); }
     for base in gone {
         v.generations.remove(&base);
         let Some((bytes, section, offset)) = v.views.remove(&base) else {
@@ -385,13 +481,48 @@ pub(crate) fn views_gone(at: usize, len: usize) {
                 let before = pages.len();
                 pages.retain(|&shown| shown != page);
                 let after = pages.len();
+                let survivor = (before >= 2 && after == 1).then(|| pages[0]);
                 if after == 0 {
                     v.pages.remove(&key);
+                    v.alias_generation.remove(&key);
+                } else {
+                    v.alias_generation.insert(key, generation);
+                }
+                v.shared.remove(&page);
+                if let Some(survivor) = survivor {
+                    v.shared.remove(&survivor);
                 }
                 v.pages_twice = v.pages_twice.saturating_sub(usize::from(before >= 2 && after < 2));
             }
         }
     }
+}
+
+/// While the title mapping is held, the generation of a complete physical
+/// extent whose aliases can all be guarded together, and whether it is
+/// shared. A transient alias between reads also advances the generation.
+pub(crate) fn guarded_view_epoch(
+    start: usize, end: usize, backing: &[(usize, usize, usize, u64, u64)],
+) -> Option<(u64, bool)> {
+    let first = start & !(K64 - 1);
+    let v = views();
+    if start >= end { return None; }
+    let shared = v.shared.range(first..end).next().is_some();
+    let mut next = start;
+    let mut epoch = 0;
+    for &(from, to, section, offset, generation) in backing {
+        if from != next { return None; }
+        next = to;
+        epoch = epoch.max(generation);
+        let page = offset & !(K64 as u64 - 1);
+        let limit = offset.checked_add((to - from) as u64)?;
+        for (key, &changed) in v.alias_generation.range((section, page)..(section, limit)) {
+            if shared && v.pages.get(key)?.len() > crate::watch::MANY_VIEWS { return None; }
+            epoch = epoch.max(changed);
+        }
+    }
+    if next != end { return None; }
+    Some((epoch, shared))
 }
 
 /// The 64 KiB pages of `[start, end)` that the title shows at other
@@ -424,6 +555,7 @@ pub(crate) fn aliases(at: usize, len: usize) -> Vec<usize> {
         return Vec::new();
     }
     let v = views();
+    if !v.shared.contains_key(&(at & !(K64 - 1))) { return Vec::new(); }
     let mapping = |address: usize| {
         let (&base, &(size, section, offset)) = v.views.range(..=address).next_back()?;
         let consumed = address - base;
@@ -474,23 +606,20 @@ pub(crate) fn aliases_of_bytes(at: usize, len: usize) -> Vec<(usize, usize)> {
     let mut ranges = vec![(at, end)];
     {
         let v = views();
-        for page in at / K64..end.div_ceil(K64) {
-            let base = page * K64;
-            let Some((&from, &(bytes, section, offset))) = v.views.range(..=base).next_back()
-            else {
-                continue;
-            };
-            if base - from >= bytes {
-                continue;
-            }
+        let mapped = |page: usize| v.views.range(..=page).next_back()
+            .map_or(0, |(&from, &(bytes, _, _))| from.saturating_add(bytes).saturating_sub(page).min(K64));
+        for (&base, key) in v.shared.range((at & !(K64 - 1))..end) {
             let within = at.saturating_sub(base);
-            let last = (end - base).min(K64);
-            if let Some(aliases) = v.pages.get(&(section, offset + (base - from) as u64)) {
+            let last = (end - base).min(mapped(base));
+            if let Some(aliases) = v.pages.get(key) {
                 ranges.extend(
                     aliases
                         .iter()
                         .filter(|&&other| other != base)
-                        .map(|&other| (other + within, other + last)),
+                        .filter_map(|&other| {
+                            let last = last.min(mapped(other));
+                            (within < last).then(|| (other + within, other + last))
+                        }),
                 );
             }
         }
@@ -1440,6 +1569,28 @@ pub(crate) fn tick() {
 pub(crate) mod tests {
     use super::*;
 
+    #[test]
+    fn sparse_null_requires_a_live_queue_destination_and_no_backing_in_the_span() {
+        // SAFETY: reserve three pages, commit the middle page, then release
+        // exactly this test's reservation through the title release hook.
+        unsafe {
+            let at = mem::VirtualAlloc(std::ptr::null(), 3 * K64, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_ne!(at, 0);
+            title_placeholder_reserved(at, 3 * K64);
+            assert!(!sparse_null_range(at, K64));
+            title_gpu_mapping_ranges(&[(at as u64, 0, K64 as u64)]);
+            assert!(sparse_range(at, 3 * K64));
+            assert!(sparse_null_range(at + 3, 2 * K64));
+            let middle = (at + K64) as *const _;
+            assert_eq!(mem::VirtualAlloc(middle, K64, mem::MEM_COMMIT, mem::PAGE_READWRITE), middle.cast_mut());
+            assert!(!sparse_null_range(at, 3 * K64));
+            assert!(sparse_null_range(at + 2 * K64, K64));
+            assert!(!sparse_range(at + 2 * K64, 2 * K64));
+            assert!(release_title_placeholder(at, 0, || mem::VirtualFree(at as *mut _, 0, mem::MEM_RELEASE) != 0));
+            assert!(!sparse_range(at, K64));
+        }
+    }
+
     /// Views as the runtime tells them: a range inside one view, or over
     /// views that continue each other in one section, is one run; over
     /// views from elsewhere it is scattered; over a gap it has holes.
@@ -1526,6 +1677,54 @@ pub(crate) mod tests {
         assert_eq!(cover(at + 4 * K64, K64), Cover::Run(77, 4 * K64 as u64));
         views_gone(at + 4 * K64, K64);
         assert_eq!(cover(at + 4 * K64, K64), Cover::None);
+    }
+
+    #[test]
+    fn texture_guard_generation_changes_after_even_a_transient_physical_alias() {
+        let a = 0x7_9800_0000;
+        let b = a + 4 * K64;
+        let section = 0xfa57;
+        title_memory_view(a, 2 * K64, section, 0);
+        let owner = backing(a, 2 * K64);
+        let (before, shared) = guarded_view_epoch(a, a + 2 * K64, &owner).unwrap();
+        assert!(!shared);
+        assert!(guarded_view_epoch(a, a + 3 * K64, &owner).is_none());
+        title_memory_view(b, K64, section, K64 as u64);
+        let (joined, shared) = guarded_view_epoch(a, a + 2 * K64, &owner).unwrap();
+        assert!(shared && joined > before);
+        for i in 0..crate::watch::MANY_VIEWS {
+            title_memory_view(b + (i + 1) * K64, K64, section, K64 as u64);
+        }
+        assert!(guarded_view_epoch(a, a + 2 * K64, &owner).is_none());
+        for i in 0..crate::watch::MANY_VIEWS {
+            views_gone(b + (i + 1) * K64, K64);
+        }
+        let (again, shared) = guarded_view_epoch(a, a + 2 * K64, &owner).unwrap();
+        assert!(shared && again > joined);
+        views_gone(b, K64);
+        let (after, shared) = guarded_view_epoch(a, a + 2 * K64, &owner).unwrap();
+        assert!(after > again && !shared);
+        assert_eq!(owner, backing(a, 2 * K64));
+        views_gone(a, 2 * K64);
+    }
+
+    #[test]
+    fn physical_alias_intervals_follow_partial_pages_and_unmaps() {
+        let a = 0x7_6800_0000;
+        let b = a + 4 * K64;
+        let c = b + 4 * K64;
+        let section = 0x7868;
+        title_memory_view(a, 2 * K64, section, 0);
+        title_memory_view(b, K64 / 2, section, K64 as u64);
+        title_memory_view(c, K64, section, K64 as u64);
+        let start = a + K64 + 64;
+        let end = a + 2 * K64;
+        assert_eq!(aliases_of_bytes(start, end - start), [(start, end), (b + 64, b + K64 / 2), (c + 64, c + K64)]);
+        views_gone(b, K64 / 2);
+        assert_eq!(aliases_of_bytes(start, end - start), [(start, end), (c + 64, c + K64)]);
+        views_gone(c, K64);
+        assert_eq!(aliases_of_bytes(start, end - start), [(start, end)]);
+        views_gone(a, 2 * K64);
     }
 
     /// Only private memory committed whole, read-write, is taken for a part.

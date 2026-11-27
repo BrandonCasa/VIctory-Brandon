@@ -337,15 +337,15 @@ pub(crate) fn compared(src: usize, len: usize, written: usize) {
     e.1 += written as u64;
 }
 
-/// A copy of `len` bytes from `src` (memory type `kind`) took `us`.
-pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
+/// A refresh of `[src, src + len)` moved `copied` bytes in `us`.
+pub(crate) fn range(src: usize, len: usize, copied: usize, us: u64) {
     let mut map = RANGES.lock().unwrap_or_else(|e| e.into_inner());
     let e = map
         .get_or_insert_with(HashMap::new)
         .entry((src, len))
-        .or_insert((0, 0, 0, kind));
+        .or_insert((0, 0, 0, 0));
     e.0 += 1;
-    e.1 += len as u64;
+    e.1 += copied as u64;
     e.2 += us;
 }
 
@@ -616,6 +616,80 @@ fn memory_categories() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_MEMORY_CATEGORIES"))
 }
 
+/// The frame logger stops when the title waits on a graphics queue. Sample
+/// live gauges on wall time too, without traversing registries used by workers.
+fn start_memory_sampler() {
+    if !memory_categories() { return; }
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| {
+        let result = std::thread::Builder::new().name("victory-memory".into()).spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let (working, private) = process_memory();
+            let (free, headroom) = system_memory();
+            let shaders = crate::pipeline::kept();
+            let alive = &crate::host::ALIVE;
+            let made = &crate::host::MADE;
+            let card = crate::host::made_host().map(|h| h.query_video_memory_groups());
+            let usage = |i: usize| card.as_ref().and_then(|g| g[i].as_ref()).map_or(0, |g| g.CurrentUsage);
+            let extra_copies = crate::shadow::EXTRA_COPY_BYTES.each_ref().map(|n| n.load(Relaxed));
+            let pool_mb = crate::pool::memory();
+            let fields = [
+                ("working set", working), ("private total", private),
+                ("free physical", free), ("commit headroom", headroom),
+                ("DXGI local usage", usage(0)), ("DXGI nonlocal usage", usage(1)),
+                ("our rust heap", (0..4).map(owned).sum()),
+                ("host texture bytes alive", crate::resource::HOST_TEXTURES[1].load(Relaxed)),
+                ("title-fill texture bytes alive", crate::resource::KINDS[1].load(Relaxed)),
+                ("pooled texture placements alive", crate::pool::HELD.load(Relaxed)),
+                ("texture pool heaps", pool_mb[0] << 20),
+                ("staging pool heaps", pool_mb[1] << 20),
+                ("sparse texture mapped tiles", crate::tiles::given_total()),
+                ("sparse texture tile heaps", crate::tiles::STATS[3].load(Relaxed)),
+                ("live texture staging", crate::texture::live_staging_bytes()),
+                ("exact texture snapshots", crate::texture::PREVIOUS_BYTES.load(Relaxed)),
+                ("snapshots without physical views", crate::texture::SNAPSHOT_OWNERS[0].load(Relaxed)),
+                ("movie snapshots", crate::texture::SNAPSHOT_OWNERS[1].load(Relaxed)),
+                ("partly mapped snapshots", crate::texture::SNAPSHOT_OWNERS[2].load(Relaxed)),
+                ("uniquely mapped snapshots", crate::texture::SNAPSHOT_OWNERS[3].load(Relaxed)),
+                ("shared mapped snapshots", crate::texture::SNAPSHOT_OWNERS[4].load(Relaxed)),
+                ("many-view snapshots", crate::texture::SNAPSHOT_OWNERS[5].load(Relaxed)),
+                ("unreadable bytes omitted from snapshots", crate::texture::SPARSE_OMITTED_BYTES.load(Relaxed)),
+                ("all guest buffer copies", crate::shadow::LIVE[1].load(Relaxed)),
+                ("loose address windows", extra_copies[0]),
+                ("copied descriptor views", extra_copies[1]),
+                ("by-address arenas", extra_copies[2]),
+                ("active texture readbacks", crate::texback::LIVE_READBACK_BYTES.load(Relaxed)),
+                ("card buffer copies and windows", crate::shadow::live_span_bytes()),
+                ("list scratch live", alive[2].load(Relaxed)),
+                ("list scratch spare", alive[4].load(Relaxed)),
+                ("list other uploads", alive[7].load(Relaxed)),
+                ("shader containers", shaders[1]), ("translations", shaders[3]),
+                ("pipeline library file", shaders[4]),
+                ("made upload buffers so far", made[1].load(Relaxed)),
+                ("made shared buffers so far", made[3].load(Relaxed)),
+                ("made card buffers so far", made[5].load(Relaxed)),
+            ];
+            let lists = &crate::host::LISTS;
+            let splits = crate::list::SPLITS.each_ref().map(|n| n.load(Relaxed));
+            let texture_writes = crate::list::TEXTURE_BOUNDARIES.each_ref().map(|n| n.load(Relaxed));
+            tracing::info!(frame = crate::queue::presented(), host_lists = alive[0].load(Relaxed),
+                native_made = lists[0].load(Relaxed), native_never_reset = lists[3].load(Relaxed),
+                native_allocators_made = crate::host::RECORDING_ALLOCATORS.load(Relaxed),
+                title_lists_created = crate::list::TITLE_LISTS.load(Relaxed),
+                thin_generations = crate::list::thin::GENERATIONS.load(Relaxed),
+                thin_backs_used = crate::list::thin::BACKS_USED.load(Relaxed),
+                native_split_wait = splits[0], native_split_texture = splits[1],
+                ordered_texture_copy = texture_writes[0], ordered_texture_shader = texture_writes[1],
+                native_split_copy_before = splits[2], native_split_copy_after = splits[3],
+                native_split_descriptor = splits[4], native_split_builder_scope = splits[5],
+                native_split_builder_dispatch = splits[6], native_split_value_write = splits[7],
+                native_split_raw_memory = splits[8], native_split_material_selector = splits[9],
+                "wall-clock memory categories: {}", category_text(&fields));
+        });
+        if let Err(error) = result { tracing::warn!(%error, "could not start wall-clock memory sampler"); }
+    });
+}
+
 /// Asks which of the pages in `asked` (address, answer) are in physical
 /// memory and adds the bytes each stands for (kind, bytes) to its kind.
 fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, u64)>, present: &mut [u64; 10]) {
@@ -804,6 +878,7 @@ fn log_memory_map() {
 /// Logs where the memory is: the process and the PC, then what this crate
 /// holds by kind (alive now), then the host buffers made since the start.
 fn log_memory() {
+    start_memory_sampler();
     use std::sync::atomic::Ordering::Relaxed;
     let mb = |v: u64| v as f64 / (1 << 20) as f64;
     let (working, private) = process_memory();
@@ -910,7 +985,7 @@ fn log_memory() {
          outside buffers {:.0} MB; snapshot buffers kept: {} reserving {:.0} MB; staging of \
          textures: {} alive {:.0} MB, {} kept by their texture; host textures: {} alive {:.0} MB, \
          {} placed in title memory; made so far: {} upload buffers {:.0} MB, {} shared buffers \
-         {:.0} MB, {} card buffers {:.0} MB",
+         {:.0} MB, {} card buffers {:.0} MB; exact texture snapshots {:.0} MB",
         mb(private),
         mb(working),
         mb(free),
@@ -933,6 +1008,7 @@ fn log_memory() {
         mb(made[3]),
         made[4],
         mb(made[5]),
+        mb(staged[3]),
     );
     tracing::info!(
         "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
@@ -1028,7 +1104,7 @@ fn log_memory() {
             ("list scratch spare", alive[4]),
             ("list other uploads", alive[7]),
             ("private growth making lists", lists[2]),
-            ("title window copies", copies[1]),
+            ("all guest buffer copies", copies[1]),
             ("window pages copied", window[0]),
             ("window held by lists", window[4]),
             ("window without a length", window[6]),
@@ -1037,6 +1113,7 @@ fn log_memory() {
             ("texture pool", pool[0] << 20),
             ("staging pool", pool[1] << 20),
             ("live texture staging", staged[1]),
+            ("exact texture snapshots", staged[3]),
             ("descriptor views", views[2]),
             ("shader containers", kept[1]),
             ("translations", kept[3]),
@@ -1569,7 +1646,7 @@ pub(crate) fn log(frames: f64) {
             info.Type
         });
         tracing::info!(
-            "  copied from {src:#x}+{len:#x} (memory {kind:#x}): {:.1}x/frame, {:.2} MB/frame, {:.2} ms/frame",
+            "  refreshed {src:#x}+{len:#x} (memory {kind:#x}): {:.1} checks/frame, {:.2} MB copied/frame, {:.2} ms/frame",
             n as f64 / frames,
             bytes as f64 / 1e6 / frames,
             us as f64 / 1e3 / frames

@@ -76,11 +76,14 @@ pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 /// zeros from, and drops writes to, levels without memory (tiled resources
 /// tier 2).
 pub(crate) fn wanted() -> bool {
+    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUESTED.get_or_init(|| std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1"))
+        && supported()
+}
+
+pub(crate) fn supported() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
-            return false;
-        }
         let Some(host) = host() else {
             return false;
         };
@@ -99,7 +102,7 @@ pub(crate) fn wanted() -> bool {
             tier,
             on,
             floor_kb = floor() >> 10,
-            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND=1)"
+            "native sparse texture support"
         );
         on
     })

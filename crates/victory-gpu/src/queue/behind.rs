@@ -57,6 +57,8 @@ pub(super) trait Work: Send {
     type Ask;
     fn ask(&self) -> Option<Self::Ask>;
     fn met(ask: &Self::Ask) -> bool;
+    #[cfg(feature = "diagnostics")]
+    fn stalled(_number: u64, _queue: usize, _ask: Option<&Self::Ask>, _present: bool) {}
     /// Whether it is a present: everything before it goes first.
     fn shows(&self) -> bool;
     /// Whether it is a submission.
@@ -331,8 +333,24 @@ impl<W: Work> Lane<W> {
         }) else {
             // A later producer on another queue can still become runnable.
             // Presenting cannot satisfy a fence or complete a translation.
+            #[cfg(feature = "diagnostics")]
+            {
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                if crate::list::thin::Recording::trace_waits() {
+                    let now = crate::host::coarse_ms();
+                    if now >= NEXT.load(Relaxed) {
+                        NEXT.store(now + 1000, Relaxed);
+                        for (number, queue, ask, present) in &heads {
+                            W::stalled(*number, *queue, ask.as_ref(), *present);
+                        }
+                    }
+                }
+            }
             return false;
         };
+        // An ask only snapshots the heads for this decision. Release it
+        // before unfolding so a queue can drain its completed prefix in place.
+        drop(heads);
         let mut entry = {
             let mut state = self.lock();
             let Some(at) = state.items.iter().position(|e| e.number == number) else {
@@ -421,7 +439,11 @@ impl<W: Work> Lane<W> {
     }
 }
 
-type Recordings = std::sync::Arc<[std::sync::Arc<crate::list::thin::Recording>]>;
+#[derive(Clone)]
+struct Recordings {
+    lists: std::sync::Arc<VecDeque<std::sync::Arc<crate::list::thin::Recording>>>,
+    next: usize,
+}
 
 /// What the title's queues put in the line.
 enum Job {
@@ -440,6 +462,7 @@ enum Job {
     Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>),
     /// A signal of the queue's.
     Signal(crate::fence::Point),
+    Mappings(crate::resource::PageMappings),
     Present(super::Presentation),
 }
 
@@ -457,6 +480,18 @@ enum Ask {
 impl Work for Job {
     type Ask = Ask;
 
+    #[cfg(feature = "diagnostics")]
+    fn stalled(number: u64, queue: usize, ask: Option<&Ask>, present: bool) {
+        match ask {
+            Some(Ask::Wait(fence, value)) => tracing::info!(number, queue, fence=format_args!("{fence:#x}"), value,
+                completed=crate::fence::completed(*fence as This), "queue head waits for fence"),
+            Some(Ask::Value(wait)) => tracing::info!(number, queue, ?wait, "queue head waits for value"),
+            Some(Ask::Lists(r)) => tracing::info!(number, queue, next=r.next, count=r.next + r.lists.len(),
+                recording=format_args!("{:p}", std::sync::Arc::as_ptr(&r.lists[0])), dependency=%r.lists[0].describe_wait(), "queue head waits for recording"),
+            None => tracing::info!(number, queue, present, "queue head waits for earlier work"),
+        }
+    }
+
     fn ask(&self) -> Option<Ask> {
         match self {
             Job::Wait(point) => Some(Ask::Wait(point.0, point.1)),
@@ -471,22 +506,33 @@ impl Work for Job {
     }
 
     fn unfold(self) -> Vec<Self> {
-        let Job::Lists(queue, kind, recordings) = self else {
+        let Job::Lists(queue, kind, mut recordings) = self else {
             return vec![self];
         };
-        let lists: Vec<This> = recordings.iter().map(|r| r.back()).filter(|l| !l.is_null()).collect();
-        let jobs = jobs_of(queue, kind, &lists);
-        // It stood for one submission not begun.
+        // The queue can execute a completed prefix while recording workers
+        // translate later lists from this same guest submission. The suffix
+        // holds the original position ahead of every later signal or wait.
+        let count = recordings.lists.iter().take_while(|r| r.done()).count();
+        let lists: Vec<This> = recordings.lists.iter().take(count).map(|r| r.back()).filter(|l| !l.is_null()).collect();
+        let mut jobs = jobs_of(queue, kind, &lists);
         let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
         QUEUED.fetch_add(runs, Relaxed);
-        QUEUED.fetch_sub(1, Relaxed);
+        recordings.next += count;
+        if count == recordings.lists.len() {
+            QUEUED.fetch_sub(1, Relaxed);
+        } else {
+            // The detached jobs now own the prefix through GPU completion.
+            // This suffix must not retain old native tables after guest reset.
+            std::sync::Arc::make_mut(&mut recordings.lists).drain(..count);
+            jobs.push(Job::Lists(queue, kind, recordings));
+        }
         STATS[RUNS].fetch_add(runs, Relaxed);
         jobs
     }
 
     fn settle(ask: &Ask) {
         if let Ask::Lists(recordings) = ask {
-            recordings.iter().for_each(|r| r.wait());
+            recordings.lists.iter().for_each(|r| r.wait());
         }
     }
 
@@ -519,7 +565,7 @@ impl Work for Job {
         match ask {
             &Ask::Wait(fence, value) => crate::fence::completed(fence as This) >= value,
             Ask::Value(wait) => super::value_met(wait),
-            Ask::Lists(recordings) => recordings.iter().all(|r| r.done()),
+            Ask::Lists(recordings) => recordings.lists[0].done(),
         }
     }
 
@@ -553,7 +599,7 @@ impl Work for Job {
                     return Err(next);
                 }
             }
-            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
+            Job::Joined(..) | Job::Present(..) | Job::Lists(..) | Job::Mappings(..) => return Err(next),
         }
         let taken = std::mem::replace(self, Job::Run(0, Vec::new(), Vec::new()));
         let (queue, mut lists, mut order, mut parts) = match taken {
@@ -580,11 +626,13 @@ impl Work for Job {
             Job::Joined(..) => "the line: submissions joined",
             Job::Present(..) => "the line: a present",
             Job::Signal(..) => "the line: a signal",
+            Job::Mappings(..) => "the line: update page mappings",
             _ => "the line: a wait that is met",
         });
         match self {
             // (A folded one is unfolded, never done.)
             Job::Wait(..) | Job::Value(..) | Job::Lists(..) => {}
+            Job::Mappings(mappings) => { super::apply_mappings(mappings); }
             Job::Run(queue, lists, order) => {
                 let _ = queue;
                 #[cfg(feature = "diagnostics")]
@@ -775,7 +823,7 @@ pub(super) fn submit(this: This, lists: &[This]) {
         let before = QUEUED.fetch_add(1, Relaxed);
         STATS[DEPTH].fetch_add(before, Relaxed);
         STATS[DEEPEST].fetch_max(before + 1, Relaxed);
-        LANE.push(queue.id, [Job::Lists(this as usize, queue.kind, recordings)]);
+        LANE.push(queue.id, [Job::Lists(this as usize, queue.kind, Recordings { lists: std::sync::Arc::new(recordings), next: 0 })]);
         room(before + 1);
         return;
     }
@@ -841,6 +889,10 @@ pub(super) fn signal(this: This, fence: This, value: u64) {
             crate::fence::set(fence as This, value);
         }
     });
+}
+
+pub(super) fn map_pages(this: This, mappings: crate::resource::PageMappings) {
+    LANE.push(super::queue(this).id, [Job::Mappings(mappings)]);
 }
 
 /// Queue `this` waits for `fence`: nothing if it has nothing in the line and
@@ -983,6 +1035,24 @@ mod tests {
         static LATER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         /// The marks submissions were done with, by name.
         static MARKS: std::cell::RefCell<Vec<(String, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    #[test]
+    fn a_pending_suffix_releases_the_completed_recordings() {
+        use crate::list::thin::Recording;
+        use std::sync::Arc;
+        let first = Recording::empty_for_test(true);
+        let first_ref = Arc::downgrade(&first);
+        let replayed = Recording::empty_for_test(true);
+        let pending = Recording::empty_for_test(false);
+        let lists = VecDeque::from([first, replayed.clone(), pending.clone(), replayed.clone()]);
+        let parts = Job::Lists(0, 0, Recordings { lists: Arc::new(lists), next: 0 }).unfold();
+        let [Job::Lists(_, _, suffix)] = &parts[..] else { panic!("the unfinished suffix remains") };
+        assert!(first_ref.upgrade().is_none());
+        assert_eq!(suffix.next, 2);
+        assert_eq!(suffix.lists.len(), 2);
+        assert!(Arc::ptr_eq(&suffix.lists[0], &pending));
+        assert!(Arc::ptr_eq(&suffix.lists[1], &replayed));
     }
 
     /// Renderer port #7: a submission is done with the mark taken when it

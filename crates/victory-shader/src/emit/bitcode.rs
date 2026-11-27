@@ -331,7 +331,12 @@ impl Module {
     /// Possible byte positions in a dword. Only facts established by the
     /// emitted integer address arithmetic can justify a one-dword store.
     pub fn byte_positions(&self, value: V, depth: u8) -> u8 {
+        self.byte_positions_with(value, depth, &mut |_| None)
+    }
+
+    pub fn byte_positions_with(&self, value: V, depth: u8, known: &mut impl FnMut(V) -> Option<u8>) -> u8 {
         const ALL: u8 = 0b1111;
+        if let Some(mask) = known(value) { return mask; }
         if let Some(n) = self.int_value(value) {
             return 1 << (n & 3);
         }
@@ -340,10 +345,16 @@ impl Module {
         if depth == 0 || self.types[inst.ty.0 as usize] != TypeDef::Int(32) {
             return ALL;
         }
-        let positions = |v| self.byte_positions(v, depth - 1);
+        let mut positions = |v| self.byte_positions_with(v, depth - 1, known);
         match inst.op {
             Op::Select(_, a, b) => positions(a) | positions(b),
-            Op::Bin(Bin::Shl, a, b) => match self.int_value(b) {
+            Op::Bin(Bin::Shl, a, b) => match self.int_value(b).or_else(|| {
+                // GFX shifts mask their count before this analysis runs,
+                // including shifts by an inline constant.
+                let V::Inst(id) = b else { return None };
+                let Op::Bin(Bin::And, x, y) = self.insts[id as usize].op else { return None };
+                Some(self.int_value(x)? & self.int_value(y)?)
+            }) {
                 Some(0) => positions(a),
                 Some(1) => 0b0101,
                 Some(2..=31) => 1,

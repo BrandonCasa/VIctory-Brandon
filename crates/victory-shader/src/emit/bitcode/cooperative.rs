@@ -17,6 +17,93 @@ struct Part {
     term: Option<Term>,
 }
 
+/// A value crossing two scheduled blocks needs a join, but it needs a
+/// register around the whole sweep only if it can survive a backedge or
+/// a guest barrier. Follow uses back to their SSA definition. Phi inputs
+/// are used on the incoming edge, including a loop's self-edge.
+fn across_sweeps(
+    parts: &[Part], first: &[usize], seen: &[bool], insts: &[Inst], owners: &[usize],
+    carry: &[bool], rebuild: &[bool],
+) -> Vec<bool> {
+    let mut predecessors = vec![Vec::new(); parts.len()];
+    let mut last = vec![0; first.len()];
+    for (b, part) in parts.iter().enumerate() {
+        last[part.original] = b;
+        if let Some(term) = part.term {
+            for &t in successors(Some(term)).iter() {
+                predecessors[first[t]].push((b, first[t] <= b));
+            }
+        } else if let Some((_, parked)) = part.barrier {
+            predecessors[b + 1].push((b, parked));
+        }
+    }
+    let mut across = vec![false; insts.len()];
+    let mut uses = vec![Vec::new(); insts.len()];
+    for (b, part) in parts.iter().enumerate() {
+        for &id in &part.phis {
+            if let Op::Phi(incoming) = &insts[id as usize].op {
+                for &(v, pred) in incoming {
+                    if pred == 0 || !seen[pred] { continue; }
+                    if let V::Inst(i) = v && carry[i as usize] {
+                        if last[pred] >= b { across[i as usize] = true; }
+                        else { uses[i as usize].push(last[pred]); }
+                    }
+                }
+            }
+        }
+        let mut record = |v| {
+            if let V::Inst(i) = v && carry[i as usize] && owners[i as usize] != b {
+                uses[i as usize].push(b);
+            }
+        };
+        for &id in &part.body { for_each_operand(&insts[id as usize].op, &mut record); }
+        if let Some(Term::CondBr(v, _, _)) = part.term { record(v); }
+    }
+    // A reconstructed pointer or handle can be evaluated in any of its
+    // users. Retain its scalar inputs across sweeps conservatively.
+    for (id, &rebuilt) in rebuild.iter().enumerate() {
+        if rebuilt {
+            for_each_operand(&insts[id].op, |v| {
+                if let V::Inst(i) = v { across[i as usize] = true; }
+            });
+        }
+    }
+    let mut visited = vec![usize::MAX; parts.len()];
+    for (id, pending) in uses.iter_mut().enumerate() {
+        while !across[id] && let Some(b) = pending.pop() {
+            if b == owners[id] || visited[b] == id { continue; }
+            visited[b] = id;
+            for &(p, crosses) in &predecessors[b] {
+                if crosses { across[id] = true; break; }
+                pending.push(p);
+            }
+        }
+    }
+    across
+}
+
+#[cfg(test)]
+#[test]
+fn a_sweep_keeps_registers_only_across_a_park_or_backedge() {
+    let insts = [
+        Inst { ty: Ty(0), op: Op::Extract(V::Const(0), 0) },
+        Inst { ty: Ty(0), op: Op::Extract(V::Inst(0), 0) },
+    ];
+    let first = [0, 0, 1];
+    let seen = [false, true, true];
+    let has_register = |park, loops| {
+        let parts = [
+            Part { original: 1, phis: vec![], body: vec![0], barrier: Some((V::Const(0), park)), term: None },
+            Part { original: 2, phis: vec![], body: vec![1], barrier: None,
+                term: Some(if loops { Term::Br(2) } else { Term::Ret }) },
+        ];
+        across_sweeps(&parts, &first, &seen, &insts, &[0, 1], &[true, false], &[false; 2])[0]
+    };
+    assert!(!has_register(false, false));
+    assert!(has_register(true, false));
+    assert!(has_register(false, true));
+}
+
 fn visit(blocks: &[Block], b: usize, seen: &mut [bool], order: &mut Vec<usize>) {
     if std::mem::replace(&mut seen[b], true) {
         return;
@@ -232,6 +319,7 @@ impl Module {
                 self.carry_value(v, &owners, &mut carry, &mut rebuild)?;
             }
         }
+        let across = across_sweeps(&parts, &first, &seen, &self.insts, &owners, &carry, &rebuild);
         self.blocks.truncate(1);
         let header = self.new_block();
         self.terminate(0, Term::Br(header));
@@ -254,9 +342,12 @@ impl Module {
         for (i, &needed) in carry.iter().enumerate() {
             if needed {
                 let ty = self.insts[i].ty;
-                let phi = self.phi(header, ty);
-                registers.push((i, phi, self.register_zero(ty)?));
-                values[i] = phi;
+                let initial = self.register_zero(ty)?;
+                values[i] = if across[i] {
+                    let phi = self.phi(header, ty);
+                    registers.push((i, phi, initial));
+                    phi
+                } else { initial };
             }
         }
         let mut cur = header;
@@ -275,17 +366,25 @@ impl Module {
                 let Op::Phi(incoming) = self.insts[i].op.clone() else {
                     unreachable!()
                 };
-                let mut v = self.register_zero(self.insts[i].ty)?;
+                let mut value = None;
                 for (input, pred_block) in incoming {
                     if pred_block != 0 && !seen[pred_block] {
                         continue;
                     }
-                    let from = self.i32(pred_block as u32);
-                    let here = self.cmp(exe, pred::EQ, prev, from);
                     let input = self.scheduled_value(exe, input, &values, &rebuild);
-                    v = self.select(exe, here, input, v);
+                    value = Some(match value {
+                        None => input,
+                        Some(other) if other == input => other,
+                        Some(other) => {
+                            let from = self.i32(pred_block as u32);
+                            let here = self.cmp(exe, pred::EQ, prev, from);
+                            self.select(exe, here, input, other)
+                        }
+                    });
                 }
-                phis.push((i, v));
+                // An executing block always has a real predecessor. Use one
+                // incoming value as the default arm of its phi selection.
+                phis.push((i, value.ok_or("a logical wave phi without a predecessor")?));
             }
             for (i, v) in phis {
                 if carry[i] {

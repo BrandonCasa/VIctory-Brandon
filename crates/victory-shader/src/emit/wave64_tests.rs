@@ -141,6 +141,7 @@ fn lowered_counted(
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        halfword_aligned_roots: Default::default(),
         indexed_forms: Default::default(),
         root_indexed_views: res.root_indexed_views,
     })
@@ -281,6 +282,7 @@ fn on_64_lanes(native: &NativeProgram, p: &ir::Program) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        halfword_aligned_roots: Default::default(),
         indexed_forms: Default::default(),
         root_indexed_views: res.root_indexed_views,
     };
@@ -1205,6 +1207,7 @@ fn partial_dispatch_with_a_cross_half_wave_op_runs_in_32_lane_waves() {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        halfword_aligned_roots: Default::default(),
         indexed_forms: Default::default(),
         root_indexed_views: res.root_indexed_views.clone(),
     };

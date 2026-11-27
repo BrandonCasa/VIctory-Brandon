@@ -119,9 +119,9 @@ enum Command {
         list: Option<PathBuf>,
     },
     /// Make the host pipelines of every pipeline the title ever created
-    /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
-    /// driver's cache on disk has them before a run needs one: once per change
-    /// of the translator or the driver. Goes on where it was stopped.
+    /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down). Saves native
+    /// D3D12 pipeline libraries for use by later runs on the same driver.
+    /// Resumes from recipes whose native library is still available.
     ///
     /// Pipelines that crash or hang the compiler are listed in `warm-bad.txt`
     /// with the current fingerprint and retried automatically after a driver

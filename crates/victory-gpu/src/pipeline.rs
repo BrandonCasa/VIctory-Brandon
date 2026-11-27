@@ -139,10 +139,11 @@ pub(crate) struct Translated {
     pub(crate) layout: Arc<[u32]>,
     pub(crate) address_keys: Vec<(u8, u32)>,
     pub(crate) address_ordinals: Vec<Option<usize>>,
-    /// Whether the shader's code can store to buffer memory ([`stores`]);
-    /// true when its code is not known.
+    /// Whether the program can write a buffer, directly or through a UAV.
     pub(crate) stores: bool,
-    /// Whether it can store through raw addresses ([`stores_by_address`]).
+    /// Whether the program can write a texture UAV.
+    pub(crate) stores_textures: bool,
+    /// Whether it can store through raw addresses.
     pub(crate) stores_by_address: bool,
     /// Whether it stores through a view it picks from the heap by an index,
     /// once asked (`crate::picked`).
@@ -209,6 +210,13 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
+    translate_with(container, crate::shader_cache::host_shader)
+}
+
+#[cfg(windows)]
+fn translate_with(container: &[u8], get_host: impl FnOnce(&[u8]) -> Result<victory_shader::emit::HostShader, String>)
+    -> Result<Translated, String>
+{
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
@@ -217,13 +225,18 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
-    let stores = programs.is_empty() || programs.iter().any(stores);
+    let host = get_host(container)?;
+    let mut writes = ProgramWrites::default();
+    if programs.is_empty() {
+        writes.unknown();
+    }
+    for program in &programs {
+        writes.examine(program);
+    }
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
         _ => None,
     });
-    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -286,8 +299,9 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         threads,
         used,
         tables,
-        stores,
-        stores_by_address,
+        stores: writes.buffer,
+        stores_textures: writes.texture,
+        stores_by_address: writes.address,
         picks: Default::default(),
     })
 }
@@ -334,56 +348,53 @@ pub(crate) fn builder_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "0"))
 }
 
-/// Whether a console program can store to buffer memory: it has a buffer,
-/// typed-buffer, scalar-memory, flat or global store or atomic, or code
-/// that is not all known (an instruction of those kinds outside our table,
-/// an indirect jump, code that does not decode). Stores to textures
-/// (image instructions) and to the program's own scratch memory do not
-/// count: neither reaches a buffer's host copy. After upstream #413,
-/// which leaves scalar-memory stores out and counts image stores.
+/// Accumulate the memory destinations of all native programs in a container.
 #[cfg(windows)]
-fn stores(program: &victory_shader::NativeProgram) -> bool {
-    use victory_shader::gfx10::{Encoding, decode};
-    let Ok(code) = decode(&program.code) else {
-        return true;
-    };
-    code.iter().any(|i| {
-        let name = i.name();
-        match i.encoding {
-            Encoding::Mubuf
-            | Encoding::Mtbuf
-            | Encoding::Smem
-            | Encoding::Flat
-            | Encoding::Global => name.is_none_or(|n| {
-                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
-            }),
-            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
-            _ => false,
-        }
-    })
+#[derive(Default)]
+struct ProgramWrites {
+    buffer: bool,
+    texture: bool,
+    address: bool,
 }
 
-/// Whether a console program can store to memory through raw addresses
-/// (`crate::memory`): a flat or global store or atomic, or code that does
-/// not decode. The programs that only walk ray-tracing structures do not,
-/// whatever they store through views.
 #[cfg(windows)]
-fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
-    use victory_shader::gfx10::{Encoding, decode};
-    let Ok(code) = decode(&program.code) else {
-        return true;
-    };
-    code.iter().any(|i| {
-        matches!(i.encoding, Encoding::Flat | Encoding::Global)
-            && i.name()
-                .is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
-    })
+impl ProgramWrites {
+    fn unknown(&mut self) {
+        self.buffer = true;
+        self.texture = true;
+        self.address = true;
+    }
+
+    fn examine(&mut self, program: &victory_shader::NativeProgram) {
+        use victory_shader::gfx10::{Encoding, decode};
+        let Ok(code) = decode(&program.code) else { return self.unknown() };
+        for i in code {
+            let name = i.name();
+            match i.encoding {
+                Encoding::Mubuf | Encoding::Mtbuf | Encoding::Smem | Encoding::Flat | Encoding::Global => {
+                    let writes = name.is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"));
+                    self.buffer |= writes;
+                    self.address |= writes && matches!(i.encoding, Encoding::Flat | Encoding::Global);
+                }
+                Encoding::Mimg => {
+                    self.texture |= name.is_none_or(|n| n.starts_with("image_store") || n.starts_with("image_atomic"));
+                }
+                Encoding::Sop1 if name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")) => {
+                    self.buffer = true;
+                    self.texture = true;
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 #[repr(C)]
 struct Pipeline {
     object: Object,
     packet: [u32; 8],
+    #[cfg(windows)]
+    static_tables: crate::root::StaticTables,
     /// Each used stage's container.
     shaders: Vec<Arc<Shader>>,
     /// Whether a list has bound it yet (its shaders are logged then).
@@ -408,6 +419,15 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
     unsafe { &*this.cast::<Pipeline>() }
 }
 
+#[cfg(windows)]
+pub(crate) fn static_table_word(this: This, slot: u8, dword: u32) -> bool {
+    if this.is_null() || !dword.is_multiple_of(8) { return false; }
+    let Some(ranges) = &pipeline(this).static_tables else { return false };
+    let index = dword / 8;
+    let mut matches = ranges.iter().filter(|r| r.slot == slot && r.offset.contains(&index));
+    matches.next().is_some_and(|r| r.immutable) && matches.next().is_none()
+}
+
 /// List method: logs each pipeline's shaders the first time a list binds
 /// it, so a run lists the shaders its frames need first.
 pub(crate) fn bound(this: This) {
@@ -418,8 +438,13 @@ pub(crate) fn bound(this: This) {
     if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    #[cfg(windows)]
+    known::note(p.host.key(), &p.shaders, p.host.graphics.as_deref());
     let frame = crate::frame::current();
     for shader in &p.shaders {
+        #[cfg(windows)]
+        tracing::info!(pipeline = ?this, recipe = p.host.key(), frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        #[cfg(not(windows))]
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
     }
 }
@@ -489,11 +514,23 @@ fn canonical_pending(
     shaders: &[Arc<Shader>],
     graphics: Option<Box<host::GraphicsState>>,
 ) -> Arc<make::Pending> {
+    cached_pending(shaders, graphics, None)
+}
+
+#[cfg(windows)]
+fn cached_pending(
+    shaders: &[Arc<Shader>],
+    graphics: Option<Box<host::GraphicsState>>,
+    prepared: Option<host::HostPipeline>,
+) -> Arc<make::Pending> {
     type Recipe = (Vec<usize>, Option<Vec<u8>>);
     #[derive(Default)]
     struct Cache {
         live: HashMap<Recipe, std::sync::Weak<make::Pending>>,
         retained: std::collections::VecDeque<Arc<make::Pending>>,
+        startup: HashMap<String, Arc<make::Pending>>,
+        #[cfg(feature = "diagnostics")]
+        startup_claimed: usize,
     }
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     let key = (
@@ -509,9 +546,22 @@ fn canonical_pending(
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if let Some(p) = cache.live.get(&key).and_then(|p| p.upgrade()) {
+        if prepared.is_none() && !cache.startup.is_empty() && cache.startup.remove(p.key()).is_some() {
+            #[cfg(feature = "diagnostics")]
+            {
+                cache.startup_claimed += 1;
+                if cache.startup_claimed.is_power_of_two() || cache.startup.is_empty() {
+                    tracing::info!(claimed=cache.startup_claimed, remaining=cache.startup.len(), "title acquired prepared pipelines");
+                }
+            }
+        }
         return p;
     }
     let pending = Arc::new(make::Pending::new(shaders.to_vec(), graphics));
+    if let Some(host) = prepared {
+        pending.install(host);
+        cache.startup.insert(pending.key().to_owned(), pending.clone());
+    }
     if cache.retained.len() == 512 {
         cache.retained.pop_front();
     }
@@ -626,6 +676,7 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    #[cfg(windows)] static_tables: crate::root::StaticTables,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
@@ -643,6 +694,8 @@ fn hand_out(
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
+        #[cfg(windows)]
+        static_tables,
         #[cfg(windows)]
         host,
         #[cfg(windows)]
@@ -672,6 +725,8 @@ pub(crate) extern "system" fn create_graphics(
         shaders,
         #[cfg(windows)]
         None,
+        #[cfg(windows)]
+        crate::root::data_static(desc.root),
         iid,
         out,
     )
@@ -692,6 +747,8 @@ pub(crate) extern "system" fn create_compute(
         copy("compute", &desc.stage).into_iter().collect(),
         #[cfg(windows)]
         None,
+        #[cfg(windows)]
+        crate::root::data_static(desc.root),
         iid,
         out,
     )
@@ -824,6 +881,8 @@ struct StreamRecipe {
     graphics: Box<host::GraphicsState>,
     #[cfg(windows)]
     cache_root: Option<blake3::Hash>,
+    #[cfg(windows)]
+    static_tables: crate::root::StaticTables,
 }
 
 impl StreamRecipe {
@@ -832,6 +891,8 @@ impl StreamRecipe {
             self.shaders,
             #[cfg(windows)]
             Some(self.graphics),
+            #[cfg(windows)]
+            self.static_tables,
             iid,
             out,
         )
@@ -857,7 +918,7 @@ fn stream_recipe(desc: *const StreamDesc) -> Option<StreamRecipe> {
     #[cfg(windows)]
     let mut graphics = Box::new(host::GraphicsState::default());
     #[cfg(windows)]
-    let (mut root, mut represented) = (None, true);
+    let (mut root, mut static_tables, mut represented) = (None, None, true);
     let mut at = 0;
     while at < bytes.len() {
         let kind = u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?);
@@ -892,9 +953,11 @@ fn stream_recipe(desc: *const StreamDesc) -> Option<StreamRecipe> {
         #[cfg(windows)]
         {
             if kind == 0 {
-                root = crate::root::digest(unsafe {
+                let object = unsafe {
                     sub.as_ptr().add(8).cast::<This>().read_unaligned()
-                });
+                };
+                root = crate::root::digest(object);
+                static_tables = crate::root::data_static(object);
             }
             if matches!(kind, 7 | 22) || matches!(kind, 18 | 20) && sub[4..8] != [0; 4] {
                 represented = false;
@@ -911,6 +974,8 @@ fn stream_recipe(desc: *const StreamDesc) -> Option<StreamRecipe> {
         graphics,
         #[cfg(windows)]
         cache_root: if represented { root } else { None },
+        #[cfg(windows)]
+        static_tables,
     })
 }
 

@@ -25,7 +25,9 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// must be ready when it runs, not only those its tables name.
 pub const SLOT_STRIDES: u8 = 255;
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
-pub const VIEW_STRIDE_BITS: u32 = (1 << VIEW_PREFIX_SHIFT) - 1;
+pub const VIEW_STRIDE_BITS: u32 = VIEW_RAW_RGB32 - 1;
+/// A typed RGB32_FLOAT SRV backed by its exact packed three-dword raw interval.
+pub const VIEW_RAW_RGB32: u32 = 1 << 27;
 /// Dwords between the raw host descriptor start and its guest interval.
 pub const VIEW_PREFIX_SHIFT: u32 = 28;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format
@@ -179,7 +181,14 @@ pub fn set_view_heap_limit(null_slot: u32) {
 
 /// See [`VIEW_LIMIT`]: the null slot shaders translated now clamp view indices to (0: none).
 pub fn view_heap_limit() -> u32 {
+    #[cfg(test)]
+    if let Some(limit) = VIEW_LIMIT_HERE.get() { return limit; }
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static VIEW_LIMIT_HERE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 /// Where the host's raw twins of its buffer views start in its view heaps (0: there are none).

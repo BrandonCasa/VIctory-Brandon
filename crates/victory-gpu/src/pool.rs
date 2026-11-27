@@ -42,13 +42,9 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
-    if !crate::residency::on() {
-        SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
-        return;
-    }
-    // (`VICTORY_RESIDENCY=1`, codec-d/cool_fox c64fc9b4/e94d277a: fewer
-    // spares while the system is short of memory, and idle blocks let go now,
-    // not at the pool's next allocation.)
+    // A scene can give back its last pieces and make no further allocations.
+    // Finish their ordinary quarantine and free surplus heaps on the sweep.
+    // Residency pressure reduces the allowed spares further when enabled.
     let pressure = crate::residency::pressured();
     let limit = spares(memory, crate::host::keep_freed() && !pressure);
     SPARES.store(limit, Ordering::Relaxed);
@@ -56,14 +52,8 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     if let Ok(mut pool) = TEXTURES.try_lock() {
         pool.reclaim(tick, limit, true);
     }
+    let staging_limit = crate::residency::idle_staging_spares(limit);
     if let Ok(mut pool) = STAGING.try_lock() {
-        let staging_limit = if crate::residency::critical_commit() {
-            0
-        } else if pressure {
-            1
-        } else {
-            limit
-        };
         pool.reclaim(tick, staging_limit, true);
     }
 }
@@ -216,7 +206,7 @@ impl<B: Clone> Pool<B> {
             empty: 0,
             blocks: Vec::new(),
             resting: VecDeque::new(),
-            spare: 0,
+            spare: if most < SPARE { most } else { SPARE },
             most,
             retry_growth_at: 0,
         }
@@ -243,7 +233,10 @@ impl<B: Clone> Pool<B> {
         if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
             return None;
         }
-        self.rested(now);
+        // A waiting allocation can immediately consume a newly returned
+        // block even when the idle budget is zero. The sweep can still
+        // discard all empty blocks when there is no allocation to serve.
+        self.reclaim(now, self.spare.max(1), false);
         let mut found = None;
         for (i, block) in self.blocks.iter_mut().enumerate() {
             if let Some(block) = block
@@ -331,8 +324,9 @@ impl<B: Clone> Pool<B> {
 
     /// Makes the pieces that rested long enough free, and lets go of empty
     /// blocks past [`SPARE`].
+    #[cfg(test)]
     fn rested(&mut self, now: u64) {
-        self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
+        self.reclaim(now, self.spare, false);
     }
 
     /// [`Pool::rested`] with at most `limit` empty blocks kept; `sweep`: the
@@ -354,8 +348,10 @@ impl<B: Clone> Pool<B> {
         }
         // (Without a piece given back too, once there is less room.)
         let most = limit.min(self.most);
-        if sweep || any || most < self.spare {
+        if sweep {
             self.spare = most;
+        }
+        if sweep || any {
             let mut spare = 0;
             for block in &mut self.blocks {
                 if block.as_ref().is_some_and(|b| b.empty) {
@@ -388,7 +384,7 @@ fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
 }
 
 /// Bytes of the pieces textures hold now.
-static HELD: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HELD: AtomicU64 = AtomicU64::new(0);
 
 /// Bytes of the texture blocks no texture holds: the card's memory in use
 /// by us that new textures take first.
@@ -402,7 +398,10 @@ pub(crate) fn memory() -> [u64; 2] {
 }
 
 /// Part of a block of mapped upload memory, back in the pool when dropped.
-pub(crate) struct StagingPiece(Piece, StagingUse);
+pub(crate) struct StagingPiece {
+    piece: Piece,
+    quarantine: bool,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum StagingUse {
@@ -414,11 +413,17 @@ pub(crate) enum StagingUse {
 impl Drop for StagingPiece {
     fn drop(&mut self) {
         let mut pool = lock(&STAGING);
-        match self.1 {
-            StagingUse::Detile => pool.give(self.0, now()),
-            StagingUse::Submission => pool.resting.push_front((0, self.0)),
+        if self.quarantine {
+            pool.give(self.piece, now());
+        } else {
+            pool.resting.push_front((0, self.piece));
         }
     }
+}
+
+impl StagingPiece {
+    /// The copy worker has waited on the fence for the batch that consumed this piece.
+    pub(crate) fn fence_completed(&mut self) { self.quarantine = false; }
 }
 
 /// Upload space, its buffer offset, and its mapping. Detile space starts zeroed.
@@ -439,7 +444,7 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64, usage: StagingUse) -
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
     })?;
-    let owned = StagingPiece(piece, usage);
+    let owned = StagingPiece { piece, quarantine: matches!(usage, StagingUse::Detile) };
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
     if again && matches!(usage, StagingUse::Detile) {
@@ -449,6 +454,61 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64, usage: StagingUse) -
         unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
     }
     Some((owned, memory.0, piece.start, data))
+}
+
+/// Small address windows remain independent native resources so D3D12 can
+/// transition each one. Pack fresh ranges into a resident write-back heap.
+/// Resources retain that heap through COM, including after their guest
+/// shadow is removed while a descriptor or an in-flight list still names it.
+#[derive(Default)]
+pub(crate) struct WindowHeap {
+    current: Option<(ID3D12Heap, u64)>,
+}
+
+impl WindowHeap {
+    pub(crate) fn place(
+        &mut self,
+        device: &ID3D12Device,
+        properties: D3D12_HEAP_PROPERTIES,
+        desc: &D3D12_RESOURCE_DESC,
+    ) -> Option<ID3D12Resource> {
+        const BYTES: u64 = 8 << 20;
+        const OWNER: GUID = GUID::from_u128(0xa13d4a21_b9ea_4697_b9ef_87e84b6d36ea);
+        // Larger windows need few native allocations and should release their
+        // bytes independently when streaming moves away from them.
+        if desc.Width > 1 << 20 { return None; }
+        // SAFETY: a complete description of a buffer to be placed on this device.
+        let info = unsafe { device.GetResourceAllocationInfo(0, &[*desc]) };
+        if info.Alignment == 0 || info.SizeInBytes > BYTES { return None; }
+        if self.current.as_ref().is_none_or(|(_, end)| end.next_multiple_of(info.Alignment) + info.SizeInBytes > BYTES) {
+            let mut heap: Option<ID3D12Heap> = None;
+            let block = D3D12_HEAP_DESC {
+                SizeInBytes: BYTES,
+                Properties: properties,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | crate::host::not_resident(),
+                ..Default::default()
+            };
+            // SAFETY: ordinary D3D12 heap creation. All placed buffers use the
+            // same CPU page properties and GPU common state as committed windows.
+            unsafe { device.CreateHeap(&block, &mut heap) }.ok()?;
+            let heap = heap?;
+            crate::host::resident(device, &heap).ok()?;
+            crate::host::mapped(device).ok()?;
+            self.current = Some((heap, 0));
+        }
+        let (heap, used) = self.current.as_mut()?;
+        let start = used.next_multiple_of(info.Alignment);
+        let mut resource: Option<ID3D12Resource> = None;
+        // SAFETY: this range is aligned, inside the heap, and has never been
+        // used for another resource. Released ranges are never reassigned.
+        unsafe {
+            device.CreatePlacedResource(&*heap, start, desc, D3D12_RESOURCE_STATE_COMMON, None, &mut resource).ok()?;
+            let resource = resource?;
+            resource.SetPrivateDataInterface(&OWNER, &*heap).ok()?;
+            *used = start + info.SizeInBytes;
+            Some(resource)
+        }
+    }
 }
 
 /// An object the host texture holds and releases when it goes: its piece
@@ -765,6 +825,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn loose_windows_retain_their_heap_after_rollover() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("Skipping window placement test because D3D12 is unavailable");
+            return;
+        };
+        let mut pool = WindowHeap::default();
+        let properties = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 1 << 20,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut resources = Vec::new();
+        let mut heaps = std::collections::HashSet::new();
+        for value in 1..=9u32 {
+            let resource = pool.place(&host.device, properties, &desc).expect("placed window");
+            heaps.insert(pool.current.as_ref().unwrap().0.as_raw() as usize);
+            let mut data = std::ptr::null_mut();
+            // SAFETY: a writable CPU mapping with space for the marker.
+            unsafe {
+                resource.Map(0, None, Some(&mut data)).unwrap();
+                data.cast::<u32>().write(value);
+                resource.Unmap(0, None);
+            }
+            resources.push(resource);
+        }
+        assert_eq!(heaps.len(), 2);
+        drop(pool);
+        for (i, resource) in resources.iter().enumerate() {
+            let mut data = std::ptr::null_mut();
+            // SAFETY: each resource still owns its distinct piece of backing.
+            unsafe {
+                resource.Map(0, None, Some(&mut data)).unwrap();
+                assert_eq!(data.cast::<u32>().read(), i as u32 + 1);
+                resource.Unmap(0, Some(&D3D12_RANGE::default()));
+            }
+        }
+    }
+
+    #[test]
     fn a_failed_block_is_not_retried_for_each_small_upload() {
         let mut pool: Pool<u32> = Pool::new(2);
         let calls = std::cell::Cell::new(0);
@@ -797,7 +908,22 @@ mod tests {
         assert_eq!(pool.blocks(), 1);
         assert!(pool.resting.is_empty());
         pool.give(held, REST);
-        pool.reclaim(2 * REST, 0, true);
+        // Allocation-time maintenance must retain this pool's host-budget
+        // limit even when the texture pool has a different VRAM budget.
+        pool.rested(2 * REST);
+        assert_eq!(pool.blocks(), 0);
+    }
+
+    #[test]
+    fn zero_idle_budget_reuses_a_completed_block_for_an_active_upload() {
+        let mut pool = Pool::new(STAGING_KEPT);
+        let (first, _, _) = pool.take(4096, 512, 0, || Some(7)).unwrap();
+        pool.reclaim(0, 0, true);
+        pool.resting.push_front((0, first));
+        let (next, backing, _) = pool.take(4096, 512, 1, || panic!("completed block should be reused")).unwrap();
+        assert_eq!(backing, 7);
+        pool.resting.push_front((0, next));
+        pool.reclaim(2, 0, true);
         assert_eq!(pool.blocks(), 0);
     }
 
@@ -959,12 +1085,12 @@ mod tests {
         assert_eq!(resting(), before + 1);
         // SAFETY: the piece's mapping, 4096 bytes of it ours.
         unsafe {
-            let (piece, _, at, data) = staging(host, 4096).unwrap();
+            let (piece, _, at, data) = staging(host, 4096, StagingUse::Detile).unwrap();
             assert!(at.is_multiple_of(512));
             std::ptr::write_bytes(data, 0xAB, 4096);
             drop(piece);
             lock(&STAGING).rested(u64::MAX);
-            let (_piece, _, _, data) = staging(host, 4096).unwrap();
+            let (_piece, _, _, data) = staging(host, 4096, StagingUse::Detile).unwrap();
             assert!((0..4096).all(|i| *data.add(i) == 0));
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());

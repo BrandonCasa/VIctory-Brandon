@@ -56,6 +56,28 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
+static WARM_SOURCE: OnceLock<PathBuf> = OnceLock::new();
+
+pub(super) fn warm_from(dir: &std::path::Path) {
+    let _ = WARM_SOURCE.set(dir.to_owned());
+}
+
+thread_local! {
+    static WARM_PUBLISHED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static PRELOAD_NATIVE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn take_warm_publication() -> Option<String> { WARM_PUBLISHED.take() }
+
+/// During startup accept only the exact native artifact in this receipt.
+/// A cache miss goes back to normal first-use scheduling.
+pub(super) fn from_receipt<T>(native: String, f: impl FnOnce() -> T) -> T {
+    struct Clear;
+    impl Drop for Clear { fn drop(&mut self) { PRELOAD_NATIVE.take(); } }
+    PRELOAD_NATIVE.replace(Some(native));
+    let _clear = Clear;
+    f()
+}
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
@@ -214,6 +236,10 @@ impl Blob {
         if next.exists() && std::fs::rename(&next, &path).is_err() {
             tracing::warn!("the host pipeline library saved last could not take the old one's place");
         }
+        Self::read(&path)
+    }
+
+    fn read(path: &std::path::Path) -> Blob {
         if mapped()
             && let Some(file) = Mapped::open(&path)
         {
@@ -415,14 +441,26 @@ unsafe impl Send for Library {}
 // SAFETY: as above; the other fields are an atomic and a lock.
 unsafe impl Sync for Library {}
 
-/// Held by a load of the pipeline named `name`: loads of the same name
-/// wait for each other (the host's one exception to the library's thread
-/// safety: such a load may change that pipeline's entry). Names share 64
-/// locks, so two different names seldom wait.
-fn same_name(name: &str) -> MutexGuard<'static, ()> {
-    static LOADING: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
-    let at = name.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b)));
-    LOADING[at % LOADING.len()].lock().unwrap_or_else(|e| e.into_inner())
+/// Loads of the same pipeline library entry serialize with each other.
+/// A native load can run the driver compiler for seconds. Hold the registry
+/// mutex only while acquiring or releasing the name.
+static LOADING: std::sync::LazyLock<(Mutex<HashSet<String>>, std::sync::Condvar)> =
+    std::sync::LazyLock::new(Default::default);
+
+struct LoadingName<'a>(&'a str);
+
+fn same_name(name: &str) -> LoadingName<'_> {
+    let active = LOADING.0.lock().unwrap_or_else(|e| e.into_inner());
+    let mut active = LOADING.1.wait_while(active, |names| names.contains(name)).unwrap_or_else(|e| e.into_inner());
+    active.insert(name.to_owned());
+    LoadingName(name)
+}
+
+impl Drop for LoadingName<'_> {
+    fn drop(&mut self) {
+        LOADING.0.lock().unwrap_or_else(|e| e.into_inner()).remove(self.0);
+        LOADING.1.notify_all();
+    }
 }
 
 /// With `VICTORY_LIBRARY_LOCK=1`: held by every library call, as before.
@@ -448,7 +486,11 @@ fn library() -> Option<&'static Library> {
         .get_or_init(|| {
             let _opening = crate::timeline::span("pipeline: open the host pipeline library");
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
+            let blob = if let Some(dir) = WARM_SOURCE.get() {
+                Blob::read(&dir.join(LIBRARY_FILE))
+            } else {
+                DIR.get().map_or(Blob::None, |d| Blob::of(d))
+            };
             let library = open(&device, blob);
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -517,10 +559,22 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     key: &dyn Fn() -> String,
-    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    if let Some(result) = PRELOAD_NATIVE.with_borrow(|expected| {
+        let expected = expected.as_ref()?;
+        let saved = warm_folder().filter(|_| key() == *expected)
+            .and_then(|dir| read_warm(&dir.join(expected)));
+        Some(match saved {
+            Some(saved) => load(&saved, PCWSTR(HSTRING::from(expected.as_str()).as_ptr())),
+            None => Err(windows::Win32::Foundation::E_INVALIDARG.into()),
+        })
+    }) {
+        return result;
+    }
     let create = || {
+        let _permit = super::make::enter_driver_compile();
         let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
         create()
     };
@@ -531,6 +585,35 @@ pub(crate) fn pipeline(
     let key = key();
     let name = key.as_str();
     let wide = HSTRING::from(name);
+    let warm_file = warm_folder().map(|dir| dir.join(name));
+    let warming = WARM_SOURCE.get().is_some();
+    let load_warm = || {
+        let file = warm_file.as_deref()?;
+        let read = |path: &std::path::Path| {
+            let library = read_warm(path)?;
+            load(&library, PCWSTR(wide.as_ptr())).ok()
+        };
+        if let Some(pso) = read(file) { return Some((pso, true)); }
+        // Earlier single-entry exports used the translator fingerprint as
+        // the directory. The driver still validates the exact key and PSO.
+        static OLDER: OnceLock<Vec<PathBuf>> = OnceLock::new();
+        let older = OLDER.get_or_init(|| {
+            file.parent().and_then(std::path::Path::parent).and_then(|d| d.read_dir().ok())
+                .into_iter().flatten().flatten().filter_map(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_str()?;
+                    (name.len() == 16 && name.bytes().all(|b| b.is_ascii_hexdigit())).then(|| entry.path())
+                }).collect()
+        });
+        older.iter().find_map(|d| read(&d.join(name))).map(|pso| (pso, false))
+    };
+    // Offline workers can share identical native recipes; a completed
+    // single-entry library is already the durable result for either recipe.
+    if warming && let Some((pso, local)) = load_warm() {
+        if local { WARM_PUBLISHED.replace(Some(key)); }
+        else { publish_warm(warm_file.as_deref(), name, &wide, &pso); }
+        return Ok(pso);
+    }
     let began = std::time::Instant::now();
     let loaded = {
         let mut loading = crate::timeline::span("pipeline: acquire library load guards");
@@ -545,6 +628,7 @@ pub(crate) fn pipeline(
     TRIMMED.store(false, Ordering::Relaxed);
     let refused = match loaded {
         Ok(pso) => {
+            if warming { publish_warm(warm_file.as_deref(), name, &wide, &pso); }
             LOADED.fetch_add(1, Ordering::Relaxed);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
@@ -555,18 +639,28 @@ pub(crate) fn pipeline(
         Err(e) => e,
     };
     // Compiled outside any lock: compiles take up to seconds.
-    let pso = {
+    let pso = if !warming && let Some((pso, _)) = load_warm() {
+        LOADED.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(name, "loaded an offline host pipeline");
+        pso
+    } else {
         let _call = call("make", name);
-        create()?
+        let pso = create()?;
+        MADE.fetch_add(1, Ordering::Relaxed);
+        crate::host::trail(|| {
+            let label = LABEL.with(|l| l.borrow().clone());
+            format!("pipeline library: made {label} in {:.1} ms (the library did not load it: {refused})",
+                began.elapsed().as_secs_f64() * 1e3)
+        });
+        if warming {
+            publish_warm(warm_file.as_deref(), name, &wide, &pso);
+            return Ok(pso);
+        }
+        if began.elapsed().as_millis() >= u128::from(SLOW_MS) && let Some(path) = warm_file {
+            preserve_slow(path, name, &pso);
+        }
+        pso
     };
-    MADE.fetch_add(1, Ordering::Relaxed);
-    crate::host::trail(|| {
-        let label = LABEL.with(|l| l.borrow().clone());
-        format!(
-            "pipeline library: made {label} in {:.1} ms (the library did not load it: {refused})",
-            began.elapsed().as_secs_f64() * 1e3
-        )
-    });
     let mut storing = crate::timeline::span("pipeline: acquire library store guards");
     let _all = one_call();
     let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
@@ -578,6 +672,91 @@ pub(crate) fn pipeline(
         library.added.fetch_add(1, Ordering::Relaxed);
     }
     Ok(pso)
+}
+
+pub(super) fn warm_folder() -> Option<&'static std::path::Path> {
+    static FOLDER: OnceLock<PathBuf> = OnceLock::new();
+    let root = WARM_SOURCE.get().or_else(|| DIR.get())?;
+    Some(FOLDER.get_or_init(|| super::known::native_folder(root)))
+}
+
+/// A worker writes precisely one native PSO at a time. A different process
+/// can use it immediately without taking a lock on the live game's library.
+fn publish_warm(path: Option<&std::path::Path>, key: &str, name: &HSTRING, pso: &ID3D12PipelineState) {
+    if let Some(path) = path {
+        match write_entry(path, name, pso) {
+            Ok(()) => { WARM_PUBLISHED.replace(Some(key.to_owned())); }
+            Err(error) => tracing::warn!(?path, %error, "could not save an offline host pipeline"),
+        }
+    }
+}
+
+fn write_entry(path: &std::path::Path, name: &HSTRING, pso: &ID3D12PipelineState) -> std::io::Result<()> {
+    let failed = |e: windows::core::Error| std::io::Error::other(e.to_string());
+    let host = crate::host::host().ok_or_else(|| std::io::Error::other("no host device"))?;
+    let device = host.device.cast::<ID3D12Device1>().map_err(failed)?;
+    // SAFETY: an empty library owns its storage. The PSO and name live throughout the calls.
+    let library = unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(&[]) }
+        .and_then(|l| l.cast::<ID3D12PipelineLibrary1>()).map_err(failed)?;
+    unsafe { library.StorePipeline(PCWSTR(name.as_ptr()), pso) }.map_err(failed)?;
+    let size = unsafe { library.GetSerializedSize() };
+    let mut bytes = vec![0u8; size];
+    unsafe { library.Serialize(&mut bytes) }.map_err(failed)?;
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    write_atomically(path, &bytes)
+}
+
+/// Preserve unusually expensive native compiles before the next whole-library
+/// save. A failed title frame can end the process before that save runs.
+fn preserve_slow(path: PathBuf, name: &str, pso: &ID3D12PipelineState) {
+    type Entry = (PathBuf, String, ID3D12PipelineState, Option<String>);
+    static WRITER: OnceLock<Option<std::sync::mpsc::SyncSender<Entry>>> = OnceLock::new();
+    let sender = WRITER.get_or_init(|| {
+        let (send, receive) = std::sync::mpsc::sync_channel::<Entry>(2);
+        std::thread::Builder::new().name("pipeline cache".into()).spawn(move || {
+            for (path, name, pso, recipe) in receive {
+                match write_entry(&path, &HSTRING::from(name.as_str()), &pso) {
+                    Err(error) => tracing::warn!(?path, %error, "could not preserve a slow native pipeline"),
+                    Ok(()) => if let (Some(dir), Some(recipe)) = (DIR.get(), recipe) {
+                        use std::io::Write;
+                        static FINGERPRINT: OnceLock<String> = OnceLock::new();
+                        let fp = FINGERPRINT.get_or_init(super::known::fingerprint);
+                        let entry = format!("{fp} {recipe} exact-v1 {name}\n");
+                        if let Err(error) = std::fs::OpenOptions::new().create(true).append(true)
+                            .open(dir.join("warm-done.txt")).and_then(|mut f| f.write_all(entry.as_bytes())) {
+                            tracing::warn!(%error, "could not record a preserved pipeline for startup");
+                        }
+                    },
+                }
+            }
+        }).ok()?;
+        Some(send)
+    });
+    // The main library still owns all PSOs if its optional writer is busy.
+    if let Some(sender) = sender {
+        let _ = sender.try_send((path, name.to_owned(), pso.clone(), super::make::active_recipe()));
+    }
+}
+
+fn read_warm(path: &std::path::Path) -> Option<ID3D12PipelineLibrary1> {
+    use std::io::Read;
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCreateBlob;
+    const BACKING: windows::core::GUID = windows::core::GUID::from_u128(0x301e1a61_9e49_4890_aa03_cccec00bf9ea);
+    let mut f = std::fs::File::open(path).ok()?;
+    let size = usize::try_from(f.metadata().ok()?.len()).ok()?;
+    if size == 0 { return None; }
+    let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
+    // SAFETY: this blob owns exactly size writable bytes. CreatePipelineLibrary
+    // may retain their address; its private COM reference keeps them alive
+    // until the library's final release, including any internal references.
+    unsafe {
+        let blob = D3DCreateBlob(size).ok()?;
+        let bytes = std::slice::from_raw_parts_mut(blob.GetBufferPointer().cast::<u8>(), size);
+        f.read_exact(bytes).ok()?;
+        let library = device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes).ok()?;
+        library.SetPrivateDataInterface(&BACKING, &blob).ok()?;
+        library.cast().ok()
+    }
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -796,6 +975,26 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_library_loads_wait_only_for_the_same_name() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        // These names collide under the old 64-stripe hash.
+        let first = same_name("00");
+        let second = same_name("22");
+        let (entered, done) = mpsc::channel();
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                let _again = same_name("00");
+                entered.send(()).unwrap();
+            });
+            assert!(done.recv_timeout(Duration::from_millis(20)).is_err());
+            drop(first);
+            done.recv_timeout(Duration::from_secs(2)).unwrap();
+            drop(second);
+        });
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {

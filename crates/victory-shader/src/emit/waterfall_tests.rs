@@ -83,6 +83,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        halfword_aligned_roots: Default::default(),
         indexed_forms: Default::default(),
         root_indexed_views: Vec::new(),
     };
@@ -386,6 +387,7 @@ fn immediate_sampler_chosen_by_control_flow() {
             root_cbvs: lowered.root_cbvs,
             root_srvs: lowered.root_srvs,
             root_uavs: lowered.root_uavs,
+            halfword_aligned_roots: Default::default(),
             indexed_forms: Default::default(),
             root_indexed_views: Vec::new(),
         };

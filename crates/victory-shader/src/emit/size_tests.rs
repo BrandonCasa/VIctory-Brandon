@@ -72,7 +72,8 @@ fn build(words: &[u32], srv: (u8, u32)) -> Result<HostShader, ShaderError> {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
-        indexed_forms: Default::default(),
+        halfword_aligned_roots: Default::default(),
+        indexed_forms: lowered.indexed_forms,
         root_indexed_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -129,6 +130,28 @@ const FROM_HEAP: &[u32] = &[
     0xF40C_0203,
     0x1800_0000,
 ];
+
+#[test]
+fn indexed_image_writes_follow_the_native_instruction() {
+    for (image, writes) in [
+        (0xF000_3F88, false), // image_load
+        (0xF020_3F08, true),  // image_store
+        (0xF044_3108, true),  // image_atomic_add
+    ] {
+        let body = [
+            0x7E00_0280, 0x7E02_0280, 0x7E04_0280, 0x7E06_0280,
+            0x7E08_0280, 0x7E0A_0280, // v0..5 = 0
+            image, 0x0002_0200,
+            0x7E08_0502, // v_readfirstlane_b32 s4, v2
+            0xBE85_0380, // s5 = 0
+        ];
+        let shader = build(&[TABLE, FROM_HEAP, &body, STORE].concat(), (8, 0)).expect("translates");
+        let access = shader.indexed_forms;
+        let form = access.offsets.iter().fold(access.opaque, |all, (_, f)| all | f);
+        assert_ne!(form & (8 | 16), 0, "image={image:#x}");
+        assert_eq!(form & super::TEXTURE_WRITE_ACCESS != 0, writes, "image={image:#x}");
+    }
+}
 
 /// `s_load_dwordx4 s[8:11], s[2:3], 0`, then the record count in s4 and 0
 /// in s5.
@@ -223,6 +246,51 @@ fn the_record_count_of_a_structured_buffer_read_by_index() {
     ];
     for (label, got) in run(&shader, &views) {
         assert_eq!(got[..2], [3, 77], "{label}");
+    }
+}
+
+/// A packed RGB32 SRV shares its canonical raw bytes with the writer. Its
+/// typed view supplies W, rejects out-of-range elements, and reports triples.
+#[test]
+fn packed_rgb32_srv_preserves_typed_loads_dimensions_and_d16() {
+    use super::host::{Dispatch, Host, Root};
+    use super::shader::{FRESH_TABLE_SIZES, VIEW_LIMIT_HERE, VIEW_MAPPING, VIEW_RAW_RGB32};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32_FLOAT;
+    VIEW_LIMIT_HERE.set(Some(999_999));
+    let mut words = [TABLE, COUNT].concat();
+    let store = |reg: u32, offset: u32| [0xE070_0000 | offset, 0x8005_0000 | reg << 8];
+    words.push(0x7E08_0204); // v4 = s4, the descriptor's record count
+    words.extend(store(4, 0));
+    for (d16, index, offset) in [(false, 1u32, 4), (false, 1 << 30, 20), (true, 1, 36)] {
+        words.extend([0x7E06_02FF, index]); // v3 = element index
+        words.extend([if d16 { 0xE20C_2000 } else { 0xE00C_2000 }, 0x8002_0C03]);
+        for ch in 0..if d16 { 2 } else { 4 } { words.extend(store(12 + ch, offset + 4 * ch)); }
+    }
+    words.extend_from_slice(FROM_HEAP); // logical slot 1 also maps to physical SRV 0
+    words.extend([0x7E06_0280, 0xE00C_2000, 0x8002_0C03]); // element 0
+    for ch in 0..4 { words.extend(store(12 + ch, 44 + 4 * ch)); }
+    words.push(0xBF81_0000);
+    let shader = build(&words, (4, 12)).expect("typed SRV translates");
+    VIEW_LIMIT_HERE.set(None);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let data = [7f32, 8., 9., 2., 3., 4.].map(f32::to_bits);
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pipeline) = host.compute_pipeline(&shader).unwrap();
+        for (raw, stride) in [(true, Stride::Raw), (false, Stride::Format(DXGI_FORMAT_R32G32B32_FLOAT, 12))] {
+            let mut metadata = vec![0; FRESH_TABLE_SIZES as usize / 4 + 1];
+            metadata[0] = 12 | if raw { VIEW_RAW_RGB32 } else { 0 };
+            let header = VIEW_MAPPING as usize / 4;
+            metadata[header..header + 5].copy_from_slice(&[3, 3, 0, 0, 2]);
+            let views = [View::Buffer { data: &data, stride }, View::Buffer { data: &data, stride: Stride::Raw }, View::RawUav(15)];
+            let output = host.dispatch(&root, &pipeline, &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords() as usize])), (1, Root::View { srv: true, data: metadata })],
+                views: &views, samplers: &[], groups: [1; 3],
+            }).unwrap();
+            let expected = [2, 2f32.to_bits(), 3f32.to_bits(), 4f32.to_bits(), 1f32.to_bits(), 0, 0, 0, 1f32.to_bits(),
+                0x42004000, 0x3c004400, 7f32.to_bits(), 8f32.to_bits(), 9f32.to_bits(), 1f32.to_bits()];
+            assert_eq!(&output[0][..], expected, "{label} raw={raw}");
+        }
     }
 }
 

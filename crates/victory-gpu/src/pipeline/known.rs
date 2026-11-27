@@ -259,6 +259,68 @@ pub fn fingerprint() -> String {
     h.finalize().to_hex()[..16].to_owned()
 }
 
+/// The file name within this folder already hashes the exact translated
+/// stages, root signature and pipeline state. A reflection-cache update that
+/// leaves those native inputs identical can use the same driver library.
+pub fn native_folder(dir: &Path) -> PathBuf {
+    let adapter = crate::host::host().map_or_else(|| "unknown".to_owned(), |host| host.pipeline_adapter());
+    dir.join("warm-libraries").join(adapter)
+}
+
+/// Install native PSOs prepared by an offline warm before starting the
+/// guest. The title acquires the same object when it creates that recipe.
+pub fn preload() {
+    // Several thousand distinct recipes occur in the first world frame.
+    // Bound objects awaiting a guest handle when a cache spans other scenes.
+    const MAX_RETAINED: usize = 4096;
+    if std::env::var_os("VICTORY_PRELOAD_PIPELINES").is_some_and(|v| v == "0") { return; }
+    let Some(dir) = super::library::folder() else { return };
+    let Ok(receipts) = std::fs::read_to_string(dir.join("warm-done.txt")) else { return };
+    let Ok(early) = std::fs::read_to_string(dir.join("early-pipelines.txt")) else { return };
+    let early: HashSet<_> = early.lines().collect();
+    // Several translation revisions can have receipts for the same recipe.
+    // Try the newest first, and let the native key and driver validate it.
+    let mut candidates = Vec::<(&str, Vec<&str>)>::new();
+    let mut by_key = HashMap::<&str, usize>::new();
+    for line in receipts.lines().rev() {
+        let mut fields = line.split_whitespace();
+        let (Some(_), Some(key), Some("exact-v1"), Some(native)) =
+            (fields.next(), fields.next(), fields.next(), fields.next()) else { continue };
+        if !is_hex(key, 32) || !is_hex(native, 32) || !early.contains(key)
+            || !super::library::warm_folder().is_some_and(|d| d.join(native).is_file()) { continue; }
+        if let Some(&i) = by_key.get(key) {
+            if !candidates[i].1.contains(&native) { candidates[i].1.push(native); }
+        } else if candidates.len() < MAX_RETAINED {
+            by_key.insert(key, candidates.len());
+            candidates.push((key, vec![native]));
+        }
+    }
+    if candidates.is_empty() { return; }
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let next = AtomicUsize::new(0);
+    let loaded = AtomicUsize::new(0);
+    let started = std::time::Instant::now();
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(4)).min(candidates.len());
+    tracing::info!(recipes=candidates.len(), workers, "loading prepared pipelines before title startup");
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                while let Some((key, names)) = candidates.get(next.fetch_add(1, Relaxed)) {
+                    let id = std::array::from_fn(|i| u8::from_str_radix(&key[i*2..i*2+2], 16).unwrap());
+                    let Some((shaders, state)) = restored(&id) else { continue };
+                    let ready = names.iter().find_map(|&name| super::library::from_receipt(name.to_owned(),
+                        || HostPipeline::new(&shaders, state.as_deref())));
+                    if let Some(ready) = ready {
+                        super::cached_pending(&shaders, state, Some(ready));
+                        loaded.fetch_add(1, Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    tracing::info!(count=loaded.into_inner(), seconds=started.elapsed().as_secs_f64(), "prepared prior draws on the live device before title startup");
+}
+
 /// Whether `warm-bad.txt` is ignored (`VICTORY_WARM_BAD=0`).
 pub fn bad_list_disabled() -> bool {
     std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0")
@@ -299,6 +361,15 @@ pub fn parse_bad_keys(text: &str, fingerprint: &str) -> HashSet<String> {
             continue;
         };
         if let Some(second) = parts.next() {
+            // Older warmers recorded their own wall-clock deadline as a
+            // compiler failure. The same recipe may finish on a slower card.
+            let mut reason = parts.clone();
+            if (second.starts_with("fp=") || is_hex(first, 16) && is_hex(second, 32))
+                && reason.next() == Some("hung") && reason.next() == Some("for")
+                && reason.next().is_some_and(|s| s.parse::<u64>().is_ok())
+                && reason.next() == Some("s") && reason.next().is_none() {
+                continue;
+            }
             if let Some(fp) = second.strip_prefix("fp=")
                 && is_hex(fp, 16)
             {
@@ -319,17 +390,15 @@ pub fn parse_bad_keys(text: &str, fingerprint: &str) -> HashSet<String> {
     keys
 }
 
-/// The translations of earlier runs are in `dir` (the pipeline library is
-/// not used: what is made here is the driver's to keep).
+/// Use the same translation cache as the live title.
 pub fn use_translations(dir: PathBuf) {
     crate::shader_cache::use_shader_cache(dir);
 }
 
-/// Makes the host pipelines of those of `which` (numbers in the file) and
-/// lets each go again: the driver's cache on disk keeps them. `each` is told
-/// the number before, and what came of it after: milliseconds and whether
-/// there is one.
-pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, bool)>)) {
+/// Makes each numbered recipe and reports the exact native key once its
+/// pipeline library has been published to disk.
+pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, Option<String>)>)) {
+    super::library::warm_from(dir);
     let mut places = HashMap::new();
     walk_shaders(dir, |stage, hash, at, len| { let _ = places.insert(hash, (stage, at, len)); });
     let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
@@ -351,11 +420,41 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
         let Some(entry) = entries.get(n) else { continue };
         each(*n, None);
         let began = std::time::Instant::now();
-        let made = parse(entry, &mut read)
-            .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref()))
-            .is_some();
-        each(*n, Some((began.elapsed().as_secs_f64() * 1e3, made)));
+        super::library::take_warm_publication();
+        let native = parse(entry, &mut read).and_then(|(shaders, g)| {
+            match warm_recipe(shaders, g.as_deref()) {
+                Ok(name) => name,
+                Err(error) => {
+                    tracing::warn!(recipe = *n, %error, "could not warm the replacement compute pipeline");
+                    None
+                }
+            }
+        });
+        each(*n, Some((began.elapsed().as_secs_f64() * 1e3, native)));
     }
+}
+
+fn warm_recipe(mut shaders: Vec<Arc<Shader>>, graphics: Option<&GraphicsState>) -> Result<Option<String>, String> {
+    let mut replacement = None;
+    if let [shader] = shaders.as_mut_slice() && shader.stage == "compute"
+        && let Some((pending, candidate)) = crate::shader_cache::warm_replacement(&shader.container)?
+    {
+        // The shared Shader can already hold the legacy translation. Give
+        // the experimental native pipeline its own host code and layout.
+        let translated = super::translate_with(&shader.container, |_| Ok(candidate))?;
+        *shader = Arc::new(Shader {
+            stage: shader.stage, hash: shader.hash.clone(), container: shader.container.clone(),
+            ambient: shader.ambient, probe: shader.probe, translated: std::sync::OnceLock::from(Some(translated)),
+        });
+        replacement = Some(pending);
+    }
+    let made = HostPipeline::new(&shaders, graphics).is_some();
+    let native = super::library::take_warm_publication().filter(|_| made);
+    if native.is_some() && let Some(pending) = replacement {
+        let shader = &shaders[0].translated().expect("prepared candidate").host;
+        pending.publish(shader).map_err(|e| e.to_string())?;
+    }
+    Ok(native)
 }
 
 #[allow(clippy::type_complexity)]
@@ -694,7 +793,6 @@ mod tests {
         assert_eq!(
             parse_bad_keys(&text, "8899aabbccddeeff"),
             HashSet::from([
-                k_warm,
                 k_no_reason,
                 k_tab,
                 k_fp_first,

@@ -573,6 +573,50 @@ impl Layout {
         Ok(base + self.row(m, y, z) + self.column(m, x))
     }
 
+    /// Visits contiguous byte runs of an element-coordinate box, in linear
+    /// row order, without including alignment or other mips in the same tile.
+    pub fn region_runs(
+        &self, mip: u32, slice: u32, bounds: [u32; 6],
+        mut visit: impl FnMut(usize, u32, u32, u32, usize),
+    ) -> Result<(), Error> {
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let [left, top, front, right, bottom, back] = bounds;
+        let volume = self.desc.dimension == Dimension::Tex3d;
+        if left >= right || top >= bottom || front >= back || right > m.width
+            || bottom > m.height || back > m.depth || (volume && slice != 0) || slice >= self.slices
+        { return Err(Error::Invalid); }
+        if !self.addressable() { return Err(Error::Unsupported); }
+        let bytes = self.desc.element_bytes as usize;
+        let linear = self.desc.swizzle == Swizzle::LINEAR;
+        let column = |x| if linear { x as usize * bytes } else { self.column(m, x) as usize };
+        let mut runs = Vec::new();
+        let mut start = left;
+        let mut at = column(left);
+        if !linear {
+            for x in left + 1..right {
+                let next = column(x);
+                if next != at + (x - start) as usize * bytes {
+                    runs.push((at, start, (x - start) as usize * bytes));
+                    (start, at) = (x, next);
+                }
+            }
+        }
+        runs.push((at, start, (right - start) as usize * bytes));
+        for z in front..back {
+            let (slab, inner) = self.split(slice + z);
+            let base = u64::from(slab) * self.slice_size + m.offset;
+            for y in top..bottom {
+                let row = if linear {
+                    u64::from(y) * u64::from(m.pitch) * bytes as u64
+                } else { self.row(m, y, inner) };
+                for &(offset, x, len) in &runs {
+                    visit((base + row) as usize + offset, x, y, z, len);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The part of an address that depends on the row (and depth in a
     /// thick block).
     fn row(&self, m: &Mip, y: u32, z: u32) -> u64 {
@@ -1081,6 +1125,31 @@ mod tests {
             block: 1,
             samples: 1,
             swizzle,
+        }
+    }
+
+    #[test]
+    fn partial_region_runs_visit_only_the_requested_elements() {
+        for d in [
+            Desc { depth: 3, ..desc(64, 64, 4, 16, Swizzle::SW_64KB_D) },
+            Desc { dimension: Dimension::Tex3d, depth: 64, ..desc(16, 16, 4, 4, Swizzle::SW_64KB_S) },
+            Desc { depth: 2, ..desc(63, 35, 2, 4, Swizzle::LINEAR) },
+        ] {
+            let l = Layout::new(&d).unwrap();
+            let volume = d.dimension == Dimension::Tex3d;
+            let slice = if volume { 0 } else { 1 };
+            let end = if volume { 18 } else { 1 };
+            let bounds = [1, 2, 0, 7, 6, end];
+            let mut seen = Vec::new();
+            l.region_runs(1, slice, bounds, |at, x, y, z, len| {
+                for k in 0..len / d.element_bytes as usize {
+                    let x = x + k as u32;
+                    assert_eq!(l.offset(1, x, y, slice + z).unwrap() as usize, at + k * d.element_bytes as usize);
+                    seen.push((x, y, z));
+                }
+            }).unwrap();
+            let expected: Vec<_> = (0..end).flat_map(|z| (2..6).flat_map(move |y| (1..7).map(move |x| (x, y, z)))).collect();
+            assert_eq!(seen, expected);
         }
     }
 

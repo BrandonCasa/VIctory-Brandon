@@ -62,9 +62,12 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let keys = known::keys(&dir);
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
     let mut done: HashSet<&str> = HashSet::new();
+    let native_dir = known::native_folder(&dir);
     for line in listed.lines() {
-        if let Some((of, key)) = line.split_once(' ')
-            && of == fingerprint
+        let mut fields = line.split_whitespace();
+        if let (Some(of), Some(key), Some("exact-v1"), Some(native)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+            && of == fingerprint && native_key(native) && native_dir.join(native).is_file()
         {
             done.insert(key);
         }
@@ -96,19 +99,22 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         &all,
         jobs,
         start_worker,
-        |n, ms, there| {
+        |n, ms, native| {
             if ms >= SLOW_MS {
                 let _ = writeln!(lock(&slow_out), "\n{} {ms:.0}", keys[n]);
             }
             let mut state = lock(&state);
             state.0.push(ms);
-            state.1 += usize::from(!there);
+            state.1 += usize::from(native.is_none());
             let count = state.0.len();
             if count.is_multiple_of(1000) {
                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
             }
             drop(state);
-            let _ = writeln!(lock(&done_out), "{fingerprint} {}", keys[n]);
+            if let Some(native) = native {
+                let receipt = format!("{fingerprint} {} exact-v1 {native}\n", keys[n]);
+                let _ = lock(&done_out).write_all(receipt.as_bytes());
+            }
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", keys[n]);
@@ -120,7 +126,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     times.sort_by(f64::total_cmp);
     let at = |q: f64| times.get((times.len() as f64 * q) as usize).copied().unwrap_or(0.0);
     println!(
-        "{} made in {:.0} s ({refused} have no host pipeline, {crashed} ended their process); ms each: median {:.1}, p90 {:.1}, p99 {:.1}, most {:.0}, sum {:.0} s",
+        "{} processed in {:.0} s ({refused} without a reusable native pipeline, {crashed} ended their process); ms each: median {:.1}, p90 {:.1}, p99 {:.1}, most {:.0}, sum {:.0} s",
         times.len(),
         began.elapsed().as_secs_f64(),
         at(0.5),
@@ -136,7 +142,7 @@ fn run_batches(
     all: &[usize],
     jobs: usize,
     start: impl Fn(&[usize]) -> Result<Child> + Sync,
-    each: impl Fn(usize, f64, bool) + Sync,
+    each: impl Fn(usize, f64, Option<&str>) + Sync,
     bad: impl Fn(usize, String) + Sync,
 ) -> Result<()> {
     let chunks: Vec<&[usize]> = all.chunks(AT_ONCE).collect();
@@ -161,7 +167,10 @@ fn run_batches(
                                 let Some((&n, after)) = remaining.split_first() else {
                                     break;
                                 };
-                                bad(n, why);
+                                match why {
+                                    WorkerStop::Deadline => println!("pipeline {n} exceeded the offline budget of {} s and remains eligible at runtime", LONGEST.as_secs()),
+                                    WorkerStop::Failed(reason) => bad(n, reason),
+                                }
                                 rest = after;
                             }
                             Ok(None) => break,
@@ -198,7 +207,13 @@ fn start_worker(these: &[usize]) -> Result<Child> {
 }
 
 /// On abnormal exit, return the number of reports before the failure and the exit reason.
-fn child(mut process: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<Option<(usize, String)>> {
+fn native_key(key: &str) -> bool {
+    key.len() == 32 && key.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+enum WorkerStop { Deadline, Failed(String) }
+
+fn child(mut process: Child, mut each: impl FnMut(usize, f64, Option<&str>)) -> Result<Option<(usize, WorkerStop)>> {
     let Some(out) = process.stdout.take() else {
         let _ = process.kill();
         process.wait().context("warm worker stdout unavailable, failed to reap worker")?;
@@ -227,7 +242,7 @@ fn child(mut process: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<O
                 && let (Ok(n), Ok(ms)) = (n.parse(), ms.parse())
             {
                 made += 1;
-                each(n, ms, there == "1");
+                each(n, ms, native_key(there).then_some(there));
             }
         }
         over.store(true, Ordering::Relaxed);
@@ -238,9 +253,9 @@ fn child(mut process: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<O
         return Ok(None);
     }
     let why = if hung.load(Ordering::Relaxed) {
-        format!("hung for {} s", LONGEST.as_secs())
+        WorkerStop::Deadline
     } else {
-        status.map_or_else(|e| e.to_string(), |s| format!("{s}"))
+        WorkerStop::Failed(status.map_or_else(|e| e.to_string(), |s| format!("{s}")))
     };
     Ok(Some((made, why)))
 }
@@ -254,7 +269,7 @@ fn make(dir: &Path, these: &str) -> Result<()> {
     known::make(dir, &these, |n, came| {
         let told = match came {
             None => writeln!(out, "at {n}"),
-            Some((ms, there)) => writeln!(out, "made {n} {ms:.2} {}", u8::from(there)),
+            Some((ms, native)) => writeln!(out, "made {n} {ms:.2} {}", native.as_deref().unwrap_or("-")),
         };
         if told.and_then(|()| out.flush()).is_err() {
             // Whoever asked is gone.
@@ -328,11 +343,11 @@ mod tests {
             &[7, 8, 9],
             1,
             |rest| match rest {
-                [7, 8, 9] => fake_child("echo made 7 3.5 1&exit /b 7", Stdio::piped()),
+                [7, 8, 9] => fake_child("echo made 7 3.5 0123456789abcdef0123456789abcdef&exit /b 7", Stdio::piped()),
                 [9] => fake_child("echo made 9 2.0 0", Stdio::piped()),
                 _ => panic!("unexpected batch {rest:?}"),
             },
-            |n, ms, there| lock(&done).push((n, ms, there)),
+            |n, ms, native| lock(&done).push((n, ms, native.is_some())),
             |n, why| lock(&bad).push((n, why)),
         )
         .unwrap();

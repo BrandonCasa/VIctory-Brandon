@@ -57,18 +57,26 @@ impl Cache {
         let output = converter
             .convert(input)
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
+        self.replace(&key, &output)?;
+        Ok(path)
+    }
+
+    /// Publish a completed conversion atomically, retaining the previous
+    /// contents until the replacement is ready.
+    pub fn replace(&self, key: &CacheKey, output: &[u8]) -> Result<()> {
+        let path = self.path_for(key);
         let dir = path.parent().expect("hashed path has a parent");
         std::fs::create_dir_all(dir)?;
         // Write-then-rename so readers never see partial output.
         let (tmp, mut file) = tempfile_in(dir)?;
-        let written = file.write_all(&output);
+        let written = file.write_all(output);
         drop(file);
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));
         if published.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
         published?;
-        Ok(path)
+        Ok(())
     }
 }
 

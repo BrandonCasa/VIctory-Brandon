@@ -218,8 +218,62 @@ struct RootSignature {
 }
 
 #[cfg(windows)]
+pub(crate) type StaticTables = Option<std::sync::Arc<[TableRange]>>;
+
+#[cfg(windows)]
+pub(crate) struct TableRange {
+    pub slot: u8,
+    pub offset: std::ops::Range<u32>,
+    pub immutable: bool,
+}
+
+/// Preserve ranges whose guest root signature promises immutable descriptor
+/// data from recording through the last execution of the list.
+#[cfg(windows)]
+fn static_tables(blob: &[u8]) -> StaticTables {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+    if !blob.starts_with(b"DXBC") {
+        return None;
+    }
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: the runtime validates the input blob and owns its returned arrays.
+    unsafe {
+        D3D12CreateVersionedRootSignatureDeserializer(blob.as_ptr().cast(), blob.len(),
+            &ID3D12VersionedRootSignatureDeserializer::IID, &mut raw).ok()?;
+        let deserializer = ID3D12VersionedRootSignatureDeserializer::from_raw(raw);
+        let desc = deserializer.GetUnconvertedRootSignatureDesc().as_ref()?;
+        let (params, count) = match desc.Version {
+            D3D_ROOT_SIGNATURE_VERSION_1_1 => (desc.Anonymous.Desc_1_1.pParameters, desc.Anonymous.Desc_1_1.NumParameters),
+            D3D_ROOT_SIGNATURE_VERSION_1_2 => (desc.Anonymous.Desc_1_2.pParameters, desc.Anonymous.Desc_1_2.NumParameters),
+            _ => return None,
+        };
+        let mut ranges = Vec::new();
+        for i in 0..count.min(256) {
+            let param = &*params.add(i as usize);
+            if param.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE { continue }
+            let table = param.Anonymous.DescriptorTable;
+            let mut next = 0;
+            for j in 0..table.NumDescriptorRanges {
+                let range = &*table.pDescriptorRanges.add(j as usize);
+                let first = match range.OffsetInDescriptorsFromTableStart {
+                    u32::MAX => next,
+                    n => n,
+                };
+                next = first.saturating_add(range.NumDescriptors);
+                let immutable = matches!(range.RangeType, D3D12_DESCRIPTOR_RANGE_TYPE_SRV | D3D12_DESCRIPTOR_RANGE_TYPE_CBV)
+                    && range.Flags.contains(D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC)
+                    && !range.Flags.contains(D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE);
+                ranges.push(TableRange { slot: i as u8, offset: first..next, immutable });
+            }
+        }
+        ranges.iter().any(|r| r.immutable).then(|| ranges.into())
+    }
+}
+
+#[cfg(windows)]
 static DIGESTS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<usize, blake3::Hash>>,
+    std::sync::Mutex<std::collections::HashMap<usize, (blake3::Hash, StaticTables)>>,
 > = std::sync::LazyLock::new(Default::default);
 
 #[cfg(windows)]
@@ -238,7 +292,12 @@ pub(crate) fn digest(this: This) -> Option<blake3::Hash> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&(this as usize))
-        .copied()
+        .map(|r| r.0)
+}
+
+#[cfg(windows)]
+pub(crate) fn data_static(this: This) -> StaticTables {
+    DIGESTS.lock().unwrap_or_else(|e| e.into_inner()).get(&(this as usize))?.1.clone()
 }
 
 /// Device method.
@@ -263,7 +322,7 @@ pub(crate) extern "system" fn create(
     #[cfg(windows)]
     DIGESTS.lock().unwrap_or_else(|e| e.into_inner()).insert(
         std::ptr::from_ref(root.as_ref()) as usize,
-        blake3::hash(&root.blob),
+        (blake3::hash(&root.blob), static_tables(&root.blob)),
     );
     object::hand_out(ROOT_SIGNATURE, root, iid, &ROOT_SIGNATURE_IIDS, out)
 }
@@ -541,6 +600,56 @@ mod tests {
         );
         assert_eq!(slot::<extern "system" fn(This) -> u32>(root, 0x10)(root), 0);
         slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
+    }
+
+    /// Recording can read only a range whose data stays fixed until execution finishes.
+    #[cfg(windows)]
+    #[test]
+    fn only_explicit_static_table_data_can_supply_a_recorded_index() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let ranges = [
+            D3D12_DESCRIPTOR_RANGE1 {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 2,
+                Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC,
+                OffsetInDescriptorsFromTableStart: 3,
+                ..Default::default()
+            },
+            D3D12_DESCRIPTOR_RANGE1 {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
+                NumDescriptors: 1,
+                Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE,
+                OffsetInDescriptorsFromTableStart: u32::MAX,
+                ..Default::default()
+            },
+        ];
+        let parameter = D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                    NumDescriptorRanges: 2, pDescriptorRanges: ranges.as_ptr(),
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+            Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+            Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                    NumParameters: 1, pParameters: &parameter, ..Default::default()
+                }
+            },
+        };
+        // SAFETY: all arrays live until serialization returns. The blob
+        // remains alive while the deserializer reads its bytes.
+        let ranges = unsafe {
+            let mut blob = None;
+            D3D12SerializeVersionedRootSignature(&desc, &mut blob, None).unwrap();
+            let blob = blob.unwrap();
+            static_tables(std::slice::from_raw_parts(blob.GetBufferPointer().cast(), blob.GetBufferSize())).unwrap()
+        };
+        assert_eq!((ranges[0].slot, &ranges[0].offset, ranges[0].immutable), (0, &(3..5), true));
+        assert_eq!((ranges[1].slot, &ranges[1].offset, ranges[1].immutable), (0, &(5..6), false));
     }
 
     /// The host's deserializer reads our blobs back (the upscaler's call).

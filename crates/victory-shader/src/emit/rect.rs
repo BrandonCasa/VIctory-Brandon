@@ -414,6 +414,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            halfword_aligned_roots: Default::default(),
             indexed_forms: Default::default(),
             root_indexed_views: Vec::new(),
         };

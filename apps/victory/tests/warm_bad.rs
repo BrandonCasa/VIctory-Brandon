@@ -85,6 +85,17 @@ fn warm_bad_fingerprint_override_again_and_help() {
         out_default.contains(&format!("4 pipelines known, 0 made before ({fp_base}), 2 bad; 2 to make")),
         "{out_default}"
     );
+    let ledger = pipelines.join("warm-done.txt");
+    assert_eq!(fs::read_to_string(&ledger).unwrap(), "", "key-only recipes produced no native file");
+    // Simulate two artifacts already published by an independent warm run.
+    // This test exercises coordinator selection with an intentionally absent GPU.
+    let native = pipelines.join("warm-libraries").join("unknown");
+    fs::create_dir_all(&native).unwrap();
+    for key in [&k_fresh, &k_other] {
+        fs::write(native.join(key), b"fixture").unwrap();
+    }
+    let published = format!("{fp_base} {k_fresh} exact-v1 {k_fresh}\n{fp_base} {k_other} exact-v1 {k_other}\n");
+    fs::write(&ledger, &published).unwrap();
 
     let out_repeat = run_warm(root.path(), &cache, &[], &[]);
     assert!(
@@ -100,7 +111,7 @@ fn warm_bad_fingerprint_override_again_and_help() {
 
     let out_again = run_warm(root.path(), &cache, &[], &["--again", "--used"]);
     assert!(
-        out_again.contains(&format!("4 pipelines known, 4 made before ({fp_base}), 2 bad; 2 to make")),
+        out_again.contains(&format!("4 pipelines known, 2 made before ({fp_base}), 2 bad; 2 to make")),
         "{out_again}"
     );
 
@@ -113,15 +124,5 @@ fn warm_bad_fingerprint_override_again_and_help() {
         "{out_new_fp}"
     );
 
-    let done = fs::read_to_string(pipelines.join("warm-done.txt")).unwrap();
-    let new_fp_keys: Vec<_> = done
-        .lines()
-        .filter_map(|line| line.split_once(' '))
-        .filter(|(fp, _)| *fp == fp_new)
-        .map(|(_, key)| key)
-        .collect();
-    assert_eq!(
-        new_fp_keys,
-        [k_fp_bad.as_str(), k_fresh.as_str(), k_other.as_str()]
-    );
+    assert_eq!(fs::read_to_string(ledger).unwrap(), published);
 }

@@ -126,16 +126,14 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     let staging = super::staging(resource, &copy, first, true);
     super::PICKING.set(None);
     let Some(staging) = staging.filter(|s| {
-        matches!(s.storage, super::StageStorage::Upload { .. }) && !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed)
+        matches!(*s.storage.lock().unwrap_or_else(|e| e.into_inner()), super::StageStorage::Upload { .. })
+            && !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed)
     }) else {
         let _way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
         copy.ahead.store(LISTED, std::sync::atomic::Ordering::Release);
         LANDED.notify_all();
         return turned_down();
     };
-    if super::no_wait() && super::fill_unlocked() {
-        staging.expected.store(if there == u64::MAX { super::mapped_bytes(staging.memory, staging.read) } else { there }, Relaxed);
-    }
     let job = Arc::new(Job { staging, copy, asked: std::time::Instant::now(), then: Mutex::new(Some(Vec::new())) });
     BYTES.fetch_add(job.staging.read as u64, Relaxed);
     ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner()).push((job.copy.serial, job.clone()));
@@ -273,7 +271,8 @@ impl Job {
     /// `list` is an open copy list, and the job lives until it has run.
     unsafe fn record(&self, list: &ID3D12GraphicsCommandList) {
         let (s, texture) = (&self.staging, &self.copy.texture);
-        let super::StageStorage::Upload { buffer, base, .. } = &s.storage else {
+        let storage = s.storage.lock().unwrap_or_else(|e| e.into_inner());
+        let super::StageStorage::Upload { buffer, base, .. } = &*storage else {
             unreachable!("ahead jobs require a mapped upload buffer")
         };
         for (i, footprint) in s.footprints.iter().enumerate() {
@@ -309,6 +308,16 @@ fn finish(jobs: Vec<Arc<Job>>, succeeded: bool) {
             for part in &mut *job.staging.parts.lock().unwrap_or_else(|e| e.into_inner()) {
                 part.dirty = false;
             }
+            // The copy queue fence has passed and every subresource was
+            // installed. Future list replays retain the source description
+            // and recapture any title writes when the submission consumes it.
+            let mut storage = job.staging.storage.lock().unwrap_or_else(|e| e.into_inner());
+            if let super::StageStorage::Upload { piece, .. } = &mut *storage {
+                if let Some(piece) = piece { piece.fence_completed(); }
+                *storage = super::StageStorage::Cpu(Vec::new());
+                super::STAGED[1].fetch_sub(job.staging.bytes, Relaxed);
+            }
+            drop(storage);
             job.staging.note_held();
             job.copy.ahead.store(DONE, std::sync::atomic::Ordering::Release);
         } else {
@@ -366,7 +375,10 @@ mod tests {
     #[test]
     fn a_placed_texture_is_filled_ahead_of_the_lists() {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
-        let Some(host) = crate::host::host() else { return };
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped ahead upload hardware exercise: no D3D12 device");
+            return;
+        };
         // 256x256 BC7, nine levels.
         let desc = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
         let whole = crate::resource::placed_bytes(&desc).unwrap() as usize;
@@ -378,6 +390,7 @@ mod tests {
         crate::resource::want_level(texture, 0);
         let copy = crate::resource::host_copy(texture).unwrap();
         if !crate::pool::fresh(&copy.texture) {
+            eprintln!("skipped ahead upload hardware exercise: texture was not newly pooled");
             return;
         }
         assert!(!there(texture));
@@ -392,6 +405,7 @@ mod tests {
         let wait = std::time::Duration::from_secs(20);
         assert_eq!((heard.recv_timeout(wait), heard.recv_timeout(wait)), (Ok(1), Ok(2)));
         assert!(there(texture) && claim(texture, 0, u64::MAX).is_none());
+        assert!(matches!(&*job.staging.storage.lock().unwrap(), super::super::StageStorage::Cpu(bytes) if bytes.is_empty()));
         // Level 0 as the card has it, and as the layout says.
         let layout = crate::resource::texture_memory(texture)
             .and_then(|(_, d)| crate::resource::texture_layout(&d).map(|t| t.planes[0].layout.clone()))
@@ -438,5 +452,93 @@ mod tests {
             assert!(seen == expected.as_slice(), "level 0's blocks");
             back.Unmap(0, None);
         }
+        // A later title write can still make the next ordinary submission
+        // detile a fresh version after the copy-queue upload lease expired.
+        let texel = layout.offset(0, 0, 0, 0).unwrap() as usize;
+        unsafe { *at.add(texel) ^= 1 };
+        job.staging.refresh_timed(true);
+        let storage = job.staging.storage.lock().unwrap();
+        assert!(matches!(&*storage, super::super::StageStorage::Cpu(bytes) if !bytes.is_empty()));
+        drop(storage);
+        assert!(job.staging.dirty.load(Relaxed));
+
+        let occurrence = super::super::PreludeUpload {
+            staging: job.staging.clone(), copy: copy.clone(), resource: texture as usize,
+            partial_timer: crate::resource::partial_timer(texture),
+            version: None, on_demand: None,
+        };
+        let (older, _) = occurrence.finish_refresh().expect("changed first occurrence");
+        unsafe { *at.add(texel) ^= 2 };
+        job.staging.refresh_timed(true);
+        let (newer, _) = occurrence.finish_refresh().expect("changed replay");
+        // A rejected occurrence can die as another thread commits the more recent capture.
+        std::thread::scope(|scope| {
+            scope.spawn(move || drop(older));
+            newer.sent();
+        });
+        assert!(!job.staging.dirty.load(Relaxed));
+        assert!(matches!(&*job.staging.storage.lock().unwrap(), super::super::StageStorage::Cpu(bytes) if bytes.is_empty()));
+
+        unsafe { *at.add(texel) ^= 4 };
+        job.staging.refresh_timed(true);
+        drop(occurrence.finish_refresh().expect("another changed replay"));
+        let (retried, _) = occurrence.finish_refresh().expect("unsubmitted latest upload remains retryable");
+        retried.sent();
+        assert!(occurrence.finish_refresh().is_none());
+
+        // A rejected initial observation has no GPU-visible contents. Replay
+        // must recapture unchanged mapped bytes as well as intervening writes.
+        super::super::unstage(texture);
+        let unsent = super::super::staging(texture, &copy, 0, false).unwrap();
+        unsent.refresh_timed(true);
+        let first = match &*unsent.storage.lock().unwrap() {
+            super::super::StageStorage::Cpu(parts) => parts[0].clone(),
+            _ => panic!("ordinary staging must be CPU backed"),
+        };
+        assert!(unsent.discard_unsubmitted_cpu() > 0);
+        assert_eq!(unsent.discard_unsubmitted_cpu(), 0);
+        unsent.refresh_timed(true);
+        assert!(matches!(&*unsent.storage.lock().unwrap(), super::super::StageStorage::Cpu(parts) if parts[0] == first));
+        assert!(unsent.discard_unsubmitted_cpu() > 0);
+        unsafe { *at.add(texel) ^= 8 };
+        unsent.refresh_timed(true);
+        assert!(matches!(&*unsent.storage.lock().unwrap(), super::super::StageStorage::Cpu(parts) if parts[0][0] == first[0] ^ 8));
+        let replay = super::super::PreludeUpload { staging: unsent.clone(), ..occurrence };
+        let (claimed, _) = replay.finish_refresh().expect("replayed first capture remains uploadable");
+        assert_eq!(unsent.discard_unsubmitted_cpu(), 0);
+        assert!(matches!(&*unsent.storage.lock().unwrap(), super::super::StageStorage::Cpu(parts) if parts.iter().all(Vec::is_empty)));
+        let version = claimed.version.as_ref().unwrap();
+        let original = version.parts[0].1.clone();
+        let unchanged = version.parts[1].1.clone();
+        drop(claimed); // The unsent version must remain retryable from immutable native bytes.
+        unsafe { *at.add(texel) ^= 16 };
+        unsent.refresh_timed(true);
+        let (retry, _) = replay.finish_refresh().expect("mixed old and newly detiled mip levels");
+        let version = retry.version.as_ref().unwrap();
+        let changed = &version.parts[0].1;
+        let kept = &version.parts[1].1;
+        assert!(!Arc::ptr_eq(&original.memory, &changed.memory));
+        assert!(Arc::ptr_eq(&unchanged.memory, &kept.memory));
+        assert_eq!(unchanged.offset, kept.offset);
+        let commands = host.new_list().unwrap();
+        unsafe {
+            commands.list.CopyBufferRegion(&back, 0, &original.memory.buffer, original.offset, 4);
+            commands.list.CopyBufferRegion(&back, 4, &changed.memory.buffer, changed.offset, 4);
+            commands.close();
+            host.execute(&[&commands]);
+            let mut data = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut data)).unwrap();
+            let contents = std::slice::from_raw_parts(data.cast::<u8>(), 8);
+            assert_eq!((contents[0],contents[4]), (first[0] ^ 8, first[0] ^ 8 ^ 16));
+            back.Unmap(0, None);
+        }
+        retry.sent();
+        // The original loading draw aliases the end of level zero with a
+        // render target. A mip-one SRV can keep just the 24 KiB prefix even
+        // when an older command still owns the whole 88 KiB staging object.
+        let prefix = super::super::sampled_upload_from(texture, 1, &copy, true, |_| true).unwrap();
+        assert_eq!(prefix.memory(), (at as usize, 0x6000));
+        assert_eq!(unsent.memory(), (at as usize, whole));
+        assert!(!Arc::ptr_eq(&unsent, &prefix.staging));
     }
 }

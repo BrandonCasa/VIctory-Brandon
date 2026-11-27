@@ -82,6 +82,10 @@ fn slice() -> u64 {
 /// resource is there).
 const KEY: usize = usize::MAX - 0x7a;
 
+pub(crate) fn may_write(list: &crate::host::HostList) -> bool {
+    on() && list.used(KEY)
+}
+
 /// `list` runs a shader that stores through a picked view.
 pub(crate) fn runs_in(list: &HostList) {
     list.first_use(KEY);

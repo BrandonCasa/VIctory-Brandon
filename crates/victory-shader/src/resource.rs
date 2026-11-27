@@ -142,6 +142,98 @@ pub struct HeapOffset {
     pub constant: Option<(u8, u32, u8)>,
 }
 
+/// Heap byte offset made from one dword of a statically bound table buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferIndex {
+    pub table_slot: u8,
+    pub table_dword: u32,
+    pub word: HeapOffset,
+    /// Zero addresses one exact word. Otherwise the load can begin anywhere
+    /// in the bound view congruent to `word.bytes` modulo this byte stride.
+    pub word_step: u32,
+    pub bytes: u32,
+    /// A dominating scalar branch executes this load only if the consecutive
+    /// unsigned first/end words in a bound table buffer form a nonempty range.
+    pub guard: Option<BufferRange>,
+    pub records: Option<IndexRecords>,
+    /// Integer bits retained before shifting the slot into a heap byte offset.
+    pub value_mask: u32,
+}
+
+/// Structured-buffer records selected by two dispatch root constants.
+/// The word at `word.bytes` within each record is converted by v_cvt_u32_f32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexRecords {
+    pub first: (u8, u32),
+    pub count: (u8, u32),
+    pub stride: u32,
+}
+
+mod structured_index;
+mod guarded_index;
+mod material_chain;
+mod scalar_records;
+mod linked_fields;
+pub(crate) use linked_fields::mesh_output_limits;
+
+/// One texture handle reached through per-workgroup byte offsets in two
+/// statically bound SRVs. The handle is B[B[T[group] + parent] + handle].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaterialChain {
+    pub groups: (u8, u32),
+    pub records: (u8, u32),
+    pub parent: u32,
+    pub handle: u32,
+}
+
+/// Uniform SRV reads that select a record and walk its signed-count member list.
+/// Each offset and product is a wrapping guest byte address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScalarRecordChain {
+    pub index: (u8, u32),
+    pub instances: (u8, u32),
+    pub records: (u8, u32),
+    pub index_offset: u32,
+    pub instance_stride: u32,
+    pub packed_offset: u32,
+    pub record_shift: u8,
+    pub record_stride: u32,
+    pub count_offset: u32,
+    pub handle_offset: u32,
+    pub handle_stride: u32,
+}
+
+/// A heap slot read at a byte offset supplied by another bound buffer.
+/// The shader reads records[pointer[pointer_offset] + field] as one u32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PointerField {
+    pub pointer: (u8, u32),
+    pub records: (u8, u32),
+    pub pointer_offset: u32,
+    pub field: u32,
+}
+
+/// A bounded SSA expression for one scalar texture handle. Operands refer
+/// to earlier operations. Buffer addresses and arithmetic are 32-bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScalarWordOp {
+    Constant(u32),
+    Read { table: (u8, u32), address: u8 },
+    Add(u8, u8),
+    Multiply(u8, u8),
+    And(u8, u8),
+    Or(u8, u8),
+    ShiftLeft(u8, u8),
+    ShiftRight(u8, u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferRange {
+    pub table_slot: u8,
+    pub table_dword: u32,
+    pub offset: u32,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Resources {
     /// Every scalar memory access by address (`s_load_*`, `s_store_*`), and
@@ -150,6 +242,12 @@ pub struct Resources {
     pub descriptors: Vec<Descriptor>,
     /// Direct heap loads whose byte offset is a constant or a shifted root constant.
     pub heap_offsets: Vec<(Site, HeapOffset)>,
+    pub buffer_indices: Vec<(Site, BufferIndex)>,
+    pub chains: Vec<(Site, MaterialChain)>,
+    pub scalar_records: Vec<(Site, ScalarRecordChain)>,
+    pub pointer_fields: Vec<(Site, PointerField)>,
+    pub scalar_programs: Vec<(Site, Vec<ScalarWordOp>)>,
+    pub pointer_limits: Vec<(Site,u8,u8,u32)>,
     /// Direct descriptor sources with a draw-evaluable index.
     pub root_indexed_views: Vec<RootIndexedView>,
     /// User SGPRs holding root parameters: value on entry, layout index,
@@ -212,6 +310,13 @@ pub fn track(
     stage: HwStage,
     lanes: Option<&Structured>,
 ) -> Result<Resources, ShaderError> {
+    track_with_used(p, layout, stage, lanes, &[], &crate::native::StageIo::None)
+}
+
+pub(crate) fn track_with_used(
+    p: &Program, layout: &[RootParam], stage: HwStage, lanes: Option<&Structured>,
+    used: &[crate::native::UsedResource], io: &crate::native::StageIo,
+) -> Result<Resources, ShaderError> {
     let t = Tracer::new(p, layout, stage, lanes)?;
     let mut out = Resources {
         params: p
@@ -242,7 +347,7 @@ pub fn track(
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+                let source = t.descriptor(inst, op, site).map_err(fail)?;
                 // A descriptor the code keeps per lane ([`Tracer::lane_copies`])
                 // is the same in every lane: its loop is lowered as it stands
                 // and needs no proof.
@@ -345,6 +450,45 @@ pub fn track(
     t.at.set(None);
     for &(site, address) in &out.scalar {
         if t.layout.get(address.param).is_some_and(|p| p.root == RootType::ResourceHeap) {
+            if let crate::native::StageIo::Cs(cs) = io
+                && let Some(chain) = t.material_chain(address, &out, cs)
+            {
+                out.chains.push((site, chain));
+                continue;
+            }
+            if address.offset == 0 && let Some(word) = t.guarded_handle(site, address, &out) {
+                if let Some(program) = t.scalar_handle_program(word, &out) {
+                    out.scalar_programs.push((site, program));
+                    continue;
+                }
+                if let Some(index) = t.buffer_index_word(address, word, u32::MAX, &out) {
+                    out.buffer_indices.push((site, index));
+                    continue;
+                }
+            }
+            if let Some(index) = t.buffer_index(address, &out) {
+                if index.word_step != 0 && let Some(field) = t.pointer_field(address, &out) {
+                    out.pointer_fields.push((site,field));
+                    continue;
+                }
+                if index.word_step != 0 && let Some(chain) = t.scalar_record_chain(address, &out) {
+                    out.scalar_records.push((site, chain));
+                    continue;
+                }
+                // A uniform buffer address may be a chain of scalar loads even
+                // without a guarded phi. Preserve the inexpensive exact paths
+                // above; replace the broad fallback only when all operands were traced.
+                if index.word_step != 0 && address.offset == 0
+                    && let Some(dynamic) = address.dynamic
+                    && let Some((_,[Term::Value(handle),Term::Const(5)])) = t.sop2(dynamic,&["s_lshl_b32"])
+                    && let Some(program) = t.scalar_handle_program(handle,&out)
+                {
+                    out.scalar_programs.push((site,program));
+                    continue;
+                }
+                out.buffer_indices.push((site, index));
+                continue;
+            }
             let constant = match address.dynamic {
                 Some(value) => match t.shifted_constant(value) {
                     Some(term) => Some(term),
@@ -386,6 +530,38 @@ pub fn track(
             out.waterfall.compares.extend(proof.compares);
             out.waterfall.reads.extend(proof.reads);
             out.waterfall.loads.extend(loads);
+        }
+    }
+    for &load in &out.waterfall.loads {
+        if let Some(index) = t.waterfall_buffer_index(load, &out)
+            .or_else(|| t.structured_buffer_index(load, &out, used)) {
+            out.buffer_indices.push((load, index));
+        } else if let Some(indices) = t.wave64_structured_indices(load, &out, used) {
+            out.buffer_indices.extend(indices.into_iter().map(|index| (load, index)));
+        }
+    }
+    // SMEM descriptor fields also supply numeric texture queries. These
+    // have no image instruction for the ordinary waterfall pass to visit.
+    for &(load, addr) in &out.scalar {
+        if !out.waterfall.loads.contains(&load) && t.p.wave64
+            && t.layout.get(addr.param).is_some_and(|p| p.root == RootType::ResourceHeap)
+            && let Some(indices) = t.wave64_structured_indices(load, &out, used) {
+            out.buffer_indices.extend(indices.into_iter().map(|index| (load, index)));
+        }
+    }
+    if let crate::native::StageIo::Ps { inputs,.. } = io {
+        for &(site,addr) in &out.scalar {
+            if addr.offset != 0 || !t.layout.get(addr.param).is_some_and(|p| p.root == RootType::ResourceHeap) { continue; }
+            match t.pixel_fields(site,&out,inputs,used) {
+                Some(linked_fields::PixelFields::Pointers(fields,limits)) => {
+                    out.pointer_fields.extend(fields.into_iter().map(|f|(site,f)));
+                    out.pointer_limits.extend(limits.into_iter().map(|(row,col,max)|(site,row,col,max)));
+                }
+                Some(linked_fields::PixelFields::Words(words)) => {
+                    for index in words { if !out.buffer_indices.contains(&(site,index)) {out.buffer_indices.push((site,index));} }
+                }
+                None=>{}
+            }
         }
     }
     out.lane_copied = t.lane_copied.take();
@@ -431,6 +607,7 @@ struct Tracer<'a> {
     meets: std::cell::RefCell<Meets>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
+    dominators: std::cell::OnceCell<Vec<usize>>,
     /// The block of the access being traced ([`Self::live`]).
     at: std::cell::Cell<Option<usize>>,
 }
@@ -499,6 +676,7 @@ impl<'a> Tracer<'a> {
             read_first_lane: Default::default(),
             meets: Default::default(),
             rpo,
+            dominators: Default::default(),
             at: Default::default(),
         };
         t.origin = t.propagate_copies(n)?;
@@ -655,6 +833,206 @@ impl<'a> Tracer<'a> {
         let (param, dword) = self.param_of(self.inputs[input.0 as usize]?)?;
         let constant = self.layout.get(param)?;
         (constant.root == RootType::Constants).then_some((constant.slot, dword, shift))
+    }
+
+    /// A representative value and the number of its known low bits. Power
+    /// of two strides remain valid under GCN's wrapping 32-bit arithmetic.
+    fn word_residue(&self, term: Term, depth: u8) -> (u32, u32) {
+        let v = match term {
+            Term::Const(k) => return (k, 32),
+            Term::Value(v) => v,
+        };
+        let Some(next) = depth.checked_sub(1) else { return (0, 0) };
+        let Some((inst, [a, b])) = self.sop2(v, &["s_add_i32", "s_add_u32", "s_mul_i32", "s_lshl_b32", "s_or_b32"])
+            else { return (0, 0) };
+        if inst.name() == "s_lshl_b32" {
+            let Term::Const(shift) = b else { return (0, 0) };
+            let shift = shift & 31;
+            let (a, bits) = self.word_residue(a, next);
+            return (a << shift, (bits + shift).min(32));
+        }
+        let (a, a_bits) = self.word_residue(a, next);
+        let (b, b_bits) = self.word_residue(b, next);
+        if inst.name() == "s_or_b32" {
+            return (a | b, a_bits.min(b_bits));
+        }
+        if inst.name() == "s_mul_i32" {
+            // Expand (a + A*2^a_bits) * (b + B*2^b_bits). Every term other
+            // than a*b is divisible by at least this power of two.
+            let bits = (a_bits + b.trailing_zeros()).min(b_bits + a.trailing_zeros()).min(a_bits + b_bits);
+            return (a.wrapping_mul(b), bits.min(32));
+        }
+        (a.wrapping_add(b), a_bits.min(b_bits))
+    }
+
+    fn buffer_index(&self, heap: Address, resources: &Resources) -> Option<BufferIndex> {
+        // The resource heap stores 32-byte views. Start with a scalar index
+        // shifted by exactly five; never follow a first-lane/vector read.
+        let (_, [Term::Value(value), Term::Const(5)]) =
+            self.sop2(heap.dynamic?, &["s_lshl_b32"])? else { return None };
+        let (value, value_mask) = match self.sop2(value, &["s_and_b32"]) {
+            Some((_, [Term::Value(input), Term::Const(mask)] | [Term::Const(mask), Term::Value(input)])) => (input, mask),
+            _ => (value, u32::MAX),
+        };
+        self.buffer_index_word(heap, value, value_mask, resources)
+    }
+
+    fn buffer_index_word(&self, heap: Address, value: Value, value_mask: u32, resources: &Resources) -> Option<BufferIndex> {
+        let site = self.defs[value.0 as usize]?;
+        let read = self.inst(site);
+        let Fields::Smem { data: Some(Operand::Scalar { code, dwords }), offset, soffset, .. } = &read.fields
+            else { return None };
+        if !read.name().starts_with("s_buffer_load_dword") {
+            return None;
+        }
+        let component = (0..*dwords).find(|&i| read.write(Reg::S(code + i)) == Some(value))?;
+        let (table_slot, table_dword) = self.buffer_index_table(site, resources)?;
+        let (term, extra, word_step) = match self.term(read, soffset) {
+            Some(Term::Const(k)) => (None, k, 0),
+            Some(Term::Value(v)) => {
+                let (v, constant) = match self.sop2(v, &["s_add_i32", "s_add_u32"]) {
+                    Some((_, [Term::Value(input), Term::Const(k)] | [Term::Const(k), Term::Value(input)])) => (input, k),
+                    _ => (v, 0),
+                };
+                if let Some(root) = self.shifted_constant(v) {
+                    (Some(root), constant, 0)
+                } else {
+                    let (residue, bits) = self.word_residue(Term::Value(v), 6);
+                    (None, constant.wrapping_add(residue), 1u32 << bits.min(31))
+                }
+            }
+            None => (None, 0, 1),
+        };
+        let bytes = (*offset as u32).wrapping_add(extra).wrapping_add(4 * u32::from(component));
+        Some(BufferIndex {
+            table_slot,
+            table_dword,
+            word: HeapOffset { bytes: if word_step == 0 { bytes } else { bytes % word_step }, constant: term },
+            word_step,
+            bytes: heap.offset,
+            guard: (word_step != 0).then(|| self.buffer_range_guard(site.0, resources)).flatten(),
+            records: None,
+            value_mask,
+        })
+    }
+
+    fn buffer_range_guard(&self, mut block: usize, resources: &Resources) -> Option<BufferRange> {
+        let dom = self.dominators.get_or_init(|| {
+            crate::ir::idoms(&self.p.blocks, &crate::ir::reverse_postorder(&self.p.blocks), &self.rpo)
+        });
+        while block != 0 {
+            let parent = *dom.get(block)?;
+            if parent == block || parent == usize::MAX { break; }
+            // All paths to the access must traverse this arm, including
+            // paths from loop latches. A single incoming edge proves it.
+            if self.p.blocks[block].preds.as_slice() == [parent]
+                && let Some(guard) = self.nonempty_range_arm(parent, block, resources)
+            {
+                return Some(guard);
+            }
+            block = parent;
+        }
+        None
+    }
+
+    fn nonempty_range_arm(&self, parent: usize, arm: usize, resources: &Resources) -> Option<BufferRange> {
+        let block = &self.p.blocks[parent];
+        let Exit::Branch { taken, not_taken } = block.exit else { return None };
+        if taken == not_taken { return None; }
+        let branch = block.insts.last()?;
+        let positive = match branch.name() {
+            "s_cbranch_scc1" => taken == arm,
+            "s_cbranch_scc0" => not_taken == arm,
+            _ => return None,
+        };
+        let cmp = self.def(branch.read(Reg::Scc)?)?;
+        if !matches!((cmp.name(), positive), ("s_cmp_lt_u32", true) | ("s_cmp_ge_u32", false)) { return None; }
+        let Fields::Sop { src, .. } = &cmp.fields else { return None };
+        let [a, b] = src.as_slice() else { return None };
+        let (Term::Value(a), Term::Value(b)) = (self.term(cmp, a)?, self.term(cmp, b)?) else { return None };
+        let site = self.defs[a.0 as usize]?;
+        let read = self.inst(site);
+        if read.name() != "s_buffer_load_dwordx2" { return None; }
+        let Fields::Smem { data: Some(Operand::Scalar { code, .. }), offset, soffset, .. } = &read.fields else { return None };
+        if read.write(Reg::S(*code)) != Some(a) || read.write(Reg::S(code.checked_add(1)?)) != Some(b) { return None; }
+        let Term::Const(base) = self.term(read, soffset)? else { return None };
+        let (table_slot, table_dword) = self.buffer_index_table(site, resources)?;
+        let offset = base.wrapping_add(*offset as u32);
+        // The two source words must be contiguous in the same bound interval.
+        offset.checked_add(7)?;
+        Some(BufferRange { table_slot, table_dword, offset })
+    }
+
+    fn buffer_index_table(&self, read: Site, resources: &Resources) -> Option<(u8, u32)> {
+        let source = resources.descriptors.iter().find(|d| d.site == read && d.role == Role::Resource)?;
+        let Source::Loaded { load, first } = source.source else { return None };
+        let i = resources.scalar.binary_search_by_key(&load, |(s, _)| *s).ok()?;
+        let table = resources.scalar[i].1;
+        let base = self.layout.get(table.param)?;
+        if base.root != RootType::Table || table.dynamic.is_some() || table.offset & 3 != 0 {
+            return None;
+        }
+        Some((base.slot, (table.offset >> 2).checked_add(u32::from(first))?))
+    }
+
+    /// A proven waterfall takes each initial lane's own shifted buffer word.
+    /// Require the load and shift in its one preheader, with EXEC unchanged
+    /// from the producer to loop entry so no lane can supply an older VGPR.
+    fn waterfall_buffer_index(&self, load: Site, resources: &Resources) -> Option<BufferIndex> {
+        let pos = resources.scalar.binary_search_by_key(&load, |(s, _)| *s).ok()?;
+        let heap = resources.scalar[pos].1;
+        if self.layout.get(heap.param)?.root != RootType::ResourceHeap {
+            return None;
+        }
+        let shifted = self.first_lane_source(self.first_lane_offset(load)?)?;
+        let shift_site = self.defs[shifted.0 as usize]?;
+        let shift = self.inst(shift_site);
+        let Fields::Valu(f) = &shift.fields else { return None };
+        let [amount, Operand::Vector { reg, .. }] = f.src.as_slice() else { return None };
+        if shift.name() != "v_lshlrev_b32" || f.sdwa.is_some() || f.dpp.is_some()
+            || f.abs != 0 || f.neg != 0 || f.clamp || f.omod != 0 || f.opsel != 0
+            || !matches!(self.term(shift, amount), Some(Term::Const(5)))
+        {
+            return None;
+        }
+        let value = shift.read(Reg::V(*reg))?;
+        let read_site = self.defs[value.0 as usize]?;
+        let [a, b] = self.p.blocks[load.0].preds.as_slice() else { return None };
+        let preheader = if *a == load.0 { *b } else if *b == load.0 { *a } else { return None };
+        if read_site.0 != preheader || shift_site.0 != preheader || read_site.1 >= shift_site.1 {
+            return None;
+        }
+        let pre = &self.p.blocks[preheader].insts;
+        let unchanged_exec = |start: usize| !pre[start..].iter().any(|i|
+            i.write(Reg::S(EXEC)).is_some() || i.write(Reg::S(EXEC + 1)).is_some());
+        if !unchanged_exec(read_site.1) {
+            return None;
+        }
+        let read = self.inst(read_site);
+        let Fields::Buffer { data: Some(Operand::Vector { reg, .. }), addr: Operand::Vector { reg: va, .. },
+            soffset, offset, offen: true, idxen: false, format: None, lds: false, tfe: false, .. } = &read.fields
+            else { return None };
+        if read.name() != "buffer_load_dword" || read.write(Reg::V(*reg)) != Some(value) {
+            return None;
+        }
+        let (table_slot, table_dword) = self.buffer_index_table(read_site, resources)?;
+        let mut word_step = 1;
+        let mut bytes = 0;
+        if let Some(Term::Const(base)) = self.term(read, soffset)
+            && let Some(at) = self.defs[read.read(Reg::V(*va))?.0 as usize]
+            && at.0 == preheader && unchanged_exec(at.1)
+            && let address = self.inst(at)
+            && address.name() == "v_add_lshl_u32"
+            && let Fields::Valu(a) = &address.fields
+            && a.sdwa.is_none() && a.dpp.is_none() && a.omod == 0 && !a.clamp && a.opsel == 0 && a.neg == 0 && a.abs == 0
+            && let Some(Term::Const(bits)) = a.src.get(2).and_then(|op| self.term(address, op))
+            && bits & 31 >= 2
+        {
+            word_step = 1u32 << (bits & 31);
+            bytes = base.wrapping_add(u32::from(*offset)) % word_step;
+        }
+        Some(BufferIndex { table_slot, table_dword, word: HeapOffset { bytes, constant: None }, word_step,
+            bytes: heap.offset, guard: self.buffer_range_guard(read_site.0, resources), records: None, value_mask: u32::MAX })
     }
 
     fn sum(&self, t: Term) -> Sum {
@@ -1134,8 +1512,8 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    /// The source of the descriptor operand `op` of `inst`, in block `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    /// The source of the descriptor operand `op` at the access.
+    fn descriptor(&self, inst: &Inst, op: &Operand, site: Site) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -1151,8 +1529,55 @@ impl<'a> Tracer<'a> {
             words = raw.to_vec();
         }
         // Only the lanes that reach the access read the descriptor.
-        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        let mut known = Vec::new();
+        if let Some(lanes) = self.lanes {
+            known.push((lanes.reach[site.0], true));
+            if let Some(guard) = lanes.guards[site.0][site.1] {
+                known.push((guard, true));
+            }
+            if let Some(initial) = self.loop_entry_exec(site.0, lanes, &known) {
+                known.push((initial, true));
+            }
+        }
         self.classify(&words, &mut Vec::new(), &mut known)
+    }
+
+    /// A waterfall can only remove lanes from its initial EXEC. The loop
+    /// header's phi otherwise hides the guard under which the descriptor
+    /// dwords were copied into VGPRs before the loop.
+    fn loop_entry_exec(&self, b: usize, lanes: &Structured, known: &Known) -> Option<Bool> {
+        let block = &self.p.blocks[b];
+        let [a, z] = block.preds.as_slice() else {
+            return None;
+        };
+        let retry = match (*a == b, *z == b) {
+            (true, false) => 0,
+            (false, true) => 1,
+            _ => return None,
+        };
+        let phi = |reg| block.phis.iter().find(|p| p.reg == Reg::S(reg));
+        let lo = phi(EXEC)?;
+        let hi = if self.p.wave64 {
+            Some(phi(EXEC + 1)?)
+        } else {
+            None
+        };
+        let header = lanes.mask_bits(lo.value, hi.map(|p| p.value))?;
+        let on_edge = |edge: usize| lanes.mask_bits(lo.args[edge], hi.map(|p| p.args[edge]));
+        let initial = on_edge(1 - retry)?;
+        let again = on_edge(retry)?;
+        // The initial mask must still describe the same lanes on every pass.
+        // Check the induction step and that this access uses only such lanes.
+        if !lanes.bools.defined_before(initial, self.rpo[b])
+            || self.meet(lanes, &[(again, true), (header, false)])
+        {
+            return None;
+        }
+        known
+            .iter()
+            .rev()
+            .any(|&fact| !self.meet(lanes, &[fact, (header, false)]))
+            .then_some(initial)
     }
 
     /// The source of a descriptor's words; `joins` are the phi blocks
@@ -1257,6 +1682,7 @@ impl<'a> Tracer<'a> {
                 not_taken,
             } = lanes.exits[q]
                 && taken != not_taken
+                && lanes.edge_fixes_lane_bit(q, taken == block)
             {
                 known.push((when, taken == block));
             }
@@ -1677,6 +2103,15 @@ impl<'a> Tracer<'a> {
         let Some(&Some(guard)) = lanes.guards.get(site.0).and_then(|g| g.get(site.1)) else {
             return Ok(());
         };
+        // A small guard can imply the producer's EXEC by itself. Including
+        // every enclosing branch can exhaust the bounded boolean search.
+        if known
+            .iter()
+            .rev()
+            .any(|&fact| !self.meet(lanes, &[fact, (guard, false)]))
+        {
+            return Ok(());
+        }
         let mut skips = known.clone();
         skips.extend([(lanes.reach[site.0], true), (guard, false)]);
         if self.meet(lanes, &skips) {
@@ -1939,6 +2374,7 @@ impl<'a> Tracer<'a> {
                 not_taken,
             } = lanes.exits[q]
                 && taken != not_taken
+                && lanes.edge_fixes_lane_bit(q, taken == block)
             {
                 known.push((when, taken == block));
             }
@@ -2043,7 +2479,12 @@ impl<'a> Tracer<'a> {
             return Err(SELECT);
         }
         let reach = (lanes.reach[b], true);
-        let meet = |conditions: &[(Bool, bool)]| self.meet(lanes, conditions);
+        let meet = |conditions: &[(Bool, bool)]| {
+            // First try just the loop's local masks. A proof that already
+            // holds for every lane also holds under a large outer reach.
+            let local: Vec<_> = conditions.iter().copied().filter(|&c| c != reach).collect();
+            self.meet(lanes, &local) && self.meet(lanes, conditions)
+        };
         let mut out = Waterfall::default();
         let mut required = vec![(remaining, true)];
         for (i, inst) in block.insts[..access].iter().enumerate() {
@@ -2467,6 +2908,36 @@ pub(crate) mod tests {
         track(&p, layout, stage, lanes(&p).as_ref()).unwrap()
     }
 
+    #[test]
+    fn group_pointer_chain_requires_group_x_and_a_bounded_local_id() {
+        let words: [u32; 27] = [
+            0xbeb00305, 0xbeb10380, 0xbe850380,       // group table originally in s5
+            0xf4080018, 0xfa000000,                  // group buffer descriptor
+            0xd7460000, 0x04010c09,                  // v0 = (group.x << 6) + local.x
+            0xbeb20307, 0xbeb30380,                  // absolute resource heap originally in s7
+            0xf4080702, 0xfa000ac0,                  // record buffer descriptor at byte 2752
+            0x2c080086, 0x7e0e0504, 0x8f078207,      // read first lane (v0 >> 6) * 4
+            0xf42016c0, 0x0e000000,                  // q = groups[group.x]
+            0xf428080e, 0xb6000000,                  // parents = records[q..q+16]
+            0x815aff20, 0x0000039c,                  // s90 = first parent + 924
+            0xf42000ce, 0xb4000000,                  // handle = records[s90]
+            0x8f0e8503, 0xf40c0219, 0x1c000000,      // 32-byte heap descriptor indexed by handle
+            0xbf800000, S_ENDPGM,
+        ];
+        let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [param(Table,4,1), RootParam {slot:1, ..param(Table,5,1)}, param(ResourceHeap,7,1)];
+        let track = |threads, rsrc2| {
+            let io = crate::native::StageIo::Cs(crate::native::ComputeIo { threads: [threads,1,1], rsrc2 });
+            track_with_used(&p, &layout, HwStage::Cs, lanes(&p).as_ref(), &[], &io).unwrap()
+        };
+        let r = track(64, 146);
+        assert_eq!(r.chains.iter().map(|p|p.1).collect::<Vec<_>>(),
+            [MaterialChain { groups:(1,0), records:(0,688), parent:0, handle:924 }]);
+        assert!(track(128, 146).chains.is_empty());
+        assert!(track(64, 144).chains.is_empty(), "s9 is no longer group.x");
+    }
+
     /// `p` as one lane runs it, if it structures.
     fn lanes(p: &Program) -> Option<Structured> {
         crate::structure::structure(p).ok()
@@ -2489,6 +2960,96 @@ pub(crate) mod tests {
             offset,
             dynamic: None,
         }
+    }
+
+    #[test]
+    fn record_chain_proves_the_signed_count_and_handle_component() {
+        let check = |entry_compare, latch_compare, component| {
+            let mut words = vec![
+                0xbe9a0311, 0xbe910380, 0xbe9b0380, 0xbebc0317, 0xbebd0380, // tables and heap
+                0xf408010d, 0xfa000020, 0xf4080008, 0xfa000b20, // A and B descriptors
+                0xf4200102, 0xfa000014, // i=A[20]
+                0x9304b004, 0x81049804, 0xf4200000, 0x08000000, // packed=B[i*48+24]
+                0x903e9000, 0xb83e0390, // base = (packed>>16)*912
+                0xf4080d08, 0xfa000780, // C descriptor
+                0x8110ff3e, 0x00000088, 0xf42009da, 0x20000000, // n=C[base+136]
+                entry_compare, 0xbf850000, 0xbeb30380, // if n<1, skip; j=0
+            ];
+            let head = words.len();
+            words.extend([
+                0x8f008433, 0x8101ff00, 148, 0x8101013e, // base + (j<<4) + 148
+                0xf424041a, 0x02000000, // load two handles
+                0x8f008510 + component, 0xf40c001e, 0x00000000, // heap[handle<<5]
+                0x81338133, latch_compare, 0xbf840000, S_ENDPGM,
+            ]);
+            let end = words.len()-1;
+            words[head-2] |= (end - (head-1)) as u32;
+            words[end-1] |= ((head as i32 - end as i32) as u16) as u32;
+            let layout = [param(Table,16,1), RootParam { slot:1, ..param(Table,17,1) }, param(ResourceHeap,23,1)];
+            track_words(&words, &layout, HwStage::Ps)
+        };
+        for component in [0,1] {
+            let r = check(0xbf048127, 0xbf032733, component);
+            let [(_,chain)] = r.scalar_records.as_slice() else { panic!("{:?}",r.buffer_indices) };
+            assert_eq!(*chain, ScalarRecordChain { index:(1,8), instances:(0,712), records:(0,480),
+                index_offset:20, instance_stride:48, packed_offset:24, record_shift:16, record_stride:912,
+                count_offset:136, handle_offset:148+component*4, handle_stride:16 });
+        }
+        for (entry,latch) in [(0xbf048027,0xbf032733), (0xbf048127,0xbf092733)] {
+            let r = check(entry,latch,0);
+            assert!(r.scalar_records.is_empty());
+            assert_eq!(r.buffer_indices.len(),1);
+        }
+    }
+
+    #[test]
+    fn record_index_records_the_source_buffer_and_every_possible_word_alignment() {
+        let track = |stride: u32, heap_shift: u32| track_words(
+            &[
+                0xbe94_0309, 0xbe95_0380, // s[20:21] = zero-extended table
+                0xbe98_030f, 0xbe99_0380, // s[24:25] = zero-extended resource heap
+                0xf408_020a, 0xfa00_0060, // load buffer descriptor from table + 96
+                0xb026_0000 | stride,     // s38 = immediate record stride
+                0x9328_262b,              // s40 = unknown record * s38
+                0xb025_0003, 0x8100_2528, // s0 = s40 + 3
+                0xf420_0004, 0x0000_0000, // load s0 from the bound buffer at s0
+                0x8f00_8000 | (heap_shift << 8), // s0 <<= heap_shift
+                0xf40c_000c, 0x0000_0000, // s[0:7] = heap descriptor at s0
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1), param(ResourceHeap, 15, 1)],
+            HwStage::Ps,
+        );
+        for (stride, step, residue) in [(304, 16, 3), (305, 1, 0), (306, 2, 1), (256, 256, 3), (512, 512, 3)] {
+            let r = track(stride, 5);
+            let [(_, index)] = r.buffer_indices.as_slice() else { panic!("{:?}", r.buffer_indices) };
+            assert_eq!((index.table_dword, index.bytes), (24, 0));
+            assert_eq!((index.word_step, index.word.bytes, index.word.constant), (step, residue, None));
+        }
+        assert!(track(304, 4).buffer_indices.is_empty());
+    }
+
+    #[test]
+    fn record_index_range_requires_a_dominating_nonempty_arm() {
+        let guarded = |skip: u32| {
+            let mut words = vec![
+                0xbe94_0309, 0xbe95_0380, 0xbe98_030f, 0xbe99_0380,
+                0xf408_020a, 0xfa00_0060, // table buffer in s[8:11]
+                0xf424_0684, 0xfa00_0078, // its first/end dwords at byte 120
+                0xbf09_1b1a,               // s_cmp_ge_u32 s26, s27
+                0xbf85_0000 | skip,        // skip the selector on an empty range
+                0xbf80_0000,               // s_nop
+                0xb026_0130, 0x9328_262b, // offset = 304 * unknown record
+                0xf420_0004, 0x5000_0000, // scalar buffer load indexed by s40
+                0x8f00_8500, 0xf40c_000c, 0, // shift the index into the heap
+            ];
+            words.push(S_ENDPGM);
+            let r = track_words(&words, &[param(Table, 9, 1), param(ResourceHeap, 15, 1)], HwStage::Ps);
+            r.buffer_indices[0].1.guard
+        };
+        assert_eq!(guarded(8), Some(BufferRange { table_slot: 0, table_dword: 24, offset: 120 }));
+        // Both arms reach the material load when the branch skips only the nop.
+        assert_eq!(guarded(1), None);
     }
 
     #[test]
@@ -3357,6 +3918,27 @@ pub(crate) mod tests {
         assert_eq!(r.waterfall.loads, [load]);
     }
 
+    #[test]
+    fn waterfall_buffer_indices_require_every_entering_lane_to_hold_the_loaded_word() {
+        let mut words = WATERFALL_INDEXED_WAVE32.to_vec();
+        // The index source is the buffer at table + 64 (the image heap is s0).
+        let binding = word_at(&words, 0xf408_0a02);
+        words[binding] = 0xf408_0a03;
+        let producer = word_at(&words, 0x360e_0081);
+        words.splice(producer..=producer, [0xe030_1008, 0x800a_0700]); // buffer_load_dword v7, v0, s[40:43], 0 offen offset:8
+        let layout = [param(ResourceHeap, 0, 1), param(Table, 1, 1)];
+        let r = track_words(&words, &layout, HwStage::Cs);
+        let [(site, index)] = r.buffer_indices.as_slice() else { panic!("{:?}", r.buffer_indices) };
+        assert!(r.waterfall.loads.contains(site));
+        assert_eq!((index.table_dword, index.word_step, index.word.bytes), (16, 1, 0));
+
+        // A lane enabled after the load can carry a value from elsewhere.
+        words.insert(producer + 2, 0xbefe_03c1); // s_mov_b32 exec_lo, -1
+        let r = track_words(&words, &layout, HwStage::Cs);
+        assert!(!r.waterfall.loads.is_empty());
+        assert!(r.buffer_indices.is_empty());
+    }
+
     /// [`WATERFALL_JOINED_WAVE32`] with other sources on each path: lanes
     /// below 16 load table entry (lane & 1) with two `global_load_dwordx4`,
     /// the others pick per lane with `v_cndmask_b32` (lanes below 24 the
@@ -3612,6 +4194,19 @@ pub(crate) mod tests {
             assert_eq!(r.waterfall.compares.len(), 4);
             assert_eq!(r.waterfall.reads.len(), 8);
         }
+    }
+
+    #[test]
+    fn waterfall_only_uses_descriptor_words_fetched_by_its_initial_lanes() {
+        let mut words = WATERFALL_FETCHED_WAVE64.to_vec();
+        words.insert(0, 0x7DA4_0080); // v_cmpx_eq_u32 exec, 0, v0
+        let r = waterfall(&words, true).unwrap();
+        assert_eq!(r.waterfall.reads.len(), 8);
+
+        // Reactivating lanes after the fetch makes their descriptor unknown.
+        let before_loop = words.iter().position(|&w| w == 0xBE94_047E).unwrap();
+        words.insert(before_loop, 0xBEFE_04C1); // s_mov_b64 exec, -1
+        assert!(waterfall(&words, true).is_err());
     }
 
     #[test]

@@ -40,6 +40,11 @@ use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
 /// Words after which a stream is handed to the translating threads.
 const CHUNK: usize = 1024;
 
+#[cfg(feature = "diagnostics")]
+pub(crate) static GENERATIONS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+pub(crate) static BACKS_USED: AtomicU64 = AtomicU64::new(0);
+
 /// Whether list calls are only written down (`VICTORY_THIN=1`; needs the line
 /// of submissions, which it turns on).
 pub(crate) fn on() -> bool {
@@ -104,6 +109,9 @@ impl Front {
             let pipeline = args[0] as This;
             self.retain(pipeline);
             if !pipeline.is_null() {
+                // The guest has bound this recipe even if an earlier command
+                // is still waiting for its native pipeline on a worker.
+                crate::pipeline::bound(pipeline);
                 crate::pipeline::prefetch(pipeline);
             }
         }
@@ -227,6 +235,10 @@ pub(crate) struct Recording {
     inner: Mutex<Inner>,
     /// Translated to its end.
     done: AtomicBool,
+    #[cfg(feature = "diagnostics")]
+    active_step: AtomicU64,
+    #[cfg(feature = "diagnostics")]
+    worker: std::sync::atomic::AtomicU32,
     moved: Condvar,
     abandoned: AtomicBool,
 }
@@ -235,6 +247,8 @@ pub(crate) struct Recording {
 struct Inner {
     chunks: VecDeque<Vec<u64>>,
     cursor: usize,
+    #[cfg(feature = "diagnostics")]
+    parked: Option<(usize, std::sync::Weak<crate::pipeline::make::Pending>)>,
     /// Streams translated (commands may name places in them until the end).
     kept: Vec<Vec<u64>>,
     /// It is among [`READY`] or being translated.
@@ -248,12 +262,25 @@ struct Inner {
 }
 
 impl Recording {
+    #[cfg(test)]
+    pub(crate) fn empty_for_test(done: bool) -> Arc<Self> {
+        let recording = Arc::new(Self::new(0));
+        recording.done.store(done, Release);
+        recording
+    }
+
     fn new(kind: u32) -> Self {
+        #[cfg(feature = "diagnostics")]
+        GENERATIONS.fetch_add(1, Relaxed);
         Recording {
             objects: Default::default(),
             kind,
             inner: Mutex::default(),
             done: AtomicBool::new(false),
+            #[cfg(feature = "diagnostics")]
+            active_step: AtomicU64::new(u64::MAX),
+            #[cfg(feature = "diagnostics")]
+            worker: std::sync::atomic::AtomicU32::new(0),
             moved: Condvar::new(),
             abandoned: AtomicBool::new(false),
         }
@@ -274,6 +301,37 @@ impl Recording {
     /// The list of ours it went to (null: it was never begun).
     pub(crate) fn back(&self) -> This {
         held(&self.inner).back as This
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn trace_waits() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_QUEUE_WAITS").is_some())
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn describe_wait(&self) -> String {
+        let (pending, cursor, op, scheduled, chunks) = {
+            let inner = held(&self.inner);
+            (inner.parked.clone(), inner.cursor,
+             inner.chunks.front().and_then(|s| s.get(inner.cursor)).map(|w| w & 0xffff),
+             inner.scheduled, inner.chunks.len())
+        };
+        if let Some((guest, pending)) = pending && let Some(pending) = pending.upgrade() {
+            return format!("pipeline={guest:#x} cursor={cursor} op={op:?} {}",pending.describe_wait());
+        }
+        let step = self.active_step.load(Relaxed);
+        if step != u64::MAX {
+            return format!("translating tid={} cursor={} op={} queued_chunks={chunks}",
+                self.worker.load(Relaxed), step >> 16, step & 0xffff);
+        }
+        format!("scheduled={scheduled} queued_chunks={chunks}")
+    }
+
+    pub(crate) fn resume_pipeline(self: Arc<Self>) {
+        #[cfg(feature = "diagnostics")]
+        if Self::trace_waits() { held(&self.inner).parked = None; }
+        self.resume();
     }
 
     /// Translates what there is.
@@ -299,15 +357,27 @@ impl Recording {
                 (chunk, inner.back as This, std::mem::take(&mut inner.cursor))
             };
             let began = std::time::Instant::now();
-            let (calls, closed, pending) =
-                translate(back, &chunk, cursor, || self.abandoned.load(Acquire));
+            #[cfg(feature = "diagnostics")]
+            let trace = Self::trace_waits().then(|| {
+                self.worker.store(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }, Relaxed);
+                &self.active_step
+            });
+            let (calls, closed, pending) = translate(back, &chunk, cursor,
+                #[cfg(feature = "diagnostics")] trace,
+                || self.abandoned.load(Acquire));
+            #[cfg(feature = "diagnostics")]
+            if let Some(step) = trace { step.store(u64::MAX, Relaxed); }
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);
-            if let Some((cursor, pipeline)) = pending {
+            if let Some((cursor, (guest, pipeline))) = pending {
+                #[cfg(not(feature = "diagnostics"))]
+                let _ = guest;
                 inner.cursor = cursor;
                 inner.chunks.push_front(chunk);
                 if pipeline.park(self) {
+                    #[cfg(feature = "diagnostics")]
+                    if Self::trace_waits() { inner.parked = Some((guest, Arc::downgrade(&pipeline))); }
                     return;
                 }
                 continue;
@@ -341,6 +411,13 @@ impl Drop for Recording {
                 super::close(inner.back as This);
             }
             let list = unsafe { &mut *(inner.back as *mut List) };
+            if list.host.is_some() {
+                // This generation never transferred its native lists to a flight.
+                // Its cuts, uploads and descriptor references may be large. No
+                // live recorder or queue still owns the back when its Arc drops.
+                unsafe { drop(Box::from_raw(inner.back as *mut List)); }
+                return;
+            }
             list.cached = None;
             list.objects = None;
             held(&BACKS).push(inner.back);
@@ -360,14 +437,18 @@ fn give_back(streams: Vec<Vec<u64>>) {
 
 /// A list of ours, closed.
 fn back_list(kind: u32) -> This {
+    #[cfg(feature = "diagnostics")]
+    BACKS_USED.fetch_add(1, Relaxed);
     if let Some(back) = held(&BACKS).pop() {
         // SAFETY: a list of ours nobody uses.
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
     }
-    let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
-    super::close(list);
-    list
+    // RESET is the first stream word. Let it acquire an idle native list,
+    // just as it does for a reused wrapper.
+    let mut list = super::boxed(kind, std::ptr::null(), false);
+    list.worker = true;
+    Box::into_raw(list).cast_const().cast()
 }
 
 fn start() {
@@ -400,7 +481,7 @@ fn start() {
 
 /// The recordings of submitted lists, in order (one that was not begun is left
 /// out).
-pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
+pub(crate) fn submitted(lists: &[This]) -> VecDeque<Arc<Recording>> {
     lists
         .iter()
         .filter(|l| !l.is_null())
@@ -445,6 +526,7 @@ pub(crate) fn for_external(this: This) -> Option<This> {
         return None;
     }
     if super::host_list(this).is_some() {
+        finish_texture_piece(this);
         return Some(this);
     }
     let front = front(this);
@@ -459,7 +541,56 @@ pub(crate) fn for_external(this: This) -> Option<This> {
         inner = recording.moved.wait_while(inner, |i| i.scheduled).unwrap_or_else(|e| e.into_inner());
         inner.waiting_for_back = false;
     }
-    (inner.back != 0).then_some(inner.back as This)
+    let back = (inner.back != 0).then_some(inner.back as This)?;
+    finish_texture_piece(back);
+    Some(back)
+}
+
+/// Only a following command requires a new native list. A closing guest
+/// list already records and fences its texture readbacks at that boundary.
+fn finish_texture_piece(list: This) {
+    if super::host_list(list).is_some_and(|host| host.take_selector_boundary()) {
+        super::cut(list, None, CutReason::MaterialSelector);
+    } else if super::host_list(list).is_some_and(|host| host.take_texture_boundary()) {
+        super::cut(list, None, CutReason::TextureWrite);
+    }
+}
+
+/// Consecutive region copies into the same image can publish their combined
+/// destination once. A source whose bytes come from the guest still needs
+/// the normal publication boundary before its prelude can fetch those bytes.
+fn continues_texture_copy(host: &crate::host::HostList, op: u64, w: &[u64]) -> bool {
+    if op != COPY_TEXTURE { return false; }
+    let step = size_of::<CopyLocation>().div_ceil(8);
+    // SAFETY: copy_texture_region retains both resources and writes two full
+    // locations starting at word 2. The stream's u64 slice provides alignment.
+    let (dst, src) = unsafe { (&*at_or::<CopyLocation>(w, 2), &*at_or::<CopyLocation>(w, 2 + step)) };
+    dst.kind == 0 && src.kind == 0
+        && (!crate::resource::title_fills(src.resource) || crate::texture::host_wrote(src.resource as usize))
+        && host.readback_only_to(dst.resource)
+}
+
+/// These commands update draw state or order already-recorded operations.
+/// Their next native consumer checks its actual pipeline and output resources.
+fn ends_material_group(op: u64, drawing: bool, draw_shares: impl FnOnce() -> bool) -> bool {
+    if op <= Plain::SET_PIPELINE as u64 || op == Plain::SYNC as u64
+        || (VIEWPORTS..=TARGETS).contains(&op) || matches!(op, UPLOAD | BARRIER_GROUPS | CLOSE | RESET | BUILDER_RANGES)
+        || op == Plain::WAIT_VALUE as u64 || op == Plain::WAIT_VALUE64 as u64 { return false; }
+    !drawing || !draw_shares()
+}
+
+/// A compute shader with explicitly bounded outputs can defer its material
+/// inputs at the tail of an existing native piece. Unknown future chunks
+/// and any other intervening work retain recording-time preparation.
+fn material_tail(mut stream: &[u64]) -> bool {
+    while let Some((&head, rest)) = stream.split_first() {
+        let op = head & 0xffff;
+        if matches!(op, CLOSE | RESET | BUILDER_RANGES) || op == Plain::WAIT_VALUE as u64 || op == Plain::WAIT_VALUE64 as u64 { return true; }
+        if ends_material_group(op, false, || false) { return false; }
+        let Some(next) = rest.get((head >> 16) as usize..) else { return false; };
+        stream = next;
+    }
+    false
 }
 
 /// An argument as a word.
@@ -594,11 +725,11 @@ pub(crate) fn builder_ranges(list: This, ranges: &[[u64; 3]]) {
 
 fn builder_scope(list: This, ranges: &[[u64; 3]]) {
     if !ranges.is_empty() {
-        super::cut(list, None);
+        super::cut(list, None, super::CutReason::BuilderScope);
     }
     super::with_state(list, |host, state| state.set_builder_ranges(host, ranges));
     if ranges.is_empty() {
-        super::cut(list, None);
+        super::cut(list, None, super::CutReason::BuilderScope);
     }
 }
 
@@ -836,23 +967,35 @@ fn translate(
     list: This,
     stream: &[u64],
     cursor: usize,
+    #[cfg(feature = "diagnostics")] trace: Option<&AtomicU64>,
     left: impl Fn() -> bool,
 ) -> (
     u64,
     bool,
-    Option<(usize, Arc<crate::pipeline::make::Pending>)>,
+    Option<(usize, (usize, Arc<crate::pipeline::make::Pending>))>,
 ) {
     let (mut i, mut calls, mut closed) = (cursor, 0, false);
     let mut skip = left();
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
+        #[cfg(feature = "diagnostics")]
+        if let Some(step) = trace { step.store(((i as u64) << 16) | op, Relaxed); }
         let w = &stream[i + 1..i + 1 + len];
+        let drawing = op == Plain::DRAW as u64 || op == Plain::DRAW_INDEXED as u64
+            || op == Plain::EXECUTE_INDIRECT as u64 && crate::signature::layout(w[0] as This)
+                .is_some_and(|(_, args)| matches!(args, [[0 | 1, ..]]));
+        let mesh = op == Plain::DISPATCH_MESH as u64 || op == Plain::DISPATCH_MESH_X as u64
+            || op == Plain::EXECUTE_INDIRECT as u64 && crate::signature::layout(w[0] as This)
+                .is_some_and(|(_, args)| matches!(args, [[10, ..]]));
+        if !skip && op != CLOSE && op != RESET && op != UPLOAD && op != BARRIER && op != BARRIER_GROUPS
+            && op != Plain::WAIT_VALUE as u64 && op != Plain::WAIT_VALUE64 as u64
+            && let Some(host) = super::host_list(list)
+            && host.has_texture_boundary() && !continues_texture_copy(host, op, w)
+        {
+            finish_texture_piece(list);
+        }
         if !skip {
-            let draw = op == Plain::DRAW as u64
-                || op == Plain::DRAW_INDEXED as u64
-                || op == Plain::EXECUTE_INDIRECT as u64
-                    && crate::signature::layout(w[0] as This)
-                        .is_some_and(|(_, args)| matches!(args, [[0 | 1, ..]]));
+            let draw = drawing;
             if draw
                 || [
                     Plain::DISPATCH as u64,
@@ -869,6 +1012,18 @@ fn translate(
                     return (calls, closed, Some((i, p)));
                 }
             }
+            if let Some(host) = super::host_list(list) && host.has_material_group() && ends_material_group(op, drawing || mesh, || {
+                let mut shares = false;
+                super::with_state(list, |h, state| shares = state.continues_materials(h, mesh));
+                shares
+            })
+            {
+                super::cut(list, None, CutReason::MaterialSelector);
+            }
+            let dispatch = op == Plain::DISPATCH as u64 || op == Plain::DISPATCH_X as u64
+                || op == Plain::EXECUTE_INDIRECT as u64 && crate::signature::layout(w[0] as This)
+                    .is_some_and(|(_, args)| matches!(args, [[2, ..]]));
+            if let Some(host) = super::host_list(list) { host.set_stream_draw(drawing || mesh || dispatch && material_tail(&stream[i+1+len..])); }
         }
         i += 1 + len;
         calls += 1;
@@ -1043,6 +1198,15 @@ const MINE: [(usize, *const ()); 50] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selector_groups_end_at_producers_and_reuse_existing_boundaries() {
+        let mut commands = vec![Plain::GRAPHICS_TABLE as u64, Plain::DRAW_INDEXED as u64].repeat(1024);
+        commands.extend([Plain::COPY_BUFFER as u64, Plain::WRITE32 as u64, Plain::DISPATCH as u64, CLOSE]);
+        assert_eq!(commands.iter().filter(|&&op| ends_material_group(op, op == Plain::DRAW_INDEXED as u64, || true)).count(), 3);
+        assert!(ends_material_group(Plain::DRAW as u64, true, || false));
+        assert!(!ends_material_group(Plain::WAIT_VALUE as u64, false, || false));
+    }
 
     #[test]
     fn an_empty_recording_completes_without_a_native_allocator() {

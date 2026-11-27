@@ -200,12 +200,22 @@ impl Names {
         let mut parts: Vec<String> = Vec::new();
         for &address in stack.iter().take_while(|a| **a != 0) {
             let name = self.of(address);
+            // An optimized closure may have no separate frame. MSVC PDBs
+            // put its actual name in the executor's first template argument.
+            let closure = ["core::ops::function::FnOnce::call_once<", "std::sys::backtrace::__rust_begin_short_backtrace<"]
+                .into_iter()
+                .find_map(|prefix| name.strip_prefix(prefix))
+                .and_then(|arg| arg.split_once("::closure_env$"))
+                .map(|(closure, _)| closure)
+                .filter(|closure| closure.starts_with("victory_") && !closure.contains('<'));
+            let name = closure.unwrap_or(&name);
             let plain = name.trim_start_matches('<').trim_start_matches("impl$").trim_start_matches(|c: char| c.is_ascii_digit());
             let skipped = ["std::", "core::", "alloc::", "windows_core::", "windows::"].iter().any(|p| plain.starts_with(p))
                 || ["timeline::hooks::", "timeline::record::"].iter().any(|p| name.contains(p))
                 || ["KERNEL", "ntdll", "kernel"].iter().any(|p| name.starts_with(p));
             if !skipped {
-                parts.push(name.replace("victory_gpu::", "").replace("victory_hle::", "hle::"));
+                let site = name.replace("victory_gpu::", "").replace("victory_hle::", "hle::");
+                if closure.is_none() || parts.last() != Some(&site) { parts.push(site); }
             }
             if parts.len() == 3 {
                 break;

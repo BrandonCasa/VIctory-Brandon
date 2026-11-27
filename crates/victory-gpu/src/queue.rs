@@ -61,6 +61,7 @@ enum Held {
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
     Signal(crate::fence::Point),
+    Mappings(crate::resource::PageMappings),
     /// Previous work on this queue has reached a pending presentation.
     PresentBoundary(Arc<AtomicU64>),
     Present(Arc<AtomicU64>, Presentation),
@@ -214,6 +215,7 @@ pub(crate) fn release_held() {
                 }
                 match held.remove(0) {
                     Held::Wait(..) | Held::Value(..) => {}
+                    Held::Mappings(mappings) => { apply_mappings(mappings); }
                     Held::PresentBoundary(boundary) => {
                         boundary.fetch_sub(1, Ordering::Release);
                     }
@@ -677,6 +679,8 @@ impl Written {
                 at.cast::<u64>().write_unaligned(value);
             }
         }
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::capture::value_event("write retired", at as u64, value);
     }
 }
 
@@ -1010,19 +1014,16 @@ const PAGE: u64 = 64 << 10;
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. The title streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run.
+/// one constant page or of unmapped pages). Capture the pool pages before
+/// returning; publish the destination mappings at this point in queue order.
 extern "system" fn copy_page_mappings(
-    _: This,
+    this: This,
     count: u32,
     batches: *const PageBatch,
     pool: u64,
     pool_pages: u32,
     _flags: u32,
 ) -> HRESULT {
-    let Some(map) = crate::resource::page_mapper() else {
-        return E_INVALIDARG;
-    };
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
@@ -1031,16 +1032,7 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
-    let mut ok = true;
-    let many = crate::resource::many_page_mapper();
     let mut gathered: Vec<(u64, u64, u64)> = Vec::new();
-    let mut map = |to: u64, from: u64, len: u64| match many {
-        Some(_) => {
-            gathered.push((to, from, len));
-            true
-        }
-        None => map(to, from, len),
-    };
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
             continue;
@@ -1051,25 +1043,53 @@ extern "system" fn copy_page_mappings(
         for r in ranges {
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
-            let source = pool + u64::from(r.start) * PAGE;
-            ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
-                2 => map(at, 0, len),
-                3 => true,
-                _ => false,
-            };
-            at += len;
+            let Some(end) = at.checked_add(len) else { return E_INVALIDARG };
+            match r.kind {
+                0 | 1 if inside(if r.kind == 1 { 1 } else { r.count }) => {
+                    let Some(source) = pool.checked_add(u64::from(r.start) * PAGE) else { return E_INVALIDARG };
+                    if r.kind == 0 {
+                        gathered.push((at, source, len));
+                    } else {
+                        gathered.extend((at..end).step_by(PAGE as usize).map(|dest| (dest, source, PAGE)));
+                    }
+                }
+                2 => gathered.push((at, 0, len)),
+                3 => {}
+                _ => return E_INVALIDARG,
+            }
+            at = end;
         }
     }
-    if let Some(many) = many {
-        ok &= many(&gathered);
+    if gathered.is_empty() { return S_OK; }
+    let Some(apply) = crate::resource::capture_page_mappings(&gathered) else { return E_INVALIDARG };
+    let mappings: crate::resource::PageMappings = Box::new(move || {
+        #[cfg(windows)]
+        crate::host::before_page_mappings(&gathered);
+        apply()
+    });
+    #[cfg(windows)]
+    if !this.is_null() {
+        if behind::on() {
+            behind::map_pages(this, mappings);
+            return S_OK;
+        }
+        let mut held = lock(&queue(this).held);
+        if !held.is_empty() {
+            held.push(Held::Mappings(mappings));
+            return S_OK;
+        }
     }
+    if apply_mappings(mappings) { S_OK } else { E_INVALIDARG }
+}
+
+fn apply_mappings(mappings: crate::resource::PageMappings) -> bool {
+    let ok = mappings();
     if !ok {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        tracing::error!("a queued page mapping failed");
+        #[cfg(windows)]
+        crate::host::refuse_frame(format_args!("a queued page mapping failed"));
     }
-    S_OK
+    ok
 }
 
 extern "system" fn desc(this: This, out: *mut QueueDesc) {
@@ -1196,8 +1216,9 @@ mod tests {
     fn newer_queues_have_their_methods_two_slots_later() {
         let (old, new) = (queue_table(false), queue_table(true));
         assert_eq!(old[10], new[10]); // submission stays at 0x50
-        assert_eq!(old[14], new[16]); // signal 0x70 → 0x80
-        assert_eq!(old[30], new[32]); // present 0xf0 → 0x100
+        assert_eq!(old[14], new[16]); // signal moves from 0x70 to 0x80
+        assert_eq!(old[30], present as *const ());
+        assert_eq!(new[32], present_retail as *const ());
         assert_eq!(new[35], execute_x as *const ()); // 0x118
     }
 

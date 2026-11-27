@@ -138,6 +138,9 @@ struct List {
     /// ([`thin`]; then there is no `host`).
     #[cfg(windows)]
     thin: thin::Front,
+    /// The stream interpreter sees the next command before it records it.
+    #[cfg(windows)]
+    worker: bool,
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -160,8 +163,9 @@ pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
-    if list.take_texture_boundary() {
-        cut(this, None);
+    if !unsafe { (*this.cast::<List>()).worker } {
+        if list.take_selector_boundary() { cut(this, None, CutReason::MaterialSelector); }
+        else if list.take_texture_boundary() { cut(this, None, CutReason::TextureWrite); }
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
@@ -251,7 +255,7 @@ fn pools() -> bool {
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
-fn fresh_list() -> Option<crate::host::HostList> {
+fn fresh_list(previous: Option<&crate::host::HostList>) -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
@@ -261,8 +265,11 @@ fn fresh_list() -> Option<crate::host::HostList> {
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        Some(Idle(list, _)) => {
+            if let Some(previous) = previous { previous.close(); }
+            Some(list)
+        }
+        None => crate::host::host().and_then(|h| h.recording_list(previous).ok()),
     }
 }
 
@@ -279,7 +286,8 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(contents);
         let Ok(host) = std::sync::Arc::try_unwrap(host) else {continue};
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || !host.owns_allocator()
+            || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -293,6 +301,23 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         }
     }
 }
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum CutReason {
+    MemoryWait, TextureWrite, DescriptorCopyBefore, DescriptorCopyAfter, DescriptorWrite,
+    BuilderScope, BuilderDispatch, ValueWrite, RawMemory, MaterialSelector,
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) static SPLITS: [std::sync::atomic::AtomicU64; 10] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+/// First ordered texture write of each native piece, from a copy or a shader.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) static TEXTURE_BOUNDARIES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) static TITLE_LISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A wait for a memory value recorded into list `this`, with waits cut
 /// into native lists. On the console the queue runs the
@@ -312,7 +337,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
 /// console, never earlier, and nothing can wait for itself that way (a
 /// part has no wait after its first work).
 #[cfg(windows)]
-fn cut(this: This, wait: Option<ValueWait>) {
+fn cut(this: This, wait: Option<ValueWait>, _reason: CutReason) {
     if this.is_null() {
         return;
     }
@@ -326,11 +351,12 @@ fn cut(this: This, wait: Option<ValueWait>) {
         list.gate.extend(wait);
         return;
     }
-    let Some(fresh) = fresh_list() else {
+    let Some(fresh) = fresh_list(Some(current)) else {
         current.refused_command(0, "cannot allocate a command list at a required ordering boundary");
         return;
     };
-    current.close();
+    #[cfg(feature = "diagnostics")]
+    SPLITS[_reason as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
         tracing::info!(parts = list.earlier.len() + 2, "a list is cut at a wait for a memory value");
@@ -378,9 +404,9 @@ fn freeze(this: This) -> Option<std::sync::Arc<[(Vec<ValueWait>, Detached)]>> {
     let _closed = FREEZE.lock().unwrap_or_else(|e| e.into_inner());
     let list = unsafe { this.cast_mut().cast::<List>().as_mut()? };
     if list.cached.is_none() {
-        let fresh = fresh_list()?;
-        fresh.close();
-        let last = list.host.replace(fresh)?;
+        // The frozen generation owns its native commands across every replay.
+        // Its guest wrapper needs another allocator only if reset for new work.
+        let last = list.host.take()?;
         let contents = std::sync::Arc::new(Contents {
             _objects: list.objects.clone(),
             _state: std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner())),
@@ -512,12 +538,23 @@ fn new_list(
     }
     tracing::debug!(kind, "command list");
     #[cfg(windows)]
-    if thin::on() {
+    let list = if thin::on() {
         let mut list = boxed(kind, pipeline, true);
         list.thin.begin(kind, pipeline);
-        return object::hand_out(LIST, list, iid, &LIST_IIDS, out);
+        list
+    } else {
+        let mut list = boxed(kind, pipeline, false);
+        list.host = fresh_list(None);
+        list
+    };
+    #[cfg(not(windows))]
+    let list = boxed(kind, pipeline, false);
+    let result = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if result == S_OK {
+        TITLE_LISTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    object::hand_out(LIST, boxed(kind, pipeline, false), iid, &LIST_IIDS, out)
+    result
 }
 
 /// A list; with `thin` one whose calls are written down (it has no host list).
@@ -544,13 +581,7 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
-            }
-        }),
+        host: None,
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
@@ -567,6 +598,8 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         gate: Vec::new(),
         #[cfg(windows)]
         thin: Default::default(),
+        #[cfg(windows)]
+        worker: false,
     });
     #[cfg(not(windows))]
     let _ = pipeline;
@@ -626,12 +659,15 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         list.objects = None;
         list.earlier.clear();
         list.gate.clear();
+        if let Some(host) = &list.host {
+            host.reset();
+        } else if crate::host::host().is_some() {
+            // A recycled or newly created host list is already open.
+            list.host = fresh_list(None);
+            if list.host.is_none() { return 0x8007000eu32 as HRESULT; }
+        }
+        list.state.lock().unwrap_or_else(|e| e.into_inner()).reset(pipeline);
     }
-    #[cfg(windows)]
-    with_state(this, |host, state| {
-        host.reset();
-        state.reset(pipeline);
-    });
     crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
     let _ = this;
@@ -667,7 +703,9 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);
-            let (texture, before) = list.transition(b.first, wanted)?;
+            // A barrier changes the state of the native image. Only a
+            // command that writes texels can invalidate its guest landing.
+            let (texture, before) = list.transition_access(b.first, wanted, false)?;
             Some(Barrier {
                 kind: 0,
                 flags: 0,
@@ -676,19 +714,12 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
                 last: u64::from(crate::host::legal_state(texture, wanted)),
             })
         }
-        1 => Some(Barrier {
-            first: if b.first.is_null() {
-                b.first
-            } else {
-                host(b.first)?
-            },
-            second: if b.second == 0 {
-                0
-            } else {
-                host(b.second as This)? as u64
-            },
-            ..*b
-        }),
+        1 => {
+            let first = if b.first.is_null() { b.first } else { host(b.first)? };
+            let second = if b.second == 0 { 0 } else { host(b.second as This)? as u64 };
+            list.note_alias_barrier(first as usize, second as usize);
+            Some(Barrier { first, second, ..*b })
+        }
         2 => Some(Barrier {
             first: if b.first.is_null() {
                 b.first
@@ -762,8 +793,13 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 /// Moves a title texture's host copy to `state` in the list, if needed.
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
+    ensure_state_access(list, resource, state, true);
+}
+
+#[cfg(windows)]
+pub(crate) fn ensure_state_access(list: &crate::host::HostList, resource: This, state: u32, may_write: bool) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-    if let Some((texture, before)) = list.transition(resource, state) {
+    if let Some((texture, before)) = list.transition_access(resource, state, may_write) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture (the list's states hold
@@ -796,8 +832,10 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
 fn buffer_copy(this: This, to: *mut u8, from: *const u8, len: usize) {
     if len == 0 { return; }
     let descriptors = crate::descriptor::in_shader_heap(to as usize, len);
+    let in_build = in_build(this);
+    if in_build { cut(this, None, CutReason::BuilderScope); }
     if descriptors {
-        cut(this, None);
+        cut(this, None, CutReason::DescriptorCopyBefore);
     }
     let Some(list) = host_list(this) else { return; };
     if list.place_copy(to as usize, from as usize, len) {
@@ -807,7 +845,9 @@ fn buffer_copy(this: This, to: *mut u8, from: *const u8, len: usize) {
     }
     if descriptors {
         list.descriptor_write_boundary();
-        cut(this, None);
+        cut(this, None, CutReason::DescriptorCopyAfter);
+    } else if in_build {
+        cut(this, None, CutReason::BuilderScope);
     }
 }
 
@@ -831,11 +871,26 @@ extern "system" fn copy_buffer_region(
 }
 
 #[cfg(windows)]
-fn texture_copy_finished(this: This, list: &crate::host::HostList, resource: This) {
+fn texture_copy_finished(this: This, list: &crate::host::HostList, resource: This, _source: This, write: Option<crate::texback::Write>) {
     if crate::resource::title_fills(resource) {
-        list.texture_written(resource, None, false);
-        if list.take_texture_boundary() {
-            cut(this, None);
+        let Some(write) = write else {
+            list.refused_command(0, "cannot identify copied texture destination blocks");
+            return;
+        };
+        #[cfg(feature = "diagnostics")]
+        {
+            static COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n <= 12 || n.is_power_of_two() {
+                let sub = match write { crate::texback::Write::Region(sub, _) => Some(sub), _ => None };
+                tracing::info!(copies = n, ?resource, source = ?_source, ?sub,
+                    source_buffer = crate::resource::buffer_bytes(_source).is_some(),
+                    source_title = crate::resource::title_fills(_source), "ordered texture copy");
+            }
+        }
+        list.texture_copied(resource, write);
+        if !unsafe { (*this.cast::<List>()).worker } && list.take_texture_boundary() {
+            cut(this, None, CutReason::TextureWrite);
         }
     } else {
         crate::texture::host_written(resource);
@@ -915,7 +970,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
-            texture_copy_finished(this, list, dst);
+            texture_copy_finished(this, list, dst, src, Some(crate::texback::Write::All));
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -939,6 +994,27 @@ pub(crate) struct CopyLocation {
     resource: This,
     kind: u32,
     footprint: crate::resource::PlacedFootprint,
+}
+
+#[cfg(windows)]
+fn subresource_extent(desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC, sub: u32) -> [u32; 3] {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    let mip = sub % u32::from(desc.MipLevels.max(1));
+    let depth = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { u32::from(desc.DepthOrArraySize) } else { 1 };
+    [(desc.Width >> mip).max(1) as u32, (desc.Height >> mip).max(1), (depth >> mip).max(1)]
+}
+
+#[cfg(windows)]
+fn copied_region(sub: u32, dst: [u32; 3], dst_format: u32, extent: [u32; 3], src_format: u32) -> Option<crate::texback::Write> {
+    let dst_block = victory_formats::texture::format(dst_format)?.block;
+    let src_block = victory_formats::texture::format(src_format)?.block;
+    let [x, y, z] = dst;
+    if !x.is_multiple_of(dst_block) || !y.is_multiple_of(dst_block) { return None; }
+    let (x, y) = (x / dst_block, y / dst_block);
+    Some(crate::texback::Write::Region(sub, [
+        x, y, z, x.checked_add(extent[0].div_ceil(src_block))?,
+        y.checked_add(extent[1].div_ceil(src_block))?, z.checked_add(extent[2])?,
+    ]))
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
@@ -1004,12 +1080,14 @@ extern "system" fn copy_texture_region(
             return;
         }
         let mut from = src;
+        let source_shape;
         // Both sides are the same subresource of one host texture (set below).
         let mut same = false;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
+            source_shape = src.footprint.extent();
             let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
                 return;
             };
@@ -1042,6 +1120,9 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            // SAFETY: a live native texture used by this recording.
+            let desc = unsafe { texture.GetDesc() };
+            source_shape = (subresource_extent(&desc, src.footprint.offset as u32), desc.Format.0 as u32);
             // The same subresource of one host texture on both sides (two
             // title textures over one memory): not a copy the host allows.
             // The states and the copy are left out below; the rest is
@@ -1062,10 +1143,27 @@ extern "system" fn copy_texture_region(
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
         list.twin_use(dst.resource, false, true);
-        // A region copy preserves the rest of the destination allocation.
-        if !same && crate::resource::title_fills(dst.resource) {
-            crate::texture::upload(list, dst.resource, to);
-        }
+        let write = if !same && crate::resource::title_fills(dst.resource) {
+            // SAFETY: a retained live texture and the title's optional box.
+            let desc = unsafe { to.GetDesc() };
+            let extent = unsafe { source_box.as_ref() }.map_or(source_shape.0, |b| [
+                b[3].saturating_sub(b[0]), b[4].saturating_sub(b[1]), b[5].saturating_sub(b[2]),
+            ]);
+            if extent.contains(&0) { return; }
+            let format = desc.Format.0 as u32;
+            let sub = dst.footprint.offset as u32;
+            let write = copied_region(sub, [x, y, z], format, extent, source_shape.1);
+            // A complete replacement needs none of the old destination bytes.
+            // Preserve the upload when another mip, layer, or plane can survive.
+            let full = desc.MipLevels == 1 && desc.DepthOrArraySize == 1 && sub == 0
+                && victory_formats::texture::format(format).is_some_and(|f| {
+                    let [w, h, d] = subresource_extent(&desc, 0);
+                    write == Some(crate::texback::Write::Region(0, [0, 0, 0, w.div_ceil(f.block), h.div_ceil(f.block), d]))
+                        && !f.stencil
+                });
+            if !full { crate::texture::upload(list, dst.resource, to); }
+            write
+        } else { None };
         // A destination made level by level gets the level's memory ahead
         // of this list (`crate::tiles`): the title's bake copies each level
         // of its result into a block-compressed texture of that kind, and
@@ -1115,7 +1213,7 @@ extern "system" fn copy_texture_region(
                 host_box,
             )
         };
-        texture_copy_finished(this, list, dst.resource);
+        texture_copy_finished(this, list, dst.resource, src.resource, write);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
@@ -1225,6 +1323,14 @@ extern "system" fn resolve(
         if unlike(dst, src) {
             return;
         }
+        // SAFETY: live resources held while recording this resolve.
+        let (a, b) = unsafe { (to.GetDesc(), from.GetDesc()) };
+        let dst_extent = subresource_extent(&a, dst_sub);
+        let src_extent = subresource_extent(&b, src_sub);
+        let extent = [dst_extent[0].min(src_extent[0]), dst_extent[1].min(src_extent[1]), 1];
+        if extent != dst_extent && crate::resource::title_fills(dst) {
+            crate::texture::upload(list, dst, to);
+        }
         // Depth textures shaders also write: what they wrote, first.
         list.twin_use(dst, false, true);
         list.twin_use(src, false, false);
@@ -1236,9 +1342,8 @@ extern "system" fn resolve(
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
-            let (a, b) = (to.GetDesc(), from.GetDesc());
             let format = if crate::resource::stands_in(dst) { a.Format } else { DXGI_FORMAT(format as i32) };
-            if (a.Width, a.Height) == (b.Width, b.Height) {
+            if dst_extent == src_extent {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
@@ -1246,8 +1351,8 @@ extern "system" fn resolve(
                 let rect = RECT {
                     left: 0,
                     top: 0,
-                    right: a.Width.min(b.Width) as i32,
-                    bottom: a.Height.min(b.Height) as i32,
+                    right: extent[0] as i32,
+                    bottom: extent[1] as i32,
                 };
                 list1.ResolveSubresourceRegion(
                     to,
@@ -1260,9 +1365,9 @@ extern "system" fn resolve(
                     format,
                     D3D12_RESOLVE_MODE_AVERAGE,
                 );
-            }
+            } else { return; }
         }
-        texture_copy_finished(this, list, dst);
+        texture_copy_finished(this, list, dst, src, copied_region(dst_sub, [0; 3], a.Format.0 as u32, extent, a.Format.0 as u32));
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_sub, src, src_sub, format);
@@ -1305,6 +1410,7 @@ extern "system" fn clear_rtv(
         });
         const RENDER_TARGET: u32 = 0x4;
         let rtv = host.rtv(Some(texture), record.desc().as_ref());
+        list.note_clear_view(texture, record.key().1);
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
@@ -1389,14 +1495,32 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 /// host follows one: the counts are threads, not groups (`draw.rs`
 /// `THREAD_DIMENSIONS`; the ray-tracing structure builder dispatches this way).
 #[cfg(windows)]
+fn in_build(this: This) -> bool {
+    if this.is_null() { return false; }
+    // Only the recording thread mutates the state of this guest list.
+    unsafe { &(*this.cast::<List>()).state }.lock().unwrap_or_else(|e| e.into_inner()).in_build()
+}
+
+#[cfg(windows)]
 fn builder_boundary(this: This) {
     if !crate::pipeline::builder_enabled() {
         return;
     }
-    let mut boundary = false;
-    with_state(this, |_, state| boundary = state.needs_memory_boundary());
-    if boundary {
-        cut(this, None);
+    let mut boundary = None;
+    with_state(this, |host, state| {
+        if state.declared_builder_kernel() {
+            // The producer's address ranges and packed input are prepared
+            // once at scope entry. Kernels share that directory and observe
+            // earlier UAV stores at the native dispatch boundary.
+            state.enter_builder(host);
+            let barrier = unsafe { std::mem::transmute::<Barrier, windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            unsafe { host.list.barriers(&[barrier]) };
+        } else if state.needs_memory_boundary() {
+            boundary = Some(if state.builder_bound() { CutReason::BuilderDispatch } else { CutReason::RawMemory });
+        }
+    });
+    if let Some(reason) = boundary {
+        cut(this, None, reason);
         with_state(this, |host, state| state.enter_builder(host));
     }
 }
@@ -1995,6 +2119,8 @@ impl ValueWait {
 }
 
 fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: bool) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::capture::value_event("wait recorded", address, reference);
     let wait = ValueWait {
         address,
         comparison,
@@ -2023,7 +2149,7 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
     }
     // The list is cut here, and the wait stands before what follows.
     #[cfg(windows)]
-    cut(this, Some(wait));
+    cut(this, Some(wait), CutReason::MemoryWait);
     #[cfg(not(windows))]
     let _ = this;
 }
@@ -2094,6 +2220,8 @@ extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, fl
 /// pyramid). Off by default: every such write then ends a host list, and
 /// each part is a submission of its own.
 fn value_written(this: This, address: u64, value: u64) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::capture::value_event("write recorded", address, value);
     #[cfg(windows)]
     {
         if address == 0 || this.is_null() {
@@ -2112,28 +2240,7 @@ fn value_written(this: This, address: u64, value: u64) {
         {
             return;
         }
-        // SAFETY: the title passes one of our lists; a list is recorded by
-        // one thread at a time and is not submitted while it records.
-        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(current) = list.host.as_ref() else {
-            return;
-        };
-        let Some(fresh) = fresh_list() else {
-            return;
-        };
-        current.close();
-        if let Some(done) = list.host.replace(fresh) {
-            // The part so far keeps its waits; nothing stands before the
-            // next one but this part itself.
-            let waits = std::mem::take(&mut list.gate);
-            list.earlier.push(Part { waits, host: done });
-        }
-        if let Some(host) = list.host.as_ref() {
-            list.state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .replay(host);
-        }
+        cut(this, None, CutReason::ValueWrite);
     }
     #[cfg(not(windows))]
     let _ = (this, address, value);
@@ -2148,7 +2255,9 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
         list.defer_write(address as *mut u8, what, bytes);
         if crate::descriptor::in_shader_heap(address as usize, bytes) {
             list.descriptor_write_boundary();
-            cut(this, None);
+            cut(this, None, CutReason::DescriptorWrite);
+        } else if in_build(this) {
+            cut(this, None, CutReason::BuilderScope);
         }
         return;
     }
@@ -2286,6 +2395,18 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn destination_coverage_uses_source_format_elements_for_block_copies() {
+        use crate::texback::Write;
+        // Four RGBA32 blocks occupy sixteen BC7 texels in the destination.
+        assert!(matches!(copied_region(3, [8, 4, 0], 98, [4, 2, 1], 2),
+            Some(Write::Region(3, [2, 1, 0, 6, 3, 1]))));
+        assert!(matches!(copied_region(4, [0; 3], 98, [5, 3, 1], 98),
+            Some(Write::Region(4, [0, 0, 0, 2, 1, 1]))));
+        assert!(copied_region(4, [1, 0, 0], 98, [4, 4, 1], 98).is_none());
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

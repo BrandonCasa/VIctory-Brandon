@@ -161,7 +161,7 @@ pub(crate) extern "system" fn create_cached_graphics_x(
         let mut bytes = Vec::new();
         g.put(&mut bytes);
         if let Some(g) = host::GraphicsState::get(&bytes) {
-            return hand_out(p.shaders.clone(), Some(Box::new(g)), iid, out);
+            return hand_out(p.shaders.clone(), Some(Box::new(g)), crate::root::data_static(usize::from_le_bytes(root_ptr) as This), iid, out);
         }
     }
     let Some((shaders, Some(state))) = recipe
@@ -170,7 +170,7 @@ pub(crate) extern "system" fn create_cached_graphics_x(
     else {
         return object::NOT_FOUND;
     };
-    hand_out(shaders, Some(state), iid, out)
+    hand_out(shaders, Some(state), crate::root::data_static(usize::from_le_bytes(root_ptr) as This), iid, out)
 }
 
 extern "system" fn stream(
@@ -253,5 +253,5 @@ pub(crate) extern "system" fn variant(
             return E_INVALIDARG;
         }
     }
-    hand_out(p.shaders.clone(), Some(Box::new(g)), iid, out)
+    hand_out(p.shaders.clone(), Some(Box::new(g)), p.static_tables.clone(), iid, out)
 }

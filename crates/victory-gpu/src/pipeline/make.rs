@@ -63,6 +63,25 @@ impl Pending {
         &self.key
     }
 
+    pub(super) fn install(&self, host: HostPipeline) {
+        self.publish(Some(host));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn describe_wait(&self) -> String {
+        let state = match (self.made.get(), self.queue_state.load(Ordering::Acquire)) {
+            (Some(Some(_)), _) => "ready",
+            (Some(None), _) => "failed",
+            (None, NOT_QUEUED) => "unqueued",
+            (None, EARLY) => "prefetched",
+            (None, REQUESTED) => "requested",
+            (None, MAKING_EARLY) => "making prefetched",
+            (None, MAKING_SLOW) => "making slow",
+            (None, _) => "making",
+        };
+        format!("{state} recipe={} shaders={:?}", self.key, self.shaders)
+    }
+
     pub(crate) fn park(&self, recording: &Arc<crate::list::thin::Recording>) -> bool {
         let mut recordings = self.recordings.lock().unwrap_or_else(|e| e.into_inner());
         if self.made.get().is_some() {
@@ -74,14 +93,11 @@ impl Pending {
 
     fn publish(&self, made: Option<HostPipeline>) {
         let _ = self.made.set(made);
-        for recording in self
-            .recordings
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain(..)
-            .filter_map(|r| r.upgrade())
-        {
-            recording.resume();
+        // Parking owns the recording lock before taking the waiter lock.
+        // Release the waiter lock before waking an individual recording.
+        let waiters = std::mem::take(&mut *self.recordings.lock().unwrap_or_else(|e| e.into_inner()));
+        for recording in waiters.into_iter().filter_map(|r| r.upgrade()) {
+            recording.resume_pipeline();
         }
     }
 
@@ -162,6 +178,50 @@ static CRASH_EVENT: AtomicUsize = AtomicUsize::new(0);
 /// screen alone. Never locked by the handler.
 static ACTIVE_JOBS: Mutex<Vec<Option<(Arc<Pending>, bool)>>> = Mutex::new(Vec::new());
 
+// A cold driver compile can occupy a 1–2 GiB private arena. The worker
+// count also covers inexpensive library loads and translations, so limit
+// only simultaneous misses, after we have tried loading the exact PSO.
+static DRIVER_WORKERS: Mutex<Vec<(usize, Option<Arc<Pending>>)>> = Mutex::new(Vec::new());
+static DRIVER_AVAILABLE: Condvar = Condvar::new();
+
+pub(super) struct DriverCompile(usize);
+
+pub(super) fn active_recipe() -> Option<String> {
+    let jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+    jobs.get(WORKER_SLOT.get())?.as_ref().map(|(job, _)| job.key.clone())
+}
+
+pub(super) fn enter_driver_compile() -> Option<DriverCompile> {
+    let slot = WORKER_SLOT.get();
+    if slot == usize::MAX { return None; } // Standalone warm has its own worker budget.
+    let job = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner()).get(slot)
+        .and_then(Option::as_ref).map(|(p, _)| p.clone());
+    let mut active = DRIVER_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        let limit = crate::residency::compiler_headroom()
+            .map_or(usize::MAX, |bytes| ((bytes >> 30) as usize).max(1));
+        // A speculative compile already in the driver cannot be preempted
+        // when available commit falls. Leave a way for a real draw to proceed.
+        let demanded = |p: &Option<Arc<Pending>>| p.as_ref().is_none_or(|p| p.used.load(Ordering::Relaxed));
+        if active.len() < limit || demanded(&job) && !active.iter().any(|(_, p)| demanded(p)) { break; }
+        active = DRIVER_AVAILABLE.wait(active).unwrap_or_else(|e| e.into_inner());
+    }
+    active.push((slot, job));
+    Some(DriverCompile(slot))
+}
+
+fn leave_driver_compile(slot: usize) {
+    let mut active = DRIVER_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = active.iter().position(|(worker, _)| *worker == slot) {
+        active.swap_remove(i);
+        DRIVER_AVAILABLE.notify_all();
+    }
+}
+
+impl Drop for DriverCompile {
+    fn drop(&mut self) { leave_driver_compile(self.0); }
+}
+
 thread_local! {
     /// This worker's slot (`usize::MAX`: none).
     static WORKER_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
@@ -176,13 +236,13 @@ struct Compile {
 
 impl Compile {
     fn begin(slot: usize, p: &Arc<Pending>, screens_only: bool) -> Compile {
-        if slot < MAX_SLOTS && guard_on() {
+        if slot < MAX_SLOTS {
             let mut jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
             if jobs.len() < MAX_SLOTS {
                 jobs.resize(MAX_SLOTS, None);
             }
             jobs[slot] = Some((p.clone(), screens_only));
-            COMPILING.set(true);
+            COMPILING.set(guard_on());
         }
         Compile { slot }
     }
@@ -190,7 +250,8 @@ impl Compile {
 
 impl Drop for Compile {
     fn drop(&mut self) {
-        if COMPILING.replace(false) && self.slot < MAX_SLOTS {
+        COMPILING.set(false);
+        if self.slot < MAX_SLOTS {
             let mut jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(job) = jobs.get_mut(self.slot) {
                 *job = None;
@@ -289,6 +350,8 @@ fn watch() {
 
 /// The worker at `slot` is gone with the pipeline it was making.
 fn lost(slot: usize) {
+    // A faulted driver thread stays suspended and cannot drop its permit.
+    leave_driver_compile(slot);
     let job = {
         let mut jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
         jobs.get_mut(slot).and_then(Option::take)
@@ -382,7 +445,7 @@ pub(crate) fn waiting() -> u64 {
 /// Wait on the actual compile result. A list cannot advance past a producer
 /// merely because a frame's inline wait budget expired.
 pub(crate) fn prefetch(p: &Arc<Pending>) {
-    start(p, EARLY)
+    if p.made.get().is_none() { start(p, EARLY); }
 }
 
 pub(crate) fn requested(p: &Arc<Pending>) -> bool {
@@ -413,6 +476,10 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 
 fn demand(p: &Pending) {
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
+        if matches!(p.queue_state.load(Ordering::Relaxed), MAKING_EARLY | MAKING_SLOW) {
+            let _workers = DRIVER_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
+            DRIVER_AVAILABLE.notify_all();
+        }
         super::known::note(p.key(), &p.shaders, p.graphics.as_deref());
         super::library::note_used(&p.key);
     }
@@ -422,8 +489,11 @@ fn demand(p: &Pending) {
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+        // Historical early lists may predate recording their recipes. Archive
+        // these too so an offline warm can build every requested early PSO.
+        super::known::note(p.key(), &p.shaders, p.graphics.as_deref());
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, EARLY);
+        prefetch(p);
     }
 }
 
@@ -549,6 +619,9 @@ static AVAILABLE: [Condvar; 2] = [const { Condvar::new() }; 2];
 // Driver compilation also uses internal threads. Keep speculative work within a
 // fraction of the CPU budget; a draw can always promote a queued pipeline.
 fn early_limit() -> usize {
+    // One large cold driver compile can consume 2 GiB. Preserve that room
+    // for draws waiting on a pipeline before claiming another early job.
+    if crate::residency::available_commit_for_compilers() < 2 << 30 { return 0; }
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| (n.get() / 8).clamp(1, 4)))
 }
@@ -585,6 +658,7 @@ fn start(p: &Arc<Pending>, priority: u8) {
         let screen = priority == REQUESTED && p.screen && screens_first();
         if screen
             || !queue.requested.is_empty()
+            || new && queue.early.len() + queue.slow.len() == 1
             || queue.early_now < early_limit() && (!queue.early.is_empty() || queue.slow_now < slow_limit())
         {
             queue.wake(screen);
@@ -603,9 +677,11 @@ fn next(screens_only: bool) -> Arc<Pending> {
         }
         let group = usize::from(screens_only);
         queue.sleeping[group] += 1;
-        queue = AVAILABLE[group]
-            .wait(queue)
-            .unwrap_or_else(|e| e.into_inner());
+        queue = if !screens_only && (!queue.early.is_empty() || !queue.slow.is_empty()) && early_limit() == 0 {
+            AVAILABLE[group].wait_timeout(queue, Duration::from_secs(1)).unwrap_or_else(|e| e.into_inner()).0
+        } else {
+            AVAILABLE[group].wait(queue).unwrap_or_else(|e| e.into_inner())
+        };
         queue.sleeping[group] -= 1;
         queue.signalled[group] = queue.signalled[group].saturating_sub(1);
     }

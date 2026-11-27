@@ -12,6 +12,9 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+pub(crate) mod record_bytes;
+#[cfg(windows)]
+pub(crate) mod index_words;
 #[cfg(windows)]
 mod byte_offset;
 
@@ -1087,6 +1090,15 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     shapes: Vec::new(),
     shape_index: std::collections::BTreeMap::new(),
 });
+// Existing records keep their meaning until a resource releases table entries.
+// Placed-address shapes and inline constant buffer records are permanent.
+static RELEASED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn record_lifetime(generation: u32) -> u64 {
+    if generation >> KIND_SHIFT == 0 {
+        RELEASED_VIEWS.load(std::sync::atomic::Ordering::Acquire)
+    } else { 0 }
+}
 pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 /// A record is the tag and two words, `i` and `generation` (the host keeps
@@ -1178,6 +1190,13 @@ fn placed_words(shape: u32, address: u64) -> [u32; 2] {
     kind_words(PLACED, u64::from(shape) << PLACED_ADDRESS_BITS | address)
 }
 
+/// The compact form only issues block-aligned BC addresses. An original
+/// view at another address keeps the full address in a normal table entry.
+fn inline_placed_address(format: u32, address: u64) -> bool {
+    address.is_multiple_of(16)
+        || !matches!(crate::resource::element(format), Some((bytes, 4)) if !address.is_multiple_of(bytes))
+}
+
 impl Views {
     /// The number of `shape`, a new one if it is not there yet; `None` when
     /// the shapes are full (the view is then a table entry).
@@ -1199,6 +1218,17 @@ impl Views {
         let payload = payload(i, generation);
         let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
         let &(unordered, resource, rest) = self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
+        if !inline_placed_address(resource[8], address) {
+            // A byte copy can mix an entry number with another record's
+            // address and shape. This combination has no corresponding view.
+            #[cfg(feature = "diagnostics")]
+            {
+                static FIRST: std::sync::Once = std::sync::Once::new();
+                FIRST.call_once(|| tracing::warn!(address = format_args!("{address:#x}"), format = resource[8],
+                    "discarded an unissued inline compressed-texture descriptor"));
+            }
+            return None;
+        }
         let mut desc = [0u32; 16];
         desc[..10].copy_from_slice(&rest[..10]);
         (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
@@ -1253,7 +1283,7 @@ fn words_for(view: View) -> [u32; 2] {
             }
             View::Placed(unordered, resource, desc) => {
                 let (shape, address) = shape_of(*unordered, resource, desc);
-                if address >> PLACED_ADDRESS_BITS == 0 {
+                if address >> PLACED_ADDRESS_BITS == 0 && inline_placed_address(resource[8], address) {
                     // Nearly every placed view has a shape seen before.
                     let known = views_read().shape_index.get(&shape).copied();
                     let shape = known.or_else(|| views_write().shape(shape));
@@ -1352,7 +1382,7 @@ impl View {
 /// They are made when the texture is: translated shaders index the heap
 /// directly, so a slot is not always made again by the draw that reads it.
 #[cfg(windows)]
-static WAITING: std::sync::Mutex<std::collections::BTreeMap<usize, Vec<u64>>> =
+static WAITING: std::sync::Mutex<std::collections::BTreeMap<usize, std::collections::BTreeSet<u64>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// Textures given their host copy since [`make_waiting`] last ran.
@@ -1373,21 +1403,10 @@ pub(crate) fn texture_made(resource: usize) {
 /// which has no host copy: it waits for one.
 #[cfg(windows)]
 fn wait_for(resource: usize, handle: u64) {
-    /// A texture with more slots waiting than this is in use for all we
-    /// know (its views are being copied about): its host copy is made.
-    const MOST: usize = 64;
-    let many = {
-        let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
-        let slots = waiting.entry(resource).or_default();
-        if !slots.contains(&handle) {
-            slots.push(handle);
-        }
-        slots.len() > MOST
-    };
-    if many {
-        // Makes it, and notes it made.
-        let _ = crate::resource::host_copy(resource as This);
-    } else if !crate::resource::host_waits(resource as This) {
+    // Copying views to other slots does not consume texture contents. Both
+    // table preparation and indexed residency make the backing on first use.
+    WAITING.lock().unwrap_or_else(|e| e.into_inner()).entry(resource).or_default().insert(handle);
+    if !crate::resource::host_waits(resource as This) {
         // Made by another thread since the slot was looked at: that making
         // may have been taken by `make_waiting` before this slot was noted.
         texture_made(resource);
@@ -1438,7 +1457,7 @@ fn record(handle: u64, view: View) {
     }
     let [i, generation] = words_for(view);
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
-    unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+    unsafe { record_bytes::write(handle as *mut u8, [VIEW_TAG, i, generation]) };
     #[cfg(windows)]
     mirror(handle);
 }
@@ -1454,6 +1473,7 @@ pub(crate) fn forget(resource: usize) {
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    RELEASED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Release);
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -1491,7 +1511,7 @@ pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
         return None;
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
-    let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    let words = unsafe { record_bytes::read(handle as *const u8) };
     (words[0] == VIEW_TAG).then_some(words)
 }
 
@@ -1597,7 +1617,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         // SAFETY: as above.
         #[cfg(not(windows))]
         unsafe {
-            std::ptr::copy(src as *const u8, dst as *mut u8, len as usize)
+            record_bytes::copy(dst as *mut u8, src as *const u8, len as usize)
         };
         #[cfg(windows)]
         for i in 0..u64::from(count) {
@@ -1893,6 +1913,87 @@ mod tests {
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_writable_buffers_native_cbv_table_survives_an_intervening_store() {
+        use victory_shader::{ResourceType, RootType, UsedResource};
+        let Some(device) = crate::host::host() else { return };
+        let list = device.new_list().unwrap();
+        let mut handle = std::ptr::null();
+        assert_eq!(create(HeapDesc { kind: VIEWS_KIND, count: 185, flags: SHADER_VISIBLE, nodes: 0 },
+            Placement { address: 0, size: 0 }, &mut handle), S_OK);
+        let heap = heap(handle);
+        #[repr(align(256))]
+        struct Data([u32; 64]);
+        let data = Box::new(Data([17; 64]));
+        let address = data.0.as_ptr() as u64;
+        crate::shadow::register(1, address, 256);
+        crate::shadow::find(address, 256).unwrap().keep_stores();
+        create_cbv(std::ptr::null(), &[address as u32, (address >> 32) as u32, 256, 0], heap.handle(184).unwrap());
+        let mut state = crate::draw::State::default();
+        state.set_heaps(&[handle]);
+        state.set_table(true, 0, heap.start);
+        let plan = crate::draw::TablePlan::new(&[UsedResource { kind: ResourceType::Cbv, root: RootType::Table,
+            table_offset_dwords: 184 * 8, lower_bound: 0, stride: 0, dwords: 4, user_data: 0, slot: 0 }], &[]);
+        let bind = |state: &mut crate::draw::State| state.tables(&list, &plan, "", true, &[], &mut [], &mut Default::default())[0].1;
+        let first = bind(&mut state);
+        assert_ne!(first, u32::MAX);
+        state.copied();
+        assert_eq!(bind(&mut state), first);
+        // Reusing the guest address for another resource requires a new table,
+        // even though all 185 original descriptor records still compare equal.
+        crate::shadow::unregister(1, address);
+        crate::shadow::register(2, address, 256);
+        crate::shadow::find(address, 256).unwrap().keep_stores();
+        state.copied();
+        let replacement = bind(&mut state);
+        assert_ne!(replacement, u32::MAX);
+        assert_ne!(replacement, first);
+        drop(state);
+        crate::shadow::unregister(2, address);
+        release(handle);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn volatile_selector_tracks_its_bound_buffer_becoming_writable() {
+        use index_words::{DeviceBytes, IndexWords, SampleWords};
+        let Some(_) = crate::host::host() else { return };
+        let mut handle = std::ptr::null();
+        assert_eq!(create(HeapDesc { kind: VIEWS_KIND, count: 2, flags: SHADER_VISIBLE, nodes: 0 },
+            Placement { address: 0, size: 0 }, &mut handle), S_OK);
+        let heap = heap(handle);
+        let slot = heap.handle(0).unwrap();
+        #[repr(align(256))]
+        struct Constants([u32; 64]);
+        let constants = Box::new(Constants([17; 64]));
+        let address = constants.0.as_ptr() as u64;
+        let publish = |address| create_cbv(std::ptr::null(), &[address as u32, (address >> 32) as u32, 144, 0], slot);
+        publish(address);
+        let native = heap.host().unwrap();
+        native.mirror(0, slot, true);
+        let (shadow, _, _) = host::buffer_copy(&view(slot).unwrap()).unwrap();
+        shadow.update(address as usize, 144);
+        let source = SampleWords::direct(Some(IndexWords::capture(heap, slot, None, 0, 0, 0, None, u32::MAX).unwrap()), None);
+        let mut planned = Default::default();
+        source.device_ranges(&mut planned);
+        assert_eq!(planned.contains_key(&(shadow.id(),address as usize,4)), shadow.carded());
+        shadow.keep_stores();
+        let bytes = DeviceBytes::from([((shadow.id(),address as usize,4),17u32.to_le_bytes().to_vec())]);
+        let mut selected = Default::default();
+        assert!(source.values_after(&[], 64, &mut selected, Some(&bytes)));
+        assert_eq!(selected, [17].into());
+        assert_eq!(source.on_device(), shadow.carded());
+        if shadow.carded() {
+            assert!(!source.values_after(&[], 64, &mut Default::default(), None));
+        }
+        assert!(!source.values_after(&[(address as usize, address as usize + 4)], 64, &mut Default::default(), Some(&bytes)));
+        // Even an address on the same native buffer can publish a different CBV.
+        publish(address + 4);
+        assert!(!source.values_after(&[], 64, &mut Default::default(), Some(&bytes)));
+        release(handle);
+    }
+
     #[test]
     fn views_survive_copies() {
         let null = std::ptr::null();
@@ -1947,6 +2048,32 @@ mod tests {
         assert_ne!(constant_words(0x1000, 256), constant_words(0x1000, 512));
         assert_ne!(constant_words(0x1000, 256), constant_words(0x1100, 256));
         assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
+    }
+
+    #[test]
+    fn unaligned_placed_bc_views_round_trip_only_through_issued_entries() {
+        if !inline() { return; }
+        let make = |format, lo| {
+            let mut resource = [0u32; 14];
+            resource[0] = 3;
+            resource[8] = format;
+            let mut desc = [0u32; 16];
+            desc[10] = lo;
+            desc[11] = 11;
+            View::Placed(false, resource, desc)
+        };
+        for (format, alignment) in [(71, 8), (98, 16)] {
+            let aligned = make(format, alignment);
+            let [low, generation] = words_for(aligned.clone());
+            assert_eq!(generation >> KIND_SHIFT, PLACED);
+            assert_eq!(view_at(low, generation), Some(aligned));
+            let low = alignment / 2;
+            assert_eq!(view_at(low, generation), None);
+            let original = make(format, low);
+            let [entry, generation] = words_for(original.clone());
+            assert_eq!(generation >> KIND_SHIFT, 0);
+            assert_eq!(view_at(entry, generation), Some(original));
+        }
     }
 
     /// The leak of run 65: a title that writes constant buffer views and

@@ -108,7 +108,7 @@ const FAULTS_ALL: usize = 2048;
 const SWEEP: usize = 128;
 
 /// What a draw or dispatch does with title memory by address.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Use {
     Reads,
     SizeQuery { source: u64, destination: u64 },
@@ -116,6 +116,8 @@ pub(crate) enum Use {
     /// small title buffers come back.
     Builds { back: bool },
 }
+
+pub(crate) type BuilderInputs = Arc<Mutex<std::collections::BTreeSet<u64>>>;
 
 /// A page of title memory in an arena.
 struct Held {
@@ -209,6 +211,7 @@ struct PriorOutput {
 type InstanceGraph = HashMap<u64, Vec<(u64, u64, u64)>>;
 
 struct BuildVersion {
+    ranges: Arc<[[u64; 3]]>,
     instances: Arc<InstanceGraph>,
     generation: u64,
     outputs: Vec<PriorOutput>,
@@ -391,41 +394,25 @@ impl Memory {
         let mut output = None;
         for &[at, len, stamp] in ranges {
             let kind = stamp & 255;
-            if kind == crate::bvh::COPY_EXTENT {
-                continue;
+            #[track_caller]
+            fn rejected(at: u64, len: u64, kind: u64) -> bool {
+                tracing::error!(address = format_args!("{at:#x}"), len, kind, site = %std::panic::Location::caller(), "address range rejected during BVH build");
+                false
             }
-            if kind == crate::bvh::REHYDRATE {
-                let source = len;
-                let Some(header) = crate::bvh::read(source) else {
-                    return false;
-                };
-                let Some((input, output)) = crate::bvh::rehydration_extents(&header, source == at)
-                else {
-                    return false;
-                };
-                let generation = stamp & !255;
-                if !self.reserve_ranges(
-                    &[
-                        [source, input, generation | crate::bvh::PACKED_INPUT],
-                        [at, output, generation | OUTPUT],
-                    ],
-                    instances,
-                ) {
-                    return false;
-                }
+            if kind == crate::bvh::COPY_EXTENT {
                 continue;
             }
             if kind == crate::bvh::COMPACT_COPY {
                 let source = len;
                 let Some(canonical) = self.structure_at(source) else {
-                    return false;
+                    return rejected(at, len, kind);
                 };
                 let structure = &self.structures[&canonical];
                 let Some(size) = structure.compacted else {
-                    return false;
+                    return rejected(at, len, kind);
                 };
                 if !self.published_range(canonical) || size == 0 || size > structure.size {
-                    return false;
+                    return rejected(at, len, kind);
                 }
                 let src_len = structure.size;
                 let deps = structure.dependencies.clone();
@@ -437,7 +424,7 @@ impl Memory {
                     || std::iter::once(source as usize).chain(crate::inplace::aliases(source as usize, src_len as usize))
                         .any(|other| at.abs_diff(other as u64) < if at < other as u64 { size } else { src_len })
                 {
-                    return false;
+                    return rejected(at, len, kind);
                 }
                 if self.structures.iter().any(|(&base, s)| {
                     base != at
@@ -447,15 +434,15 @@ impl Memory {
                         && s.published
                         && mapping_identity(base as usize, s.size as usize) == s.backing
                 }) {
-                    return false;
+                    return rejected(at, len, kind);
                 }
                 if !self.reserve(source, src_len, false) || !self.reserve(at, size, true) {
-                    return false;
+                    return rejected(at, len, kind);
                 }
                 let generation = stamp >> 8;
                 let target = self.structure_at(at).unwrap_or(at);
                 if target != at && !crate::inplace::aliases(at as usize, size as usize).contains(&(target as usize)) {
-                    return false;
+                    return rejected(at, len, kind);
                 }
                 if self
                     .structures
@@ -482,19 +469,19 @@ impl Memory {
                     .get(&at)
                     .is_some_and(|s| !s.published && s.generation != stamp >> 8)
             {
-                return false;
+                return rejected(at, len, kind);
             }
             if !self.reserve(at, len, matches!(kind, OUTPUT | SCRATCH)) {
-                return false;
+                return rejected(at, len, kind);
             }
             if kind == crate::bvh::PACKED_INPUT {
                 if !self.land(at, Some(len)) {
-                    return false;
+                    return rejected(at, len, kind);
                 }
             } else if kind == OUTPUT {
                 let target = self.structure_at(at).unwrap_or(at);
                 if target != at && !crate::inplace::aliases(at as usize, len as usize).contains(&(target as usize)) {
-                    return false;
+                    return rejected(at, len, kind);
                 }
                 output = Some(target);
                 let generation = stamp >> 8;
@@ -519,12 +506,12 @@ impl Memory {
             } else if matches!(kind, INSTANCES | INSTANCE_POINTERS) {
                 let mut dependencies = Vec::new();
                 let Some(records) = instances.get(&at) else {
-                    return false;
+                    return rejected(at, len, kind);
                 };
                 let mut visited = std::collections::HashSet::new();
                 for &(instance, blas, h) in records {
                     if kind == INSTANCE_POINTERS && !self.reserve(instance, 64, false) {
-                        return false;
+                        return rejected(at, len, kind);
                     }
                     if !visited.insert(blas) {
                         continue;
@@ -538,19 +525,19 @@ impl Memory {
                             || mapping_identity(canonical as usize, s.size as usize)
                                 != s.backing
                         {
-                            return false;
+                            return rejected(at, len, kind);
                         }
                         dependencies.push((blas, canonical, s.generation));
                         s.size
                     } else {
                         if h as u16 != 6 || h & 0x8100_0000 != 0x8000_0000 {
-                            return false;
+                            return rejected(at, len, kind);
                         }
                         dependencies.push((blas, blas, 0));
                         ((h >> 32) + 1) * 64
                     };
                     if !self.reserve(blas, size, false) {
-                        return false;
+                        return rejected(at, len, kind);
                     }
                 }
                 dependencies.sort_unstable();
@@ -672,11 +659,19 @@ impl Memory {
         else {
             return false;
         };
-        if at < 1 << 32 || len == 0 {
+        if at < PAGE || len == 0 {
+            return false;
+        }
+        // The original builder can name low-address geometry in ordinary
+        // title buffers. The 4 GiB heuristic for speculative pointer scans
+        // must not discard its explicit, mapped input declarations.
+        if at < 1 << 32 && crate::shadow::in_buffer(at, len).is_none()
+            && crate::watch::writes(at as usize, end as usize, true).is_none() {
+            tracing::error!(address=format_args!("{at:#x}"), len, writable, "low BVH declaration lacks a guest buffer or tracked mapping");
             return false;
         }
         let pages = at / PAGE..end.div_ceil(PAGE);
-        if !crate::texture::committed_by_query(at as *const u8, len as usize)
+        if !crate::texture::committed_declaration(at as usize, len as usize)
             || !pages.clone().all(|page| self.reserve_page(page))
         {
             return false;
@@ -770,6 +765,13 @@ impl Memory {
 
     /// Gives a copy a number, if one is left.
     fn number(&mut self, shadow: Arc<Shadow>) -> Option<usize> {
+        // Page directory clients use raw dword loads and atomics. A shadow
+        // must preserve the low two bits of each guest address in its UAV.
+        let (first, _) = shadow.span();
+        if (shadow.offset(first) ^ first) & 3 != 0 {
+            tracing::warn!(first, "unaligned shadow cannot back the raw GPU page directory");
+            return None;
+        }
         let key = Arc::as_ptr(&shadow) as usize;
         if let Some(&n) = self.numbers.get(&key) {
             return Some(n);
@@ -1494,11 +1496,16 @@ fn discover_words(addresses: &[u64]) -> Option<Vec<u64>> {
     if !pieces.is_empty() {
         let host = host()?;
         let back = host.read_back_buffer((pieces.len() * 8) as u64)?;
-        let transfers: Vec<_> = pieces
-            .iter()
-            .enumerate()
-            .map(|(i, (_, src, offset, _))| (back.clone(), (i * 8) as u64, src.clone(), *offset, 8))
-            .collect();
+        let mut transfers: Vec<(ID3D12Resource, u64, ID3D12Resource, u64, u64)> = Vec::new();
+        for (i, (_, src, offset, _)) in pieces.iter().enumerate() {
+            if let Some((_, _, previous, start, size)) = transfers.last_mut() {
+                if previous == src && start.checked_add(*size) == Some(*offset) {
+                    *size += 8;
+                    continue;
+                }
+            }
+            transfers.push((back.clone(), (i * 8) as u64, src.clone(), *offset, 8));
+        }
         host.copy_preserved_buffers(&transfers)?;
         let mut data = std::ptr::null_mut();
         unsafe {
@@ -1583,6 +1590,7 @@ fn reserve_trace_views(mut views: Vec<ViewSpan>) -> Option<()> {
                 }
                 if let Some(base) = m.structure_at(at) {
                     if !m.published_range(base) {
+                        tracing::error!(address = format_args!("{at:#x}"), "traversal preceded publication of its acceleration structure");
                         return None;
                     }
                     let s = m.structures.get(&base)?;
@@ -1603,6 +1611,7 @@ fn reserve_trace_views(mut views: Vec<ViewSpan>) -> Option<()> {
                     }
                 } else {
                     if at % 256 != 0 || at < 1 << 32 || at >= (u64::from(MEMORY_PAGES) - 1) * PAGE {
+                        tracing::error!(address = format_args!("{at:#x}"), "invalid acceleration structure address");
                         return None;
                     }
                     external.push((at, true, None));
@@ -1618,10 +1627,12 @@ fn reserve_trace_views(mut views: Vec<ViewSpan>) -> Option<()> {
                     continue;
                 }
                 if header as u16 != 6 || header & (1 << 24) != 0 {
+                    tracing::error!(address = format_args!("{at:#x}"), header = format_args!("{header:#x}"), "traversal encountered an invalid unpacked header");
                     return None;
                 }
                 let size = ((header >> 32) + 1) * 64;
                 if size > 2 << 30 || limit.is_some_and(|bytes| size > bytes) {
+                    tracing::error!(address = format_args!("{at:#x}"), size, ?limit, "acceleration structure exceeds its view");
                     return None;
                 }
                 spans.push((at, size));
@@ -1646,11 +1657,136 @@ fn reserve_trace_views(mut views: Vec<ViewSpan>) -> Option<()> {
     }
     // A reservation may refresh the CPU-side upload comparison bytes. Finish
     // all discovery against the preceding producer before changing them.
-    spans.sort_unstable();
-    spans.dedup();
+    merge_trace_spans(&mut spans);
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let m = guard.as_mut()?;
-    spans.into_iter().all(|(at, bytes)| m.reserve(at, bytes, false)).then_some(())
+    spans.into_iter().all(|(at, bytes)| {
+        if m.reserve(at, bytes, false) { return true; }
+        tracing::error!(address = format_args!("{at:#x}"), bytes, "traversal range unavailable");
+        false
+    }).then_some(())
+}
+
+/// Discovery may reach a BLAS by its header, its published size, and a
+/// containing raw SRV. Reserve their exact union after all header reads.
+/// Low addresses retain each declaration's original buffer provenance.
+fn merge_trace_spans(spans: &mut Vec<(u64, u64)>) {
+    spans.sort_unstable();
+    spans.dedup();
+    let mut count = 0;
+    for i in 0..spans.len() {
+        let (at, size) = spans[i];
+        if let Some((base, length)) = spans[..count].last_mut()
+            && *base >= 1 << 32 && size != 0 && *length != 0
+            && let Some(end) = base.checked_add(*length)
+            && let Some(next_end) = at.checked_add(size)
+            && at <= end
+        {
+            *length = end.max(next_end) - *base;
+        } else {
+            spans[count] = (at, size);
+            count += 1;
+        }
+    }
+    spans.truncate(count);
+}
+
+/// Contiguous face tables are often still CPU-owned. While remaps are held,
+/// prove there is no written arena page, buffer, window or texture in any
+/// alias. Otherwise the ordinary word reader resolves each native producer.
+fn cpu_geometry_words(addresses: &[u64]) -> Option<Vec<u64>> {
+    let &first = addresses.first()?;
+    let end = addresses.last()?.checked_add(8)?;
+    let bytes = usize::try_from(end.checked_sub(first)?).ok()?;
+    if addresses.len() < 8 || bytes > addresses.len().checked_mul(32)? || bytes > 64 * 1024
+        || !addresses.windows(2).all(|pair| pair[0] <= pair[1])
+        || addresses.iter().any(|at| at % 8 != 0)
+    {
+        return None;
+    }
+    let mapping = crate::watch::title_memory_reading_now()?;
+    let backing = crate::inplace::backing(first as usize, bytes);
+    crate::inplace::guarded_view_epoch(first as usize, end as usize, &backing)?;
+    let generation = crate::resource::alias_generation();
+    let page = first & !(PAGE - 1);
+    let pages_end = end.next_multiple_of(PAGE);
+    let ranges = crate::inplace::aliases_of_bytes(page as usize, (pages_end - page) as usize);
+    let guard = MEMORY.try_lock().ok()?;
+    let m = guard.as_ref()?;
+    for &(lo, hi) in &ranges {
+        if (lo as u64 / PAGE..(hi as u64).div_ceil(PAGE)).any(|p| {
+            let owner = m.directory_aliases.get(&p).map_or(p, |a| a.owner);
+            m.gpu_pages.contains(&owner)
+        }) { return None; }
+    }
+    if crate::resource::texture_writer_overlaps(&ranges) || crate::shadow::has_word_producer(&ranges) {
+        return None;
+    }
+    let mut data = vec![0u8; bytes];
+    if !crate::host::read_into(first as *const u8, &mut data)
+        || generation != crate::resource::alias_generation() || crate::shadow::has_word_producer(&ranges)
+    {
+        return None;
+    }
+    drop(guard);
+    drop(mapping);
+    addresses.iter().map(|&at| {
+        let offset = (at - first) as usize;
+        Some(u64::from_le_bytes(data.get(offset..offset + 8)?.try_into().ok()?))
+    }).collect()
+}
+
+/// Resolve the packed headers after preceding producers and before the first
+/// in-place kernel can overwrite them. All source words share one GPU fence.
+fn build_ranges(ranges: &[[u64; 3]], generation: u64) -> Option<Arc<[[u64; 3]]>> {
+    use crate::bvh::{INPUT, OUTPUT, PACKED_GEOMETRY, PACKED_INPUT, REHYDRATE};
+    const HEADER_OFFSETS: [u64; 5] = [0, 8, 40, 48, 56];
+    let mut addresses = Vec::new();
+    for &[_, source, kind] in ranges {
+        if kind & 255 == REHYDRATE {
+            for offset in HEADER_OFFSETS { addresses.push(source.checked_add(offset)?); }
+        }
+    }
+    let headers = discover_words(&addresses)?;
+    let mut headers = headers.chunks_exact(HEADER_OFFSETS.len());
+    let mut declared = Vec::with_capacity(ranges.len() + headers.len());
+    let stamp = generation << 8;
+    let mut packed_extents = std::collections::HashMap::new();
+    for &[at, len, kind] in ranges {
+        if kind & 255 == PACKED_GEOMETRY {
+            // Winding variants can use the exact same index stream in the
+            // same batch. Discovery precedes this batch's first dispatch.
+            let size = if let Some(&size) = packed_extents.get(&(at, len)) {
+                size
+            } else {
+                let size = crate::bvh::packed_index_extent(at, len, |addresses| {
+                    cpu_geometry_words(addresses).or_else(|| discover_words(addresses))
+                }).or_else(|| {
+                    tracing::error!(address=format_args!("{at:#x}"), indices=len, "invalid packed BVH index stream at submission");
+                    None
+                })?;
+                packed_extents.insert((at, len), size);
+                size
+            };
+            declared.push([at, size, stamp | INPUT]);
+            continue;
+        }
+        if kind & 255 != REHYDRATE {
+            declared.push([at, len, stamp | (kind & 255)]);
+            continue;
+        }
+        let mut header = [0u8; 64];
+        for (offset, &word) in HEADER_OFFSETS.into_iter().zip(headers.next()?) {
+            let offset = offset as usize;
+            header[offset..offset + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        let (input, output) = crate::bvh::rehydration_extents(&header, at == len).or_else(|| {
+            tracing::error!(source = format_args!("{len:#x}"), header = ?&header[..8], "invalid packed BVH header at submission");
+            None
+        })?;
+        declared.extend([[len, input, stamp | PACKED_INPUT], [at, output, stamp | OUTPUT]]);
+    }
+    Some(declared.into())
 }
 
 /// A recording can be submitted repeatedly. Assign its output generation
@@ -1666,9 +1802,18 @@ pub(crate) fn begin_build(ranges: &[[u64; 3]]) -> Option<()> {
         if guard.is_none() {
             *guard = Memory::new();
         }
-        guard.as_mut()?.reconcile_aliases();
+        let m = guard.as_mut()?;
+        m.reconcile_aliases();
+        let frame = crate::frame::current();
+        if m.frame != frame {
+            m.frame = frame;
+            m.refused.clear();
+            m.look_again();
+            m.report();
+        }
     }
-    let instances = Arc::new(discover_instances(ranges)?);
+    let declared = build_ranges(ranges, generation)?;
+    let instances = Arc::new(discover_instances(ranges).or_else(|| { tracing::error!(?ranges, "BVH instance graph unreadable"); None })?);
     let mut outputs = Vec::new();
     let mut copies = Vec::new();
     {
@@ -1730,15 +1875,12 @@ pub(crate) fn begin_build(ranges: &[[u64; 3]]) -> Option<()> {
     m.versions.insert(
         key,
         BuildVersion {
+            ranges: declared.clone(),
             generation,
             outputs,
             instances: instances.clone(),
         },
     );
-    let declared: Vec<_> = ranges
-        .iter()
-        .map(|&[at, len, kind]| [at, len, (generation << 8) | (kind & 255)])
-        .collect();
     m.reserve_ranges(&declared, &instances).then_some(())
 }
 
@@ -1986,6 +2128,31 @@ pub(crate) fn ready(
     views: &[ViewSpan],
     indexed: crate::descriptor::host::IndexedSlots,
 ) -> Option<Ready> {
+    let declared = ranges.first().filter(|_| matches!(use_, Use::Builds { .. }))
+        .map(|first| list.builder_inputs(first[2] >> 8, Arc::as_ptr(heap) as usize));
+    match use_ {
+        Use::Reads => {}
+        Use::SizeQuery { destination, .. } => list.guest_write(Some((destination as usize, 8))),
+        Use::Builds { .. } if ranges.is_empty() => list.guest_write(None),
+        Use::Builds { .. } if declared.as_ref().is_some_and(|(_, first)| !first) => {}
+        Use::Builds { .. } => {
+            use crate::bvh::{COMPACT_COPY, COPY_EXTENT, OUTPUT, REHYDRATE, SCRATCH};
+            for &[at, len, stamp] in ranges {
+                match stamp & 255 {
+                    OUTPUT | SCRATCH => list.guest_write(Some((at as usize, len as usize))),
+                    COMPACT_COPY | REHYDRATE => {
+                        // These declarations carry a source VA. The final byte
+                        // count is resolved in submission order.
+                        let extent = ranges.iter().find(|r| r[0] == at && r[2] & 255 == COPY_EXTENT)
+                            .map(|r| r[1]).or_else(|| crate::shadow::in_buffer(at, 1)
+                                .and_then(|(base, bytes)| bytes.checked_sub(at - base)));
+                        list.guest_write(extent.map(|bytes| (at as usize, bytes as usize)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Memory::new();
@@ -2013,7 +2180,6 @@ pub(crate) fn ready(
                 }
             }
         }
-        let spans = ranges.to_vec();
         let heap = heap.clone();
         let fixed = views.to_vec();
         let mut pointers = addresses.to_vec();
@@ -2026,7 +2192,34 @@ pub(crate) fn ready(
         }
         pointers.sort_unstable();
         pointers.dedup();
-        list.defer_builder(move || {
+        if let Some((inputs, first_stage)) = declared {
+            let key = ranges[0][2] >> 8;
+            inputs.lock().unwrap_or_else(|e| e.into_inner()).extend(
+                pointers.into_iter().filter(|at| (1 << 32..1 << 37).contains(at))
+            );
+            if first_stage {
+                list.defer_builder(move || {
+                    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+                    let m = guard.as_mut()?;
+                    // begin_build has already validated and reserved the full
+                    // producer generation. In-place rehydration must upload the
+                    // packed input once, before the first kernel overwrites it.
+                    m.versions.get(&key)?;
+                    for &at in inputs.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                        if let Some(base) = m.structure_at(at) {
+                            if !m.reserve(at, m.structures[&base].size, false) { return None; }
+                        } else {
+                            m.ready(at, 1);
+                        }
+                    }
+                    m.descriptors(&heap)?;
+                    Some(std::iter::once(m.directory.1.clone()).chain(m.copies.iter().cloned()).collect())
+                });
+            }
+            return Some(ready);
+        }
+        let spans = ranges.to_vec();
+        list.defer_builder(move || (|| {
             let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
             let m = guard.as_mut()?;
             m.reconcile_aliases();
@@ -2039,11 +2232,7 @@ pub(crate) fn ready(
             }
             if let Some(first) = spans.first() {
                 let version = m.versions.get(&(first[2] >> 8))?;
-                let (generation, instances) = (version.generation, version.instances.clone());
-                let versioned: Vec<_> = spans
-                    .iter()
-                    .map(|&[at, len, stamp]| [at, len, (generation << 8) | (stamp & 255)])
-                    .collect();
+                let (versioned, instances) = (version.ranges.clone(), version.instances.clone());
                 if !m.reserve_ranges(&versioned, &instances) {
                     return None;
                 }
@@ -2076,10 +2265,11 @@ pub(crate) fn ready(
                     };
                     views.push(ViewSpan { at, bytes });
                 }
-                reserve_trace_views(views)?;
+                let count = views.len();
+                reserve_trace_views(views).or_else(|| { tracing::error!(count, "could not reserve traversal views"); None })?;
                 guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
             } else if let Use::SizeQuery { source, destination } = use_ {
-                let source_base = m.structure_at(source)?;
+                let source_base = m.structure_at(source).or_else(|| { tracing::error!(?use_, "BVH size query has no producer"); None })?;
                 if !m.published_range(source_base) || !m.reserve(source, m.structures[&source_base].size, false)
                     || !m.reserve(destination, 8, true) {
                     return None;
@@ -2106,7 +2296,7 @@ pub(crate) fn ready(
                     .chain(m.copies.iter().cloned())
                     .collect(),
             )
-        });
+        })().or_else(|| { tracing::error!(?use_, ?spans, ?pointers, "could not bind BVH address directory"); None }));
         return Some(ready);
     }
     let frame = crate::frame::current();
@@ -2461,6 +2651,30 @@ mod dump {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn traversal_reserves_the_exact_union_and_keeps_low_buffer_provenance() {
+        let high = 1 << 36;
+        let mut spans = vec![(high+64, 8), (high, 16), (high+4, 20), (high+24, 4),
+            (high+64, 8), (1024, 8), (1028, 8)];
+        merge_trace_spans(&mut spans);
+        assert_eq!(spans, vec![(1024,8), (1028,8), (high,28), (high+64,8)]);
+    }
+
+    #[test]
+    fn in_place_rehydration_retains_its_original_extents_for_later_kernels() {
+        let mut words = [0u64; 8];
+        words[0] = (3u64 << 32) | 0x0100_0006;
+        let address = words.as_ptr() as u64;
+        let declared = build_ranges(&[[address, address, crate::bvh::REHYDRATE]], 9).unwrap();
+        words[0] &= !(1 << 24);
+        assert_eq!(crate::bvh::rehydration_extents(&crate::bvh::read(address).unwrap(), true), None);
+        assert_eq!(&*declared, &[
+            [address, 256, (9 << 8) | crate::bvh::PACKED_INPUT],
+            [address, 256, (9 << 8) | crate::bvh::OUTPUT],
+        ]);
+        std::hint::black_box(words);
+    }
 
     #[test]
     fn a_piece_takes_what_changed() {

@@ -35,6 +35,9 @@ pub(crate) struct Shadow {
     /// The bytes of `buffer`, once asked.
     width: std::sync::OnceLock<u64>,
     pub(crate) buffer: ID3D12Resource,
+    /// Native byte offset of the first guest byte. The mapped pointer and
+    /// GPU VA below already point at that first guest byte.
+    first_byte: u64,
     data: *mut u8,
     gpu: u64,
     /// Where the title buffer starts and how long it is.
@@ -91,6 +94,8 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// A by-address arena, with the shader side in local or shared memory.
+    address_arena_local: Option<bool>,
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: std::sync::atomic::AtomicBool,
@@ -104,10 +109,8 @@ pub(crate) struct Shadow {
     source: Option<Arc<Shadow>>,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
-    /// the title's own bytes and nothing is copied either way. The heap,
-    /// and the bytes from the buffer's first byte to `start` (the heap
-    /// begins on a 64 KiB line; a title buffer need not).
-    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// the title's own bytes and nothing is copied either way.
+    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, bool)>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -175,11 +178,11 @@ pub(crate) fn cards() -> bool {
 /// Default `(min_mb, max_mb)` for [`card_limits`] chosen from the adapter's
 /// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
 ///
-/// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8–12 GB cards, whose WDDM
+/// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8-12 GB cards, whose WDDM
 ///   budget is below 12 GiB): `(16, 512)` MiB, matching the 12 GB baseline.
 /// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
-///   ~13.5–15.2 GiB): `(4, 2048)` MiB.
-/// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
+///   ~13.5-15.2 GiB): `(4, 2048)` MiB.
+/// - `>= 20 GiB` (24-32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
 ///   capping at 25% of local budget (at most 8 GiB) so "before" twins (up to 2x)
 ///   still leave headroom for textures and render targets.
 fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
@@ -258,6 +261,10 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Bytes of title-memory-by-address (RT BVH) arenas placed in local VRAM.
 static BY_ADDRESS_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes alive outside registered buffers, by loose window, copied view, or by-address arena.
+#[cfg(feature = "diagnostics")]
+pub(crate) static EXTRA_COPY_BYTES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Local-VRAM buffer breakdown for the HUD: `[card_buffers_and_windows, bvh_arenas]`.
 pub(crate) fn vram_breakdown() -> [u64; 2] {
@@ -637,7 +644,7 @@ impl SentRuns {
 /// that send knows the card did not hold these bytes yet
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
-pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+pub(crate) fn card_dirty(sent_as: u64, sampled: Option<&crate::descriptor::index_words::DeviceBytes>) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let mut out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
@@ -651,7 +658,19 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             .filter(|c| c.touched.swap(false, Ordering::AcqRel))
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = joined(std::mem::take(&mut *dirty));
+                let mut ranges = joined(std::mem::take(&mut *dirty));
+                if let Some(sampled) = sampled {
+                    let base = shadow.start as usize;
+                    let held: Vec<_> = sampled.range((shadow.id, 0, 0)..=(shadow.id, usize::MAX, usize::MAX))
+                        .map(|(&(_, at, n), _)| (at - base, at - base + n)).collect();
+                    // The selector bytes were uploaded and fenced before observing
+                    // the heap. Later staging writes to those same bytes belong
+                    // to the next occurrence. All other dirty intervals still go.
+                    if !held.is_empty() {
+                        ranges = hold_selector_bytes(ranges, &joined(held), &mut dirty);
+                        if !dirty.is_empty() { c.touched.store(true, Ordering::Release); }
+                    }
+                }
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.forget(fetched);
@@ -666,6 +685,30 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         true
     });
     out
+}
+
+/// Split sorted dirty spans at the compact selector words this occurrence
+/// already consumed. Only sent spans are recorded in the relay send journal.
+fn hold_selector_bytes(ranges: Vec<(usize, usize)>, held: &[(usize, usize)], pending: &mut Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let mut ready = Vec::new();
+    for (mut lo, hi) in ranges {
+        let first = held.partition_point(|r| r.1 <= lo);
+        for &(a, b) in held[first..].iter().take_while(|r| r.0 < hi) {
+            if lo < a { ready.push((lo, a)); }
+            pending.push((lo.max(a), hi.min(b)));
+            lo = hi.min(b);
+        }
+        if lo < hi { ready.push((lo, hi)); }
+    }
+    ready
+}
+
+#[test]
+fn selector_words_keep_only_their_later_staging_updates_pending() {
+    let mut pending = Vec::new();
+    let ready = hold_selector_bytes(vec![(1, 9), (20, 40)], &[(0, 4), (6, 22), (32, 36)], &mut pending);
+    assert_eq!(ready, [(4, 6), (22, 32), (36, 40)]);
+    assert_eq!(pending, [(1, 4), (6, 9), (20, 22), (32, 36)]);
 }
 
 /// Diagnostics (`crate::host::upcheck`, nothing in the air): copies whose
@@ -2656,7 +2699,7 @@ mod merge_tests {
 
 /// Host copies alive (also those only a list, a descriptor pass or a
 /// snapshot still holds) and the bytes of title memory they copy.
-static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+pub(crate) static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 impl Drop for Shadow {
     fn drop(&mut self) {
@@ -2667,6 +2710,17 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        if self.address_arena_local == Some(true) {
+            BY_ADDRESS_CARD_BYTES.fetch_sub(self.len, Ordering::Relaxed);
+        }
+        #[cfg(feature = "diagnostics")]
+        if self.address_arena_local.is_some() {
+            EXTRA_COPY_BYTES[2].fetch_sub(self.len, Ordering::Relaxed);
+        } else if self.window {
+            EXTRA_COPY_BYTES[0].fetch_sub(self.len, Ordering::Relaxed);
+        } else if self.source.is_some() {
+            EXTRA_COPY_BYTES[1].fetch_sub(self.len, Ordering::Relaxed);
+        }
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -3178,9 +3232,48 @@ impl Shadow {
         self.place.is_some()
     }
 
+    /// Whether a shared selector buffer still reads these exact guest pages.
+    /// The caller holds the mapping read guard and retains this shadow.
+    pub(crate) fn shares_guest_pages(&self, address: usize, len: usize) -> bool {
+        match &self.place {
+            // Windows holds these private pages at their original VA while
+            // the heap opened directly on the allocation remains alive.
+            Some((_, true)) => crate::inplace::cover(address, len) == crate::inplace::Cover::None
+                && crate::inplace::private_whole(address, len),
+            Some((heap, false)) => crate::port::reads_guest_pages(heap, address, len),
+            None => false,
+        }
+    }
+
+    /// Compare a selection word against the shader's actual CPU-visible native
+    /// buffer after the submission thread has drained all prior writers. A
+    /// carded shadow maps a separate staging side and cannot supply this proof.
+    pub(crate) fn matches_native_bytes(&self, address: usize, bytes: &[u8]) -> bool {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RANGE;
+        if self.carded() || self.in_place() || self.ordered_source() { return false; }
+        let Some(relative) = self.offset_in(address as u64) else { return false };
+        if bytes.len() as u64 > self.len - relative { return false; }
+        let begin = (self.first_byte + relative) as usize;
+        let Some(end) = begin.checked_add(bytes.len()).filter(|&end| end as u64 <= self.width()) else { return false };
+        let range = D3D12_RANGE { Begin: begin, End: end };
+        let mut data = std::ptr::null_mut();
+        // SAFETY: buffer is held live, the checked range lies in subresource 0,
+        // and the successful extra map is balanced without declaring any writes.
+        unsafe {
+            if self.buffer.Map(0, Some(&range), Some(&mut data)).is_err() { return false; }
+            let mut small = [0u8; 8];
+            let mut large;
+            let native = if bytes.len() <= small.len() { &mut small[..bytes.len()] }
+                else { large = vec![0; bytes.len()]; &mut large[..] };
+            let read = !data.is_null() && crate::host::read_into(data.cast::<u8>().add(begin), native);
+            self.buffer.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+            read && native == bytes
+        }
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
-        address - self.start + self.place.as_ref().map_or(0, |place| place.1)
+        address - self.start + self.first_byte
     }
 
     /// Title memory `[start, start + len)` in place: `placed` is a buffer
@@ -3196,7 +3289,8 @@ impl Shadow {
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
-        shadow.place = Some((placed.heap, placed.bias));
+        shadow.first_byte = placed.bias;
+        shadow.place = Some((placed.heap, placed.private));
         shadow
     }
 
@@ -3215,6 +3309,13 @@ impl Shadow {
         self.source
             .as_ref()
             .is_some_and(|s| s.written() || s.in_place())
+    }
+
+    /// A shader can also write through a raw GPU address without declaring
+    /// a UAV range. Such a buffer preserves stores across ordinary refreshes.
+    pub(crate) fn selector_ownership(&self) -> (bool, bool, bool) {
+        let writable = |s: &Shadow| s.written() || s.changes_only.load(Ordering::Relaxed);
+        (self.in_place(), writable(self), self.source.as_ref().is_some_and(|s| writable(s) || s.in_place()))
     }
 
     /// Explicit SRV reads can follow a store to the canonical allocation
@@ -3245,6 +3346,7 @@ impl Shadow {
             landing: Default::default(),
             width: Default::default(),
             buffer,
+            first_byte: 0,
             data,
             gpu,
             start,
@@ -3267,12 +3369,24 @@ impl Shadow {
             },
             card: None,
             window: false,
+            address_arena_local: None,
             changes_only: Default::default(),
             raw_pages: Default::default(),
             mapped: false,
             source: None,
             place: None,
         }
+    }
+
+    /// Preserve guest dword lanes in a copied address wrapper. The native
+    /// prefix is private padding. All guest spans and CPU copies still
+    /// begin at the registered address.
+    fn set_copy_prefix(&mut self, bytes: u64) {
+        debug_assert_eq!(bytes, self.start & 3);
+        self.first_byte = bytes;
+        self.gpu += bytes;
+        // SAFETY: the caller allocated room for the prefix plus `len`.
+        self.data = unsafe { self.data.add(bytes as usize) };
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -3298,6 +3412,7 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            list.guest_write(Some((address as usize, len.min(self.left(address)) as usize)));
             return;
         }
         self.written.store(true, Ordering::Relaxed);
@@ -4958,6 +5073,48 @@ mod land_tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+    #[test]
+    fn skewed_buffer_preserves_byte_lanes_and_guest_copy_bounds() {
+        let Some(host) = crate::host::host() else { return };
+        #[repr(align(4))]
+        struct Guest([u8; 32]);
+        for prefix in 1..=3_usize {
+            let mut guest = Guest([0x17; 32]);
+            let start = guest.0.as_mut_ptr() as usize + prefix;
+            let len = 16;
+            let (buffer, data) = host.shared_buffer(32).expect("mapped test buffer");
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let mut shadow = Shadow::new(buffer, data, gpu, start as u64, len as u64);
+            shadow.set_copy_prefix(prefix as u64);
+            let native = || unsafe { std::slice::from_raw_parts_mut(data, 32) };
+            native().fill(0x33);
+            assert_eq!(shadow.span(), (start as u64, len as u64));
+            assert_eq!(shadow.offset_in((start - 1) as u64), None);
+            assert_eq!(shadow.offset_in((start + len) as u64), None);
+            for i in 0..len {
+                let va = (start + i) as u64;
+                assert_eq!(shadow.offset(va) & 3, va & 3);
+                assert_eq!(shadow.gpu(va), gpu + shadow.offset(va));
+            }
+            assert_eq!(shadow.copy(start - 1, start + len + 1), len);
+            assert!(native()[..prefix].iter().all(|&b| b == 0x33));
+            assert!(native()[prefix..prefix + len].iter().all(|&b| b == 0x17));
+            assert!(native()[prefix + len..].iter().all(|&b| b == 0x33));
+            assert!(shadow.matches_native_bytes(start + 3, &[0x17; 4]));
+            assert!(!shadow.matches_native_bytes(start + 3, &[0x33; 4]));
+            assert!(!shadow.matches_native_bytes(start + len - 1, &[0x17; 4]));
+            shadow.writing(start - 1, len + 2);
+            // Submission takes deferred snapshots before the GPU can write.
+            super::take_snapshots();
+            native().fill(0x44);
+            shadow.copy_back(start - 1, len + 2);
+            shadow.copy_back_done(&[(start - 1, start + len + 1)]);
+            assert!(guest.0[..prefix].iter().all(|&b| b == 0x17));
+            assert!(guest.0[prefix..prefix + len].iter().all(|&b| b == 0x44));
+            assert!(guest.0[prefix + len..].iter().all(|&b| b == 0x17));
+        }
+    }
+
     /// A copy in the card's memory of title memory at `title` (its card side
     /// is never looked at here), all bytes 0 on the CPU's side.
     fn copy_of(title: usize, len: usize) -> Option<Shadow> {
@@ -5292,6 +5449,7 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
+#[track_caller]
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
 }
@@ -5312,6 +5470,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// (and copied) anew. Run 71, on a 256 KiB grid: 350 MB copied per frame
 /// against 120 MB, 7,087 write-watch askings against 2,600, and 5,263
 /// windows (4.5 GB) let go in two minutes against 393 in a whole run.
+#[track_caller]
 pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // With whole windows (the default) there is one window to a cell and
     // nothing to choose: exactly `find`.
@@ -5327,6 +5486,49 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     containing_buffer(&buffers_read(), address, end).and_then(|(_, e)| e.shadow.clone())
 }
 
+/// A packed geometry span may cross several nested buffers and loose windows.
+/// Check every intersection before reading its CPU publication in one piece.
+pub(crate) fn has_word_producer(ranges: &[(usize, usize)]) -> bool {
+    let writable = |s: &Shadow| s.selector_ownership() != (false, false, false);
+    {
+        let buffers = buffers_read();
+        let longest = LARGEST_BUFFER.load(Ordering::Relaxed);
+        for &(lo, hi) in ranges {
+            let first = (lo as u64).saturating_sub(longest);
+            if buffers.range((first, 0)..(hi as u64, 0)).any(|(_, e)| {
+                e.end > lo as u64 && e.shadow.as_deref().is_some_and(writable)
+            }) {
+                return true;
+            }
+        }
+    }
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    ranges.iter().any(|&(lo, hi)| {
+        loose.range(..(hi as u64, 0)).any(|(&(at, len), shadow)| {
+            at + len > lo as u64 && writable(shadow)
+        })
+    })
+}
+
+/// Inspect a root binding for diagnostics without creating or touching a copy.
+/// An unsized root can use a different loose window than a sized constant view.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    if let Some((_, entry)) = containing_buffer(&buffers_read(), address, end) {
+        return entry.shadow.clone();
+    }
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    let key = if len <= 1 && tails() {
+        let (cell, _) = window_of(address, end, WINDOW);
+        longest_tail(loose.range((cell, 0)..=(address, u64::MAX)).map(|(k, _)| *k), address, end)?
+    } else {
+        window_of(address, end, if len <= 1 { WINDOW } else { window() })
+    };
+    loose.get(&key).cloned()
+}
+
+#[track_caller]
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
@@ -5363,7 +5565,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let size = len.next_multiple_of(1 << 16);
+        let prefix = key.0 & 3;
+        let size = len.checked_add(prefix)?.checked_next_multiple_of(1 << 16)?;
         // In place, if asked for and the memory can be opened
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
@@ -5381,6 +5584,15 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+        if prefix != 0 {
+            // The split staging/card path tracks offsets from guest byte zero.
+            // Keep one writable allocation when the native origin is skewed.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+            shadow.set_copy_prefix(prefix);
+            entry.shadow = Some(Arc::new(shadow));
+            return entry.shadow.clone();
+        }
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
         let (buffer, card) = match card_for(size) {
@@ -5433,22 +5645,14 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 /// the title's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
 /// A window nothing names any more is let go ([`let_go_idle`]).
-/// shortcut: a window is 4 MiB however little of it is read (the memory
-/// line says how much was ever asked for, and how much was ever copied);
-/// [`window`] cuts the windows of asks that give a length on a finer grid.
+/// An unsized root view needs room beyond its address. Sized views use
+/// the allocation grid returned by [`window`].
 const WINDOW: u64 = 4 << 20;
 
-/// The grid the windows of asks with a length are cut on, in bytes: 4 MiB
-/// unless `VICTORY_WINDOW_KB` names a smaller power of two (64 at least).
-/// A window is the PC's memory, all of it, however little of it is read:
-/// 803 windows held 3.3 GB in run 60's gameplay, and all that was ever
-/// asked for in them lay within 1.6 GB. On a grid of 1 MiB or 256 KiB a
-/// window ends nearer to what is read. An ask without a length keeps the
-/// 4 MiB grid whatever is set: a root view reads from its address to its
-/// window's end, and mesh streams bound that way reach megabytes.
-/// shortcut: the default stays 4 MiB until a run with the memory line's
-/// window counts has shown what the finer grids give; the same memory
-/// asked for with different ranges then lies in more than one window.
+/// Use one 64 KiB host allocation unit for sized views. A descriptor
+/// can keep its window for the lifetime of the scene, even if it reads
+/// just a few bytes. The grid changes the rounding, never the extent
+/// the caller requested. `VICTORY_WINDOW_KB` overrides it.
 fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
@@ -5458,9 +5662,10 @@ fn window() -> u64 {
 }
 
 /// The window grid in bytes for a setting in KiB: a power of two from
-/// 64 KiB to 4 MiB, 4 MiB for anything else.
+/// 64 KiB to 4 MiB. Preserve the legacy fallback for an invalid override.
 fn grid(kb: Option<u64>) -> u64 {
     match kb {
+        None => 64 << 10,
         Some(kb) if kb.is_power_of_two() && (64..=4096).contains(&kb) => kb << 10,
         _ => WINDOW,
     }
@@ -5619,29 +5824,26 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     // `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past
     // that the side shaders see is in the PC's memory.
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static USED: AtomicU64 = AtomicU64::new(0);
     let most = *MOST.get_or_init(|| {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         mb.unwrap_or(4096) << 20
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
-    let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
+    let on_card = if room && BY_ADDRESS_CARD_BYTES.fetch_add(len, Ordering::Relaxed) + len <= most {
         host.uav_buffer(len).or_else(|| {
-            USED.fetch_sub(len, Ordering::Relaxed);
+            BY_ADDRESS_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
             None
         })
     } else {
         if room {
-            USED.fetch_sub(len, Ordering::Relaxed);
+            BY_ADDRESS_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
         }
         None
     };
+    let local = on_card.is_some();
     let buffer = match on_card {
-        Some(buffer) => {
-            BY_ADDRESS_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
-            buffer
-        }
+        Some(buffer) => buffer,
         None => host.shared_buffer(len)?.0,
     };
     crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
@@ -5652,6 +5854,9 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
+    shadow.address_arena_local = Some(local);
+    #[cfg(feature = "diagnostics")]
+    EXTRA_COPY_BYTES[2].fetch_add(len, Ordering::Relaxed);
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
         staging,
@@ -5669,6 +5874,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
+#[track_caller]
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
@@ -5729,13 +5935,15 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         let mut shadow = Shadow::new(buffer, data, gpu, start, len);
         shadow.window = true;
+        #[cfg(feature = "diagnostics")]
+        EXTRA_COPY_BYTES[0].fetch_add(len, Ordering::Relaxed);
         shadow.mapped = true;
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    let (buffer, data) = host()?.window_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
     // buffer there, and the one just made is the CPU's side.
@@ -5759,10 +5967,13 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     tracing::debug!(
         start = format_args!("{start:#x}"),
         len,
+        unsized_ask, requested = end - address, caller = %std::panic::Location::caller(),
         "loose memory copied to the host"
     );
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
+    #[cfg(feature = "diagnostics")]
+    EXTRA_COPY_BYTES[0].fetch_add(len, Ordering::Relaxed);
     shadow.card = card;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
@@ -5910,6 +6121,8 @@ pub(crate) fn exact(source: &Arc<Shadow>, address: u64, len: u64) -> Option<Arc<
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut shadow = Shadow::new(buffer, data, gpu, address, len);
     shadow.source = Some(source.clone());
+    #[cfg(feature = "diagnostics")]
+    EXTRA_COPY_BYTES[1].fetch_add(len, Ordering::Relaxed);
     let shadow = Arc::new(shadow);
     map.insert((source.id(), address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
@@ -5975,13 +6188,13 @@ mod window_tests {
         assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
         assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
 
-        // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
+        // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5-15 GiB.
         assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));
         assert_eq!(default_card_limits_mb(Some(14 * GIB)), (4, 2048));
         assert_eq!(default_card_limits_mb(Some(15 * GIB)), (4, 2048));
         assert_eq!(default_card_limits_mb(Some(16 * GIB)), (4, 2048));
 
-        // 24–32+ GB tier (>= 20 GiB): 1 MiB min, 25% of budget capped at 8192 MiB.
+        // 24-32+ GB tier (>= 20 GiB): 1 MiB min, 25% of budget capped at 8192 MiB.
         assert_eq!(default_card_limits_mb(Some(20 * GIB)), (1, 5120));
         assert_eq!(default_card_limits_mb(Some(24 * GIB)), (1, 6144));
         assert_eq!(default_card_limits_mb(Some(32 * GIB)), (1, 8192));
@@ -6063,11 +6276,11 @@ mod window_tests {
         assert_eq!(longest_tail(with_whole.into_iter(), ask, ask + 1), Some((cell, WINDOW)));
     }
 
-    /// The setting takes powers of two from 64 KiB to 4 MiB; anything else
-    /// leaves the grid as it was.
+    /// Sized asks default to one allocation unit. Explicit overrides retain
+    /// the accepted powers of two and the fallback for invalid values.
     #[test]
     fn the_grid_is_a_power_of_two_or_the_default() {
-        assert_eq!(grid(None), WINDOW);
+        assert_eq!(grid(None), 64 << 10);
         assert_eq!(grid(Some(4096)), WINDOW);
         assert_eq!(grid(Some(1024)), 1 << 20);
         assert_eq!(grid(Some(256)), 256 << 10);
@@ -6077,8 +6290,7 @@ mod window_tests {
         }
     }
 
-    /// A window holds its ask and is cut on the grid; on the default grid
-    /// it is the window there always was.
+    /// A window holds its whole ask on either the fine or legacy grid.
     #[test]
     fn windows_hold_their_ask_on_the_grid() {
         let (address, end) = (0xd_1234_5678u64, 0xd_1234_5678u64 + 0x9000);

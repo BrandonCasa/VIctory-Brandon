@@ -180,6 +180,9 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
+    if !at.is_null() && kind & MEM_RESERVE_PLACEHOLDER != 0 && kind & MEM_REPLACE_PLACEHOLDER == 0 {
+        victory_gpu::title_placeholder_reserved(at as usize, size);
+    }
     // (Grand Theft Auto VI asks for its 32-bit heap with kind 0x42000,
     // without the 64 KiB page bits: not `placeholder` above, though the host
     // makes a placeholder of it all the same.)
@@ -1478,39 +1481,52 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 
 /// [`map_alias`] of many ranges, in order.
 pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
+    capture_aliases(ranges).is_some_and(|apply| apply())
+}
+
+/// Resolve the title's CPU pool views before it can recycle them after the
+/// queue call. The captured section references keep the original physical
+/// pages alive; copying their contents here would lose subsequent writes.
+pub fn capture_aliases(ranges: &[(u64, u64, u64)]) -> Option<victory_gpu::resource::PageMappings> {
+    let current = physical();
+    let mut captured = Vec::new();
+    let mut destinations = HashMap::new();
+    for &(to, from, len) in ranges {
+        if (to | from | len) % PAGE as u64 != 0 { return None; }
+        to.checked_add(len)?;
+        from.checked_add(len)?;
+        for offset in (0..len as usize).step_by(PAGE) {
+            let dest = to as usize + offset;
+            let source = from as usize + offset;
+            let slice = if from == 0 {
+                None
+            } else if let Some(&earlier) = destinations.get(&source) {
+                let earlier: &Op = captured.get(earlier)?;
+                Some(earlier.slice.clone()?)
+            } else {
+                Some(current.slice_at(source)?)
+            };
+            destinations.insert(dest, captured.len());
+            captured.push(Op::new(dest, slice));
+        }
+    }
+    drop(current);
+    victory_gpu::title_gpu_mapping_ranges(ranges);
+    Some(Box::new(move || apply_aliases(captured)))
+}
+
+fn apply_aliases(pages: Vec<Op>) -> bool {
     let _costed = Costed::begin(None);
     lift_thread();
-    if side_by_side() <= 1 {
-        return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
-    }
-    // By the page: the address, and the one whose page it is to show.
-    let pages: Vec<(usize, Option<usize>)> = ranges
-        .iter()
-        .flat_map(|&(to, from, len)| {
-            (0..len as usize).step_by(PAGE).map(move |k| (to as usize + k, (from != 0).then_some(from as usize + k)))
-        })
-        .collect();
-    if pages.iter().any(|p| p.0 % PAGE != 0 || p.1.is_some_and(|from| from % PAGE != 0)) {
-        return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
-    }
     let mut ok = true;
-    let mut at = 0;
-    while at < pages.len() {
+    let mut pages = pages.into_iter().peekable();
+    while pages.peek().is_some() {
         let _busy = Busy::begin();
         let mut physical = physical();
         let mut ops: Vec<Op> = Vec::new();
         let mut touched = std::collections::HashSet::new();
-        for &(to, from) in &pages[at..] {
-            // A page the group changes already, or one it would be mapped
-            // from: after it.
-            if ops.len() == GROUP || touched.contains(&to) || from.is_some_and(|from| touched.contains(&from)) {
-                break;
-            }
-            let slice = from.map(|from| physical.slice_at(from));
-            ok &= !matches!(slice, Some(None));
-            touched.insert(to);
-            ops.push(Op::new(to, slice.flatten()));
-            at += 1;
+        while ops.len() < GROUP && let Some(op) = pages.next_if(|op| touched.insert(op.at)) {
+            ops.push(op);
         }
         let _changing = victory_gpu::title_memory_remapping();
         ok &= change(&mut physical, ops);
@@ -2151,6 +2167,12 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::title_memory_freed(address as usize, size);
+        if kind & MEM_RELEASE != 0 {
+            return victory_gpu::release_title_placeholder(address as usize, size, || {
+                // SAFETY: the title's own arguments.
+                unsafe { VirtualFree(address, size, kind) != 0 }
+            }).into();
+        }
     }
     // SAFETY: the title's own arguments.
     unsafe { VirtualFree(address, size, kind) }
@@ -2542,6 +2564,16 @@ mod tests {
                 first(N + k).write(5);
                 assert_eq!(first(k).read(), 5);
             }
+        }
+        // The title can recycle its pool address before the GPU reaches the
+        // mapping command. Its destination must still show the captured page.
+        let pending = capture_aliases(&[(to, from, PAGE as u64)]).unwrap();
+        assert_eq!(XMemMapPhysicalPages(at(0), 1, pages.as_ptr()), at(0));
+        // SAFETY: both addresses are mapped by the operations above.
+        unsafe {
+            first(0).write(123);
+            assert!(pending());
+            assert_eq!(first(N).read(), 5);
         }
         // An address twice: the last one counts; page 0 unmaps.
         let to = [at(0), at(1), at(0), at(2), at(3), at(0)];

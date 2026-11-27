@@ -49,36 +49,24 @@ pub(crate) fn note(kind: Kind, since: u64) {
     SUMS[kind as usize].fetch_add(ms, Relaxed);
 }
 
-/// Textures viewed from a level other than 0 so far: since when, and from
-/// which level.
-static PARTLY: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
-
-/// A view of placed texture `texture` from level `first` is made.
-pub(crate) fn viewed(texture: usize, first: u32) {
-    let mut partly = PARTLY.lock().unwrap_or_else(|e| e.into_inner());
-    let partly = partly.get_or_insert_with(std::collections::HashMap::new);
+/// Keep the interval on its resource so recording workers handling unrelated
+/// textures do not serialize on a global timing table.
+pub(crate) fn viewed(timer: &std::sync::OnceLock<std::sync::Arc<AtomicU64>>, first: u32) {
     if first == 0 {
-        if let Some(since) = partly.remove(&texture) {
-            note(Kind::Full, since);
+        if let Some(timer) = timer.get() { whole(timer); }
+    } else {
+        let timer = timer.get_or_init(Default::default);
+        if timer.load(Relaxed) == 0 {
+            let _ = timer.compare_exchange(0, crate::host::now_ms().max(1), Relaxed, Relaxed);
         }
-    } else if partly.len() < 1 << 20 {
-        partly.entry(texture).or_insert_with(crate::host::now_ms);
     }
 }
 
 /// Texture `texture`'s larger levels were copied from the store (the list
 /// that did it has been sent): shown whole from now on.
-pub(crate) fn whole(texture: usize) {
-    let since = PARTLY.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|p| p.remove(&texture));
-    if let Some(since) = since {
-        note(Kind::Full, since);
-    }
-}
-
-/// A texture is let go: no longer waited for.
-pub(crate) fn gone(texture: usize) {
-    if let Some(partly) = PARTLY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        partly.remove(&texture);
+pub(crate) fn whole(timer: &AtomicU64) {
+    if timer.load(Relaxed) != 0 {
+        note(Kind::Full, timer.swap(0, Relaxed));
     }
 }
 

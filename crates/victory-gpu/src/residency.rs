@@ -8,8 +8,8 @@
 //! commit to 16 MiB; the texture pass stops below 512 MiB of commit, new
 //! staging blocks for textures picked by index below 1 GiB. With 32 GiB of RAM
 //! or less (or `VICTORY_RESIDENCY_LIMITED=1`) the budgets of a smaller PC.
-//! Off, nothing here changes anything, except that for 500 ms after the card
-//! refused memory (E_OUTOFMEMORY) the texture pass stops ([`upload_refused`]).
+//! Idle system-memory upload heaps follow host commit pressure in either mode.
+//! After an E_OUTOFMEMORY the texture pass also pauses for 500 ms ([`upload_refused`]).
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -30,6 +30,14 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
     let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status)
+}
+
+pub(crate) fn compiler_headroom() -> Option<u64> {
+    memory_status().map(|s| s.ullAvailPageFile.min(s.ullAvailPhys))
+}
+
+pub(crate) fn available_commit_for_compilers() -> u64 {
+    sample_commit(crate::host::coarse_ms())
 }
 
 // The texture sweep may run for seconds inside a single submitted frame.
@@ -176,6 +184,19 @@ pub(crate) fn critical_commit() -> bool {
     }
     let now = crate::host::coarse_ms();
     now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_commit(now) < 1536 * MIB
+}
+
+/// Called by the once-per-second sweep. Upload heaps occupy host commit even
+/// when texture admission and the optional VRAM residency policy are disabled.
+pub(crate) fn idle_staging_spares(normal: usize) -> usize {
+    static TIGHT: AtomicBool = AtomicBool::new(false);
+    let now = crate::host::coarse_ms();
+    let commit = sample_commit(now);
+    let tight = next_pressure(TIGHT.load(Ordering::Relaxed), u64::MAX, commit);
+    TIGHT.store(tight, Ordering::Relaxed);
+    if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || commit < 1536 * MIB { 0 }
+    else if tight || pressured() { normal.min(1) }
+    else { normal }
 }
 
 /// A soft per-frame admission limit. A single texture can cross it. The

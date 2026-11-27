@@ -28,6 +28,78 @@ use windows::Win32::Foundation::CloseHandle;
 use super::*;
 use crate::shadow::Shadow;
 
+/// Sorted guest write intervals for a recording, or None when an operation
+/// can write an unknown address. Call without holding the recording's lock.
+pub(super) fn indexed_write_ranges(list: &HostList) -> Option<Vec<(usize, usize)>> {
+    let d = list.deferred();
+    let mut added = Vec::new();
+    let mut add = |at: usize, bytes: usize| {
+        if bytes != 0 { added.push((at, at.saturating_add(bytes))); }
+    };
+    let mut unknown = d.unbounded_guest_write;
+    for &(at, bytes) in &d.guest_writes { add(at, bytes); }
+    for (_, at, bytes) in &d.declarations { add(*at, *bytes); }
+    for &(at, _, bytes) in &d.writes { add(at, bytes); }
+    for op in &d.copies {
+        match op {
+            Step::Copy(at, _, bytes) => add(*at, *bytes),
+            Step::Placed(p) => add(p.dst, p.len),
+            Step::Run(_) => unknown = true,
+            _ => {}
+        }
+    }
+    for (_, dst, [row, rows, pitch]) in &d.backs {
+        if row == pitch {
+            add(*dst, rows.saturating_mul(*row));
+        } else {
+            for i in 0..*rows { add(dst.saturating_add(i.saturating_mul(*pitch)), *row); }
+        }
+    }
+    for (_, heap, slots) in &d.indexed_heaps {
+        match heap.writable_candidates(slots) {
+            Some(spans) => for span in spans {
+                if let Some(bytes) = span.bytes { add(span.at as usize, bytes as usize); } else { unknown = true; }
+            }
+            None => unknown = true,
+        }
+    }
+    added.extend(d.texture_backs.iter().map(crate::texback::Back::range));
+    added.extend(d.size_results.iter().map(crate::memory::SizeResult::range));
+    if unknown { return None; }
+    let mut ranges = Vec::new();
+    join_ranges(&mut ranges, added);
+    Some(ranges)
+}
+
+/// Test reads against the accumulated write history in native execution order.
+pub(super) fn late_sample_conflict(runs: &[&HostList], samples: &[LateSamples]) -> Option<(usize, usize)> {
+    let last = samples.iter().rposition(|s| !s.uploads.is_empty())?;
+    let mut ranges = Vec::new();
+    let mut unknown = false;
+    for (list, samples) in runs.iter().zip(samples).take(last + 1) {
+        if !unknown {
+            match indexed_write_ranges(list) {
+                Some(more) => merge_coverage(&mut ranges, &more),
+                None => unknown = true,
+            }
+        }
+        for sample in samples.uploads.values() {
+            let (at, len) = sample.upload.memory();
+            if len == 0 { continue; }
+            if unknown || at.checked_add(len).is_none() { return Some((at, len)); }
+            let list_writes = |aliases: &[(usize, usize)]| !ranges.is_empty()
+                && aliases.iter().any(|&(lo, hi)| touches(&ranges, lo, hi));
+            let conflict = match sample.guest_slot {
+                Some(logical) => crate::descriptor::host::late_sample_span_conflict(logical,
+                    sample.upload.resource(), &sample.upload.copy, Some((at, len)), list_writes).is_some(),
+                None => !ranges.is_empty() && list_writes(&crate::inplace::aliases_of_bytes(at, len)),
+            };
+            if conflict { return Some((at, len)); }
+        }
+    }
+    None
+}
+
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_UPCOPY_CHECK").is_some_and(|v| v == "1"))

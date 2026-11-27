@@ -187,10 +187,10 @@ pub(crate) unsafe fn put(to: *mut u8, from: *const u8, n: usize) {
             return;
         }
         if n == 0 || !copies_on() || !crate::watch::guards_any(to as usize, n) || overlap(to as usize, from as usize, n) {
-            std::ptr::copy(from, to, n);
+            crate::descriptor::record_bytes::copy(to, from, n);
             return;
         }
-        in_pieces(to as usize, n, |_, _, _| false, |at, offset, len| std::ptr::copy_nonoverlapping(from.add(offset), at as *mut u8, len));
+        in_pieces(to as usize, n, |_, _, _| false, |at, offset, len| crate::descriptor::record_bytes::copy(at as *mut u8, from.add(offset), len));
     }
 }
 

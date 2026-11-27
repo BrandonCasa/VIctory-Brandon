@@ -122,7 +122,7 @@ pub use lower::{host_settings, host_wave_range, set_host_max_wave, set_host_rdna
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    mapped_views, VIEW_CONSTANT_BOUNDS, FRESH_TABLE_SIZES, MAPPED_DYNAMIC, SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, VIEW_MAPPING, VIEW_MAPPING_BYTES, USER_CBV_BYTES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_PREFIX_SHIFT, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    mapped_views, VIEW_CONSTANT_BOUNDS, FRESH_TABLE_SIZES, MAPPED_DYNAMIC, SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, VIEW_MAPPING, VIEW_MAPPING_BYTES, USER_CBV_BYTES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_PREFIX_SHIFT, VIEW_RAW_RGB32, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -330,12 +330,36 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct IndexedAccess {
     pub opaque: u8,
+    /// DXIL ResourceKind bits of opaque texture loads, separately for SRVs and UAVs.
+    pub texture_kinds: [u32; 2],
     pub offsets: Vec<(crate::resource::HeapOffset, u8)>,
+    /// Texture SRV index read from a statically bound buffer, and its DXIL ResourceKind.
+    pub buffer_indices: Vec<(crate::resource::BufferIndex, u8)>,
+    /// Exact uniform storage-texture slot, DXIL resource kind, and whether it is written.
+    pub uav_indices: Vec<(crate::resource::BufferIndex, u8, bool)>,
+    pub chains: Vec<(crate::resource::MaterialChain, u8)>,
+    pub scalar_records: Vec<(crate::resource::ScalarRecordChain, u8)>,
+    pub pointer_fields: Vec<(crate::resource::PointerField, u8)>,
+    pub scalar_programs: Vec<(Vec<crate::resource::ScalarWordOp>, u8)>,
+    /// Required flat uint semantic/component bounds for pointer_fields.
+    pub input_limits: Vec<(u8,u8,u32)>,
+    /// Proven upper bounds for the mesh producer, keyed like input_limits.
+    pub output_limits: Vec<(u8,u8,u32)>,
 }
+
+/// The indexed buffer UAV is an operand of a store or atomic. UAV reads
+/// and descriptor size queries still require the native UAV (bit 4).
+pub const BUFFER_WRITE_ACCESS: u8 = 64;
+
+/// The indexed texture UAV is an operand of an image store or atomic.
+pub const TEXTURE_WRITE_ACCESS: u8 = 128;
 
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
+    /// Guest root arguments that must be even for a halfword store to fit
+    /// a backing dword. A dword of u32::MAX names the root descriptor VA.
+    pub halfword_aligned_roots: Vec<(u8, u32)>,
     /// Access forms fetched through a computed ResourceHeap index.
     /// Bits 0..4 are CBV, buffer SRV/UAV and texture SRV/UAV.
     pub indexed_forms: IndexedAccess,
@@ -460,7 +484,7 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let res = resource::track_with_used(&p, &native.layout, native.stage, st.as_ref().ok(), &native.used, &native.io)?;
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res)
@@ -559,7 +583,7 @@ pub fn emit(
             p.and_then(|p| {
                 let st = structure::structure(&p).ok()?;
                 let io = io::raise(&p, native).ok()?;
-                let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
+                let res = resource::track_with_used(&p, &native.layout, native.stage, Some(&st), &native.used, &native.io).ok()?;
                 Some((p, st, io, res))
             })
         };
@@ -691,7 +715,7 @@ pub fn emit(
     let p = ir::thread_edges(p, &edges)?;
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let res = resource::track_with_used(&p, &native.layout, native.stage, Some(&st), &native.used, &native.io)?;
     emit_program(c, native, &p, &st, &io, &res).and_then(supported)
 }
 
@@ -746,7 +770,7 @@ fn widen(
             });
         }
         let io = io::raise(p, native)?;
-        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+        let res = resource::track_with_used(p, &native.layout, native.stage, Some(&st), &native.used, &native.io)?;
         lower::take_needs();
         let r = lower::with_cooperative(cooperative, split_wave, || {
             emit_program(c, native, p, &st, &io, &res)
@@ -850,7 +874,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native,
         p,
         st,
@@ -860,8 +884,29 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    };
+    let l = lower::lower(&parts)?;
     let wave_size = l.wave_size;
+    let mut indexed_forms = l.indexed_forms;
+    if native.stage == HwStage::Ms {
+        let mut channels = std::collections::BTreeSet::new();
+        for e in &parts.outputs {
+            if let Some(row) = e.row.and_then(|r|u8::try_from(r).ok()) {
+                for col in e.col..e.col+e.cols {
+                    if linked_uint_semantic(std::slice::from_ref(e),(row,col,0)).is_some() { channels.insert((row,col)); }
+                }
+            }
+        }
+        if !channels.is_empty() {
+            indexed_forms.output_limits = resource::mesh_output_limits(p,native,st,io,&channels).into_iter()
+                .filter_map(|limit| linked_uint_semantic(&parts.outputs,limit)).collect();
+        }
+    }
+    for limit in &mut indexed_forms.input_limits {
+        // 255 is reserved for an unsupported signature. A required producer
+        // must prove the same linked semantic, not merely the same row number.
+        *limit=linked_uint_semantic(&parts.inputs,*limit).unwrap_or((255,0,0));
+    }
     let shader = HostShader {
         stage: native.stage,
         dxil: l.dxil,
@@ -882,10 +927,18 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
-        indexed_forms: l.indexed_forms,
+        halfword_aligned_roots: l.halfword_aligned_roots,
+        indexed_forms,
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
+}
+
+fn linked_uint_semantic(sig:&[container::SigElement],(row,col,max):(u8,u8,u32))->Option<(u8,u8,u32)> {
+    let e=sig.iter().find(|e|e.row==Some(u32::from(row)) && col>=e.col && col<e.col+e.cols)?;
+    if e.half || e.kind!=0 || e.comp!=5 || e.index>126 {return None;}
+    let class=if e.name.eq_ignore_ascii_case("COLOR"){0} else if e.name.eq_ignore_ascii_case("TEXCOORD"){1} else {return None;};
+    Some((e.index as u8*2+class,col-e.col,max))
 }
 
 /// The title's vertex output interpolation lives in PSV0. A float packed
@@ -1753,6 +1806,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            halfword_aligned_roots: Default::default(),
             indexed_forms: Default::default(),
             root_indexed_views: Vec::new(),
         };
@@ -1766,6 +1820,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                halfword_aligned_roots: Default::default(),
                 indexed_forms: Default::default(),
                 root_indexed_views: Vec::new(),
             })
@@ -2376,6 +2431,7 @@ mod tests {
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
+            halfword_aligned_roots: Default::default(),
             indexed_forms: Default::default(),
             root_indexed_views: Vec::new(),
         };
@@ -2512,6 +2568,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                halfword_aligned_roots: Default::default(),
                 indexed_forms: Default::default(),
                 root_indexed_views: Vec::new(),
             };
@@ -2660,6 +2717,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                halfword_aligned_roots: Default::default(),
                 indexed_forms: Default::default(),
                 root_indexed_views: Vec::new(),
             };
@@ -2831,6 +2889,19 @@ mod barycentric_tests {
             usage: 0,
             half: false,
         }
+    }
+
+    #[test]
+    fn linked_limits_match_semantic_index_and_component_across_physical_rows() {
+        let producer = SigElement { comp: 5, index: 2, col: 2, cols: 2, ..element("COLOR", 0, 14) };
+        let consumer = SigElement { row: Some(7), col: 0, ..producer.clone() };
+        let key = super::linked_uint_semantic(&[producer.clone()], (14, 3, 7));
+        assert_eq!(key, Some((4, 1, 7)));
+        assert_eq!(super::linked_uint_semantic(&[consumer], (7, 1, 7)), key);
+        let other = SigElement { name: "TEXCOORD".into(), ..producer.clone() };
+        assert_ne!(super::linked_uint_semantic(&[other], (14, 3, 7)), key);
+        let converted = SigElement { comp: 9, ..producer };
+        assert_eq!(super::linked_uint_semantic(&[converted], (14, 3, 7)), None);
     }
 
     /// Translates a pixel program with the input VGPRs `input_addr`
@@ -3077,6 +3148,7 @@ mod barycentric_tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            halfword_aligned_roots: Default::default(),
             indexed_forms: Default::default(),
             root_indexed_views: Vec::new(),
         };

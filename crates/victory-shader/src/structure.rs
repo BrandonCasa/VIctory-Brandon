@@ -142,6 +142,12 @@ impl Bools {
         vars.into_iter().map(|v| self.atoms[v as usize]).collect()
     }
 
+    pub(crate) fn defined_before(&self, value: Bool, block_order: usize) -> bool {
+        self.vars(value)
+            .into_iter()
+            .all(|v| self.born[v as usize] < block_order)
+    }
+
     fn vars(&self, b: Bool) -> Vec<u32> {
         let (mut seen, mut vars, mut stack) = (Vec::new(), Vec::new(), vec![b]);
         while let Some(b) = stack.pop() {
@@ -446,6 +452,12 @@ pub struct Structured {
 }
 
 impl Structured {
+    /// A wave-wide "any" vote only fixes each lane's bit when the vote is
+    /// false. For an "all" vote, the corresponding edge is the true one.
+    pub(crate) fn edge_fixes_lane_bit(&self, block: usize, taken: bool) -> bool {
+        !self.wide.contains(&block) || self.wave_any[block] == Some(!taken)
+    }
+
     pub(crate) fn mask_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
         match high {
             Some(high) => self.paired_masks.get(&(low, high)),
@@ -464,8 +476,8 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// them: one decision for the whole wave (`s_cbranch_execz` and `vccz`: taken when no lane's
 /// bit is set; `execnz` and `vccnz`: when some lane's is; SCC of a mask operation likewise,
 /// [`Structured::wave_any`]), which every lane follows. A lane
-/// then learns nothing about its own bit from the way it went, so past such a branch EXEC
-/// stays a guard on every vector instruction, as it is on the console. For a console wave
+/// only learns its own bit from a unanimous outcome. On the other edge EXEC
+/// still guards vector instructions, as it does on the console. For a console wave
 /// run as two host waves, which exchange that decision and can then meet (a group barrier)
 /// inside the branch.
 pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Structured, ShaderError> {
@@ -694,8 +706,8 @@ impl<'a> Lanes<'a> {
 
     /// `c` narrowed by the branch at the end of `q` towards one successor.
     fn edge(&mut self, c: Bool, q: usize, taken: bool) -> Bool {
-        if self.wide.contains(&q) {
-            // the wave's decision: it says nothing about this lane's own bit
+        if self.wide.contains(&q) && self.wave_any[q] != Some(!taken) {
+            // One other lane can have decided this outcome by itself.
             return c;
         }
         match self.when[q] {
@@ -1576,6 +1588,26 @@ mod tests {
             Some((Atom::Lane(cmp), Bool::TRUE, Bool::FALSE))
         );
         assert_eq!(guarded(&s), 0, "{:?}", s.guards);
+    }
+
+    #[test]
+    fn a_wave_vote_only_fixes_the_lane_bit_on_its_unanimous_edge() {
+        for (branch, unanimous_taken) in [(0xBF88_0002, true), (0xBF89_0002, false)] {
+            let p = build(&[
+                0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+                branch,      // s_cbranch_execz or s_cbranch_execnz -> 16
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+                0x7E04_0280, // v_mov_b32 v2, 0
+                S_ENDPGM,
+            ], true);
+            let s = structure_wide(&p, &HashSet::from([0])).unwrap();
+            let LaneExit::Branch { when, taken, not_taken } = s.exits[0] else { panic!() };
+            for (edge, block) in [(true, taken), (false, not_taken)] {
+                let can_disagree = s.bools.meet(&[(s.reach[block], true), (when, !edge)]);
+                assert_eq!(can_disagree, edge != unanimous_taken);
+            }
+        }
     }
 
     #[test]

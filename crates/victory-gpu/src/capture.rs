@@ -8,6 +8,25 @@ use std::path::PathBuf;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+/// Tracks a known title wait word across recording and retirement without
+/// capturing every command in the surrounding frames. Both bounds are hex.
+pub(crate) fn value_event(operation: &str, address: u64, value: u64) {
+    static RANGE: std::sync::OnceLock<Option<(std::ops::Range<u64>, u64)>> = std::sync::OnceLock::new();
+    let range = RANGE.get_or_init(|| {
+        let text = std::env::var("VICTORY_TRACE_VALUE_RANGE").ok()?;
+        let (from, to) = text.split_once("..")?;
+        let hex = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+        // Console heaps can be mapped at a different base on every launch.
+        let mask = std::env::var("VICTORY_TRACE_VALUE_MASK").ok().map_or(Some(u64::MAX), |s| hex(&s))?;
+        Some((hex(from)?..hex(to)?, mask))
+    });
+    if range.as_ref().is_some_and(|(range, mask)| range.contains(&(address & mask))) {
+        tracing::info!(frame = crate::queue::presented(), operation,
+            address = format_args!("{address:#x}"), value = format_args!("{value:#x}"),
+            "traced title memory value");
+    }
+}
+
 /// The folder frames go to, if capturing.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();

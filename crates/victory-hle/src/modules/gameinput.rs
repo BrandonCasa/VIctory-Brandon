@@ -1434,15 +1434,17 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
-            if focused() {
-                // Left/right modifier keys only, as devices report them; no
-                // mouse buttons (below 0x08).
-                let held: Vec<u8> = (0x08..=0xFE_u8)
-                    .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
-                    // SAFETY: plain queries.
-                    .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
-                    .collect();
-                down.extend(held);
+            let foreground = foreground_window().is_some();
+            let window_keys = victory_gpu::window_keys::held();
+            // Read global key state only while our window owns input. A window-directed
+            // event belongs to the game and may arrive between foreground transitions.
+            for vk in 0x08..=0xFE_u8 {
+                if !(0x10..=0x12).contains(&vk) && !down.contains(&vk)
+                    && (window_keys[usize::from(vk)]
+                        || (foreground && unsafe { GetAsyncKeyState(i32::from(vk)) } < 0))
+                {
+                    down.push(vk);
+                }
             }
             down.into_iter()
                 .map(|vk| KeyState {
@@ -1637,11 +1639,6 @@ mod host {
             GetWindowThreadProcessId(hwnd, &mut process);
             (process == GetCurrentProcessId()).then_some(hwnd)
         }
-    }
-
-    /// The foreground window is one of ours (the title's or our fallback).
-    fn focused() -> bool {
-        foreground_window().is_some()
     }
 
     /// Recenters the cursor at `(cx, cy)` and reads back its actual screen

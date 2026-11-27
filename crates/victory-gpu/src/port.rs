@@ -82,6 +82,8 @@ pub(crate) fn on() -> bool {
 struct Region {
     start: u64,
     end: u64,
+    section: usize,
+    offset: u64,
     heap: ID3D12Heap,
 }
 
@@ -164,7 +166,7 @@ pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Pl
     let buffer = crate::inplace::place(device, &region.heap, at - region.start, end - at).map_err(|e| (6, format!("no buffer placed in the region: {e}")))?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap: region.heap.clone(), gpu, bias: start - at })
+    Ok(Placed { buffer, heap: region.heap.clone(), private: false, gpu, bias: start - at })
 }
 
 /// Opens the stretch around `[at, end)` (64 KiB aligned) as a heap through
@@ -216,7 +218,7 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
             );
             // shortcut: the view stays mapped for good (the heap holds its
             // pages while anything names it).
-            Ok(Region { start: first, end: first + bytes, heap })
+            Ok(Region { start: first, end: first + bytes, section, offset, heap })
         }
         Err(e) => {
             unmap();
@@ -245,6 +247,18 @@ fn bounds(regions: &[Region]) {
     let hi = regions.iter().map(|r| r.end).max().unwrap_or(0);
     BOUNDS[0].store(lo, Ordering::Relaxed);
     BOUNDS[1].store(hi, Ordering::Relaxed);
+}
+
+/// The live guest section and byte offset must still be the pages used to
+/// create this exact native heap. The caller holds the mapping read guard.
+pub(crate) fn reads_guest_pages(heap: &ID3D12Heap, address: usize, len: usize) -> bool {
+    use windows::core::Interface;
+    let at = address as u64;
+    let regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(region) = regions.iter().find(|r| r.heap.as_raw() == heap.as_raw()
+        && r.start <= at && at.checked_add(len as u64).is_some_and(|end| end <= r.end))
+    else { return false };
+    cover(address, len) == crate::inplace::Cover::Run(region.section, region.offset + (at - region.start))
 }
 
 /// The title maps other pages at `[at, at + len)`: the regions over it are

@@ -2134,6 +2134,19 @@ pub(crate) fn guarded(start: usize, end: usize) -> bool {
     PROTECTED.any(start / BLOCK, end.div_ceil(BLOCK))
 }
 
+/// Every covered block is a live view this runtime successfully protected
+/// read-only. Windows requires the entire VirtualProtect range to be
+/// committed, irrespective of whether the pages are currently resident.
+pub(crate) fn guarded_readable(start: usize, end: usize) -> bool {
+    let first = start / BLOCK;
+    let last = end.div_ceil(BLOCK);
+    if !PROTECTED.all(first, last) { return false; }
+    let Some(_mapping) = title_memory_reading_now() else { return false };
+    // The published bit alone also covers a protection call in progress.
+    // The guarded set only gains the range after the OS confirms success.
+    GUARDS.try_read().is_ok_and(|g| (first..last).all(|block| g.protected.contains(block)))
+}
+
 /// Whether nothing of `[start, end)` can have been written since an asking
 /// noted it in the journal ([`PUBLISHED`]).
 fn published(start: usize, end: usize) -> bool {
@@ -2142,6 +2155,20 @@ fn published(start: usize, end: usize) -> bool {
     // then clears the other, which an asking that is publishing the block may
     // just be setting.)
     light() && PUBLISHED.all(first, last) && !BESIDE.any(first, last)
+}
+
+/// The texture has verified the whole physical range and that its alias
+/// groups fit `cover`. A clean block is published only when every sibling
+/// was protected. A kernel writer or unarmed sibling prevents publication.
+pub(crate) fn physical_view_writes(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    // DirectStorage can write through its permanent section window, which the
+    // guest VA guards cannot see. At least one completion notification must
+    // invalidate those guards (xmem::notify_alias).
+    static STREAM_NOTICE: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_STREAM_NOTICE").is_none_or(|v| v != "0"));
+    if !view_guard() || !light() || (!*STREAM_NOTICE && page_writes() & 1 == 0) { return None; }
+    let written = writes(start, end, true)?;
+    (published(start, end) && PROTECTED.all(start / BLOCK, end.div_ceil(BLOCK))).then_some(written)
 }
 
 /// Since the last frame line: what asking about title memory was. Kernel
@@ -3697,7 +3724,7 @@ pub fn title_memory_freed(at: usize, len: usize) {
 }
 
 /// The end of the allocation at `at`, if `inside` lies in it; else `at`.
-fn allocation_end(at: usize, inside: usize) -> usize {
+pub(crate) fn allocation_end(at: usize, inside: usize) -> usize {
     use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     let ask = |address: usize| {
         // SAFETY: plain data filled in by the query.
@@ -4702,6 +4729,33 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    #[test]
+    fn physical_texture_journal_sees_alias_writes_and_refuses_a_kernel_writer() {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        let (section, one, two) = two_views(BLOCK);
+        let owner = crate::inplace::backing(one, BLOCK);
+        assert!(matches!(crate::inplace::guarded_view_epoch(one, one + BLOCK, &owner), Some((_, true))));
+        let (before, _) = physical_view_writes(one, one + BLOCK).expect("both physical aliases guarded");
+        unsafe { ((two + 8) as *mut u8).write(2) };
+        let (_, modified) = physical_view_writes(one, one + BLOCK).expect("aliases rearmed");
+        assert!(modified.iter().any(|&(page, at)| page == one / PAGE && at > before));
+        let writing = kernel_writing(two, BLOCK);
+        assert!(physical_view_writes(one, one + BLOCK).is_none());
+        drop(writing);
+        title_memory_remapped(two, BLOCK);
+        unsafe { assert_ne!(UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: two as *mut _ }), 0); }
+        let span = crate::inplace::backing(one, BLOCK);
+        assert!(matches!(crate::inplace::guarded_view_epoch(one, one + BLOCK, &span), Some((_, false))));
+        let (before, _) = physical_view_writes(one, one + BLOCK).expect("all physical blocks guarded");
+        unsafe { ((one + 8) as *mut u8).write(1) };
+        let (_, modified) = physical_view_writes(one, one + BLOCK).expect("guard rearmed");
+        assert!(modified.iter().any(|&(page, at)| page == one / PAGE && at > before));
+        let writing = kernel_writing(one, BLOCK);
+        assert!(physical_view_writes(one, one + BLOCK).is_none());
+        drop(writing);
+        drop_views(section, &[one], BLOCK);
     }
 
     /// A view of guarded pages is mapped anew: it is writable, so the
