@@ -328,6 +328,20 @@ fn stale_pedestrian_reflection(shader: &HostShader, container: &[u8]) -> bool {
                 | "e7bdd8b081286a92e43a11c988e9242e03f4780598408fb512753607cda87380")
 }
 
+// These alpha prepasses select their handles through bounded packed material
+// records. The earlier translations scanned the target table's whole columns.
+fn stale_alpha_material_reflection(shader: &HostShader, container: &[u8]) -> bool {
+    shader.stage == HwStage::Ps && shader.indexed_forms.packed_material.is_empty()
+        && shader.indexed_forms.buffer_indices.iter().any(|(index, _)| {
+            index.table_slot == 0 && index.table_dword == 344 && index.word_step == 64
+        })
+        && matches!(blake3::hash(container).to_hex().as_str(),
+            "3f1c61d954b46f31739d51c5d0dcccd983074cab6be4a4808ba925d7cd5b3c23"
+                | "4cde906781d9b043433a69dd12f34cab546ddcf3e009d85f851826162886ec38"
+                | "9a326171ff144fc9a928b8a6815992e0cf4e3731becc31f3bc6a24b27d3f24cb"
+                | "c5d4ff74b695d1f2be12820f4d1b2d2876a74024f9f520957958716e9afa2891")
+}
+
 fn stale_livery_reflection(shader: &HostShader, container: &[u8]) -> bool {
     let access = &shader.indexed_forms;
     shader.stage == HwStage::Ps && access.scalar_range_columns.is_empty()
@@ -336,6 +350,15 @@ fn stale_livery_reflection(shader: &HostShader, container: &[u8]) -> bool {
         })
         && blake3::hash(container).to_hex().as_str()
             == "4b3d2c8f7a15e7a116d03cd21483ad8d288aab6ce2270aa5d76463d421b8f119"
+}
+
+// The older corona vertex shader describes both IA-sourced texture handles
+// as unconstrained, even when their input elements are available.
+fn stale_vertex_input_reflection(shader: &HostShader, container: &[u8]) -> bool {
+    shader.stage == HwStage::Vs && shader.indexed_forms.vertex_inputs.is_empty()
+        && shader.indexed_forms.opaque & 8 != 0
+        && blake3::hash(container).to_hex().as_str()
+            == "9453de2c1f865e27dfe1c7f7ea312c71edee25dd453af654f0e2dadd807018f3"
 }
 
 fn stale_vehicle_offset_reflection(shader: &HostShader, container: &[u8]) -> bool {
@@ -357,6 +380,25 @@ fn stale_linked_material_reflection(shader: &HostShader, container: &[u8]) -> bo
         && matches!(blake3::hash(container).to_hex().as_str(),
             "3847458f4cebb0ba79820cc9c52fedd8439a25aba443e9d15aec796d7a37ae12"
                 | "ea90eea5044117c0baaf893278b50f4c7ac163bf4f3a5a8aff604db14f3362e2")
+}
+
+// Cascade shadow pixel stages need the bound from their matching mesh outputs
+// before the precise descriptor fields can replace the older table scan.
+fn stale_cascade_shadow_reflection(shader: &HostShader, container: &[u8]) -> bool {
+    let access = &shader.indexed_forms;
+    match shader.stage {
+        HwStage::Ps => access.buffer_indices.iter().any(|(index, _)| {
+            index.table_slot == 0 && index.table_dword == 96 && index.word_step == 1
+        }) && matches!(blake3::hash(container).to_hex().as_str(),
+            "16400b2f082a200651c7cd1c72451690f98f6188522d4d12b193ec53259f52f0"
+                | "b3c8d5bdb2d6f4cd88d46e4c84f06d510732756c76657ebb2e9375a42352d4ae"),
+        HwStage::Ms => !access.output_limits.iter().any(|&(row, component, max)| {
+            row == 15 && component == 0 && max <= 7
+        }) && matches!(blake3::hash(container).to_hex().as_str(),
+            "4c1c0bc01e07c903da288efe36920b46baf9edbb43fd48d432547a07dda789de"
+                | "adad836e0cab90b107390d2ed883f6f28de9574ca02864cb20a38bc30fad7442"),
+        _ => false,
+    }
 }
 
 fn stale_clustered_compute_reflection(shader: &HostShader, container: &[u8]) -> bool {
@@ -454,11 +496,14 @@ fn cached_by(
                 if refresh || stale_material_reflection(&shader)
                     || stale_skinning_reflection(&shader, container)
                     || stale_vehicle_reflection(&shader, container)
+                    || stale_alpha_material_reflection(&shader, container)
                     || stale_pedestrian_reflection(&shader, container)
                     || stale_livery_reflection(&shader, container)
                     || stale_vehicle_offset_reflection(&shader, container)
                     || stale_linked_material_reflection(&shader, container)
+                    || stale_cascade_shadow_reflection(&shader, container)
                     || stale_clustered_compute_reflection(&shader, container)
+                    || stale_vertex_input_reflection(&shader, container)
                     || stale_compute_translation(&shader, container)
                 {
                     tracing::debug!(path = %path.display(), "shader cache entry of an earlier translator; translating again");
@@ -522,6 +567,7 @@ const MAGIC: &[u8; 4] = b"VSHK";
 const PACKED_MAGIC: &[u8; 4] = b"VSHL";
 const FIXED_MAGIC: &[u8; 4] = b"VSHM";
 const SCALAR_RANGE_MAGIC: &[u8; 4] = b"VSHN";
+const VERTEX_INPUT_MAGIC: &[u8; 4] = b"VSHO";
 const INDEXED_BUFFER_WRITE: u32 = 4;
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
@@ -582,7 +628,9 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
     let packed = &s.indexed_forms.packed_material;
     let fixed = &s.indexed_forms.fixed_record_columns;
     let ranges = &s.indexed_forms.scalar_range_columns;
-    let magic = if !ranges.is_empty() { SCALAR_RANGE_MAGIC } else if !fixed.is_empty() { FIXED_MAGIC }
+    let vertex_inputs = &s.indexed_forms.vertex_inputs;
+    let magic = if !vertex_inputs.is_empty() { VERTEX_INPUT_MAGIC }
+        else if !ranges.is_empty() { SCALAR_RANGE_MAGIC } else if !fixed.is_empty() { FIXED_MAGIC }
         else if !packed.is_empty() { PACKED_MAGIC } else { MAGIC };
     let mut out = magic.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -728,7 +776,7 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
             }
         }
     }
-    if magic == FIXED_MAGIC || magic == SCALAR_RANGE_MAGIC {
+    if [FIXED_MAGIC, SCALAR_RANGE_MAGIC, VERTEX_INPUT_MAGIC].contains(&magic) {
         word(&mut out, fixed.len() as u32);
         for &(column, kind) in fixed {
             for value in [u32::from(column.table.0), column.table.1, column.field,
@@ -738,7 +786,7 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
             }
         }
     }
-    if magic == SCALAR_RANGE_MAGIC {
+    if magic == SCALAR_RANGE_MAGIC || magic == VERTEX_INPUT_MAGIC {
         word(&mut out, ranges.len() as u32);
         for (column, kind) in ranges {
             for value in [u32::from(column.records.0), column.records.1, column.count,
@@ -747,6 +795,16 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
                 word(&mut out, value);
             }
             write_scalar_program(&mut out, &column.base);
+        }
+    }
+    if magic == VERTEX_INPUT_MAGIC {
+        word(&mut out, vertex_inputs.len() as u32);
+        for &(index, kind) in vertex_inputs {
+            for value in [u32::from(index.row), u32::from(index.channel), index.bytes,
+                index.value_mask, u32::from(kind)]
+            {
+                word(&mut out, value);
+            }
         }
     }
     word(&mut out, s.halfword_aligned_roots.len() as u32);
@@ -793,7 +851,8 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
     }
     let mut r = Reader(bytes);
     let magic = r.take(4)?;
-    let range_access = magic == SCALAR_RANGE_MAGIC;
+    let vertex_access = magic == VERTEX_INPUT_MAGIC;
+    let range_access = magic == SCALAR_RANGE_MAGIC || vertex_access;
     let fixed_access = magic == FIXED_MAGIC || range_access;
     let packed_access = magic == PACKED_MAGIC || fixed_access;
     let typed_access = packed_access || magic == MAGIC || magic == b"VSHJ";
@@ -1044,7 +1103,22 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
             }, kind));
         }
     }
-    let indexed_forms = victory_shader::emit::IndexedAccess { opaque, texture_kinds, offsets, buffer_indices, uav_indices, buffer_uav_indices, packed_material, fixed_record_columns, scalar_range_columns, chains, scalar_records, scalar_programs, pointer_fields,input_limits,output_limits };
+    let mut vertex_inputs = Vec::new();
+    if vertex_access {
+        let count = r.word()?;
+        if stage != HwStage::Vs || count == 0 || count as usize > r.0.len() / 20 {
+            return None;
+        }
+        for _ in 0..count {
+            let row = u8::try_from(r.word()?).ok()?;
+            let channel = u8::try_from(r.word()?).ok().filter(|&channel| channel < 4)?;
+            let bytes = r.word()?;
+            let value_mask = r.word()?;
+            let kind = u8::try_from(r.word()?).ok().filter(|kind| (1..=9).contains(kind))?;
+            vertex_inputs.push((victory_shader::resource::VertexInputIndex { row, channel, bytes, value_mask }, kind));
+        }
+    }
+    let indexed_forms = victory_shader::emit::IndexedAccess { opaque, texture_kinds, offsets, buffer_indices, uav_indices, buffer_uav_indices, packed_material, fixed_record_columns, scalar_range_columns, vertex_inputs, chains, scalar_records, scalar_programs, pointer_fields,input_limits,output_limits };
     let count = r.word()? as usize;
     if r.0.len() != count.checked_mul(8)? {
         return None;
@@ -1107,6 +1181,7 @@ mod tests {
                 packed_material: Vec::new(),
                 fixed_record_columns: Vec::new(),
                 scalar_range_columns: Vec::new(),
+                vertex_inputs: Vec::new(),
                 pointer_fields:vec![(victory_shader::resource::PointerField {pointer:(1,56),records:(0,160),pointer_offset:28,field:4},2)],
                 scalar_programs: vec![(vec![victory_shader::resource::ScalarWordOp::Constant(20),
                     victory_shader::resource::ScalarWordOp::Read { table:(1,8),address:0 }],2)],
@@ -1276,6 +1351,16 @@ mod tests {
         assert_eq!(decode(&range_bytes), Some((range.clone(), b"made by".to_vec())));
         range.indexed_forms.scalar_range_columns[0].0.count += 1;
         assert!(decode(&encode(&range, "made by")).is_none());
+        let mut vertex = host.clone();
+        vertex.stage = HwStage::Vs;
+        vertex.indexed_forms.vertex_inputs.push((victory_shader::resource::VertexInputIndex {
+            row: 2, channel: 1, bytes: 0, value_mask: 0x07ff_ffff,
+        }, 2));
+        let vertex_bytes = encode(&vertex, "made by");
+        assert!(vertex_bytes.starts_with(VERTEX_INPUT_MAGIC));
+        assert_eq!(decode(&vertex_bytes), Some((vertex.clone(), b"made by".to_vec())));
+        vertex.indexed_forms.vertex_inputs[0].0.channel = 4;
+        assert!(decode(&encode(&vertex, "made by")).is_none());
         let mut legacy = bytes.clone();
         legacy[..4].copy_from_slice(b"VSH8");
         assert!(decode(&legacy).is_none());

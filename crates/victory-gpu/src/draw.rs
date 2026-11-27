@@ -154,6 +154,8 @@ pub(crate) struct VertexView {
     stride: u32,
 }
 
+type VertexTextureWords = (u8, Option<crate::descriptor::index_words::DependentWords>);
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct IndexView {
@@ -1715,12 +1717,12 @@ impl State {
 
     /// Brings the host list up to date for a draw; false if the draw cannot
     /// run on the host.
-    fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
-        self.prepare_for(list, indexed, false)
+    fn prepare(&mut self, list: &HostList, indexed: bool, vertices: Option<(u32, u32)>) -> bool {
+        self.prepare_for(list, indexed, false, vertices)
     }
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
-    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool, vertices: Option<(u32, u32)>) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -1743,13 +1745,15 @@ impl State {
             once!("rectangle geometry stage unavailable");
             return false;
         }
-        if !self.bind(list, p, false) {
+        let vertex_selectors = !p.vertex_texture_inputs.is_empty();
+        if !vertex_selectors && !self.bind(list, p, false, &[]) {
             return false;
         }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
+        let mut selectors = Vec::new();
         for (slot, (view, &v)) in views.iter_mut().zip(&self.vertex).enumerate() {
             if p.slots & 1 << slot == 0 {
                 continue;
@@ -1767,6 +1771,31 @@ impl State {
                 SizeInBytes: v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
                 StrideInBytes: v.stride,
             };
+            let mut fields = std::collections::BTreeMap::<u8, Vec<(u32, u32, u32)>>::new();
+            for &(kind, ref input) in &p.vertex_texture_inputs {
+                let Some(input) = input.as_ref().filter(|input| input.slot == slot) else { continue; };
+                if input.element_offset.checked_add(input.element_size).is_some_and(|end| end <= v.stride) {
+                    fields.entry(kind).or_default().push((input.field, input.bytes, input.value_mask));
+                } else {
+                    selectors.push((kind, None));
+                }
+            }
+            for (kind, fields) in fields {
+                let words = crate::descriptor::index_words::VertexInputWords::new(
+                    &shadow, v.address, view.SizeInBytes, v.stride, vertices, fields,
+                ).map(crate::descriptor::index_words::DependentWords::VertexInput);
+                selectors.push((kind, words));
+            }
+        }
+        if vertex_selectors {
+            for &(kind, ref input) in &p.vertex_texture_inputs {
+                if input.as_ref().is_none_or(|input| views[input.slot].BufferLocation == 0) {
+                    selectors.push((kind, None));
+                }
+            }
+            if !self.bind(list, p, false, &selectors) {
+                return false;
+            }
         }
         // SAFETY: an open list; the views name live host buffers.
         unsafe {
@@ -1832,7 +1861,7 @@ impl State {
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
-    pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool, vertex_selectors: &[VertexTextureWords]) -> bool {
         let l = &list.list;
         list.begin_shader();
         let compute_tail = compute && list.can_defer_materials() && p.stages.iter().any(|s| !s.translated().host.indexed_forms.chains.is_empty())
@@ -2083,7 +2112,8 @@ impl State {
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // The common metadata for translated descriptor indices.
                         let stage_state = if stage.shader.stage == "pixel" { 0x80 } else { 0x40 };
-                        match self.heap_metadata(list, &t.host.indexed_forms, compute, &made, p, compute_tail,
+                        let vertex_selectors = if stage.shader.stage == "vertex" { vertex_selectors } else { &[] };
+                        match self.heap_metadata(list, &t.host.indexed_forms, compute, &made, p, compute_tail, vertex_selectors,
                             stage_state, &mut device_materials, &mut stage_aliases.slots) {
                             // SAFETY: an open list; the table lives as long
                             // as the heap the list holds.
@@ -2457,7 +2487,7 @@ impl State {
     }
 
     fn indexed_slots_for_tables(&self, access: &victory_shader::emit::IndexedAccess, compute: bool, tables: &[(u8, u32)],
-        pipeline: &HostPipeline, pixel: bool) -> crate::descriptor::host::IndexedSlots {
+        pipeline: &HostPipeline, pixel: bool, vertex_selectors: &[VertexTextureWords]) -> crate::descriptor::host::IndexedSlots {
         let mut slots = self.indexed_root_slots(access, compute);
         let mut words_only = access.opaque & 8 == 0;
         for &(index, kind) in &access.buffer_indices {
@@ -2575,6 +2605,11 @@ impl State {
             let words = ScalarPrograms::capture(vec![first.base.clone()], capture).zip(capture(first.records))
                 .and_then(|(base, records)| ScalarRangeWords::new(base, records, &columns));
             bind(words.map(DependentWords::ScalarRange), kind);
+        }
+        if vertex_selectors.is_empty() {
+            for &(_, kind) in &access.vertex_inputs { bind(None, kind); }
+        } else {
+            for (kind, words) in vertex_selectors { bind(words.clone(), *kind); }
         }
         slots.words_only = words_only && !slots.words.is_empty();
         let mut uav_words_only = access.opaque & 16 == 0;
@@ -2705,7 +2740,7 @@ impl State {
         if !Self::reads_materials(p) { return false; }
         let mut inputs = crate::descriptor::index_words::DeviceRanges::new();
         for stage in &p.stages {
-            let slots = self.indexed_slots_for_tables(&stage.translated().host.indexed_forms, false, &[], p, stage.shader.stage == "pixel");
+            let slots = self.indexed_slots_for_tables(&stage.translated().host.indexed_forms, false, &[], p, stage.shader.stage == "pixel", &[]);
             if slots.opaque & 8 != 0 && (!slots.words_only || slots.words.iter().any(|w| w.index.is_none())) { return false; }
             for w in &slots.words { w.device_ranges(&mut inputs); }
         }
@@ -2715,9 +2750,9 @@ impl State {
     }
 
     fn heap_metadata(&self, list: &HostList, access: &victory_shader::emit::IndexedAccess, compute: bool, tables: &[(u8, u32)],
-        pipeline: &HostPipeline, compute_tail: bool, stage_state: u8, device_materials: &mut Vec<(usize, crate::descriptor::host::IndexedSlots)>,
+        pipeline: &HostPipeline, compute_tail: bool, vertex_selectors: &[VertexTextureWords], stage_state: u8, device_materials: &mut Vec<(usize, crate::descriptor::host::IndexedSlots)>,
         buffer_aliases: &mut crate::descriptor::host::IndexedSlots) -> Option<u64> {
-        let mut slots = self.indexed_slots_for_tables(access, compute, tables, pipeline, stage_state == 0x80);
+        let mut slots = self.indexed_slots_for_tables(access, compute, tables, pipeline, stage_state == 0x80, vertex_selectors);
         let heap = self
             .heaps
             .iter()
@@ -3671,7 +3706,7 @@ impl State {
         let threads = [x, y, z];
         let [x, y, z] = size.map_or(threads, |size| dispatch_groups(threads, size));
         self.dispatch_groups_x = Some(if y == 0 || z == 0 { 0 } else { x });
-        let bound = self.bind(list, p, true);
+        let bound = self.bind(list, p, true, &[]);
         self.dispatch_groups_x = None;
         if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -4112,7 +4147,7 @@ impl State {
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
-            && self.prepare_for(list, false, true)
+            && self.prepare_for(list, false, true, None)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
@@ -4776,7 +4811,7 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        let ready = self.prepare(list, false);
+        let ready = self.prepare(list, false, Some((first, if instances == 0 { 0 } else { vertices })));
         let ran = ready;
         if ran {
             let (count, from) = (vertices, first);
@@ -4813,7 +4848,7 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
-        let ran = self.prepare(list, true);
+        let ran = self.prepare(list, true, None);
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false, false));
@@ -5088,11 +5123,11 @@ impl State {
             }
         };
         let ran = match kind {
-            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
+            DRAW | INDEXED => self.prepare(list, kind == INDEXED, None),
+            MESH => self.prepare_for(list, false, true, None),
             DISPATCH => {
                 if max == 1 { self.indirect_groups = crate::descriptor::index_words::IndirectGroups::new(&args, arguments); }
-                let bound = self.bind(list, p, true);
+                let bound = self.bind(list, p, true, &[]);
                 self.indirect_groups = None;
                 bound
             }

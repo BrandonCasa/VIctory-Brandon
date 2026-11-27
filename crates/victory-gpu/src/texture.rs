@@ -676,7 +676,10 @@ fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     out
 }
 
-struct ReadScratch(Vec<u8>);
+struct ReadScratch {
+    bytes: Vec<u8>,
+    next_trim: u64,
+}
 
 /// Total allocated capacity across live texture readers, including idle workers.
 #[cfg(feature = "diagnostics")]
@@ -685,8 +688,8 @@ pub(crate) static READ_SCRATCH_CAPACITY: std::sync::atomic::AtomicU64 = std::syn
 #[cfg(feature = "diagnostics")]
 impl Drop for ReadScratch {
     fn drop(&mut self) {
-        if self.0.capacity() != 0 && crate::copystat::memory_categories() {
-            READ_SCRATCH_CAPACITY.fetch_sub(self.0.capacity() as u64, std::sync::atomic::Ordering::Relaxed);
+        if self.bytes.capacity() != 0 && crate::copystat::memory_categories() {
+            READ_SCRATCH_CAPACITY.fetch_sub(self.bytes.capacity() as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -695,7 +698,38 @@ thread_local! {
     /// Room to read a texture's memory into: one buffer per submitting
     /// thread. Each texture kept its own, a second copy in memory of every
     /// write-watched or partly mapped texture ever sampled, for the run.
-    static READ: std::cell::RefCell<ReadScratch> = const { std::cell::RefCell::new(ReadScratch(Vec::new())) };
+    static READ: std::cell::RefCell<ReadScratch> = const {
+        std::cell::RefCell::new(ReadScratch { bytes: Vec::new(), next_trim: 0 })
+    };
+}
+
+/// Release an idle worker's largest read buffer under host memory pressure.
+/// The read callback has already filled the owned staging and snapshot bytes.
+pub(crate) fn trim_idle_read_scratch() {
+    const MIN_CAPACITY: usize = 8 << 20;
+    const TRIM_INTERVAL_MS: u64 = 10_000;
+    if !crate::residency::pressured() {
+        return;
+    }
+    READ.with(|read| {
+        let mut scratch = read.borrow_mut();
+        let released = scratch.bytes.capacity();
+        if released < MIN_CAPACITY {
+            return;
+        }
+        let now = crate::host::coarse_ms();
+        if now < scratch.next_trim {
+            return;
+        }
+        scratch.next_trim = now.saturating_add(TRIM_INTERVAL_MS);
+        drop(std::mem::take(&mut scratch.bytes));
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::memory_categories() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let remaining = READ_SCRATCH_CAPACITY.fetch_sub(released as u64, Relaxed) - released as u64;
+            tracing::info!(released_bytes = released, remaining_bytes = remaining, "released idle texture read scratch");
+        }
+    });
 }
 
 /// Calls `f` with `size` bytes of this thread's read buffer (their
@@ -703,7 +737,7 @@ thread_local! {
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     READ.with(|read| {
         let mut scratch = read.borrow_mut();
-        let read = &mut scratch.0;
+        let read = &mut scratch.bytes;
         if read.len() < size {
             #[cfg(feature = "diagnostics")]
             let before = read.capacity();

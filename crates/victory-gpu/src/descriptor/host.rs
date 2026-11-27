@@ -1869,7 +1869,15 @@ fn note_indexed_change(logical: u32, previous: Option<(u64, u64, Option<u64>)>, 
     let prepared = failure.is_none();
     let count = if prepared { LATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 } else { 0 };
     let first = !prepared && SEEN.lock().unwrap_or_else(|e| e.into_inner()).insert((reason, failure));
-    if first || count.is_power_of_two() {
+    #[cfg(feature = "diagnostics")]
+    let detailed = {
+        use crate::host::IndexedFailureTrace;
+        static TRACE: IndexedFailureTrace<(&str, &str, u32, u64)> = IndexedFailureTrace::new();
+        failure.is_some_and(|failure| TRACE.report((reason, failure, logical, current.1)))
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let detailed = false;
+    if first || detailed || count.is_power_of_two() {
         tracing::info!(logical, reason, ?previous, ?current, ?addresses, prepared, ?failure, late_sample_checks = count, "indexed texture changed after first observation");
     }
 }
@@ -2924,7 +2932,16 @@ impl HostHeap {
         let reject = |logical: u32, reason: &'static str| {
             static SAID: std::sync::LazyLock<Mutex<std::collections::HashSet<&'static str>>> =
                 std::sync::LazyLock::new(Default::default);
-            if SAID.lock().unwrap_or_else(|e| e.into_inner()).insert(reason) {
+            let first = SAID.lock().unwrap_or_else(|e| e.into_inner()).insert(reason);
+            #[cfg(feature = "diagnostics")]
+            let detailed = {
+                use crate::host::IndexedFailureTrace;
+                static TRACE: IndexedFailureTrace<(&str, u32, bool)> = IndexedFailureTrace::new();
+                TRACE.report((reason, logical, recording))
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let detailed = false;
+            if first || detailed {
                 let view = heap.handle(logical).and_then(super::view);
                 tracing::warn!(logical, reason, recording, opaque = slots.opaque, words_only = slots.words_only,
                     selection = ?sampled_slots.map(|slots| slots.len()),
@@ -3278,7 +3295,8 @@ impl HostHeap {
                             let conflict = late_guest_sample_conflict(logical, object, &copy)?;
                             // A neighbouring target can own the excluded main mip
                             // while the published compressed SRV reads the mip prefix.
-                            if same_allocation && matches!(&view, View::Placed(false, resource, _) if matches!(resource[8], 70..=72 | 97..=99))
+                            if same_allocation && matches!(&view, View::Placed(false, resource, _)
+                                if matches!(crate::resource::element(resource[8]), Some((_, 4))))
                                 && old_view.as_ref().is_some_and(|old| same_placed_srv_mip_window(old, &view))
                                 && let Some(prefix) = crate::resource::placed_upload_prefix(this, &resolved, &copy)
                                 && late_sample_span_conflict(logical, object, &copy, Some(prefix), |_| false).is_none()

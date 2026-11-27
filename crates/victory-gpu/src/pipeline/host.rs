@@ -354,6 +354,43 @@ impl GraphicsState {
             })
             .collect()
     }
+
+    fn vertex_texture_inputs(&self, stages: &[Stage], inputs: &[Input]) -> Vec<(u8, Option<VertexTextureInput>)> {
+        let Some(stage) = stages.iter().find(|stage| stage.shader.stage == "vertex") else {
+            return Vec::new();
+        };
+        stage.translated().host.indexed_forms.vertex_inputs.iter().map(|&(index, kind)| {
+            let binding = (|| {
+                let (name, semantic) = victory_shader::emit::vertex_input_semantic(
+                    &stage.shader.container, index.row, index.channel,
+                )?;
+                let mut matching = self.names.iter().zip(&self.inputs).zip(inputs).filter(|((n, desc), _)| {
+                    n.as_bytes().eq_ignore_ascii_case(name.as_bytes()) && desc.SemanticIndex == semantic
+                });
+                let (_, input) = matching.next()?;
+                if matching.next().is_some() || input.per_instance {
+                    return None;
+                }
+                // Float32 components preserve their bits from IA through the
+                // shader's integer interpretation. A converted format cannot
+                // be read as a selector word from the source vertex bytes.
+                let components = match input.format {
+                    2 => 4,  // R32G32B32A32_FLOAT
+                    6 => 3,  // R32G32B32_FLOAT
+                    16 => 2, // R32G32_FLOAT
+                    41 => 1, // R32_FLOAT
+                    _ => return None,
+                };
+                if index.channel >= components { return None; }
+                let field = input.offset.checked_add(u32::from(index.channel) * 4)?;
+                Some(VertexTextureInput {
+                    slot: input.slot as usize, field, element_offset: input.offset,
+                    element_size: u32::from(components) * 4, bytes: index.bytes, value_mask: index.value_mask,
+                })
+            })();
+            (kind, binding)
+        }).collect()
+    }
 }
 
 /// One input element: vertex buffer slot, byte offset, format.
@@ -363,6 +400,15 @@ pub(crate) struct Input {
     pub(crate) offset: u32,
     pub(crate) format: u32,
     pub(crate) per_instance: bool,
+}
+
+pub(crate) struct VertexTextureInput {
+    pub(crate) slot: usize,
+    pub(crate) field: u32,
+    pub(crate) element_offset: u32,
+    pub(crate) element_size: u32,
+    pub(crate) bytes: u32,
+    pub(crate) value_mask: u32,
 }
 
 /// The console's own primitive topology types.
@@ -424,6 +470,7 @@ pub(crate) struct HostPipeline {
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
+    pub(crate) vertex_texture_inputs: Vec<(u8, Option<VertexTextureInput>)>,
     /// Has the geometry stage that completes the console's rectangles
     /// (`victory_shader::emit::rect_list_gs`): its rectangle draws go out
     /// as the title gives them, three vertices a rectangle.
@@ -582,6 +629,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                vertex_texture_inputs: Vec::new(),
                 rects: false,
                 state: String::new(),
             });
@@ -636,6 +684,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                vertex_texture_inputs: Vec::new(),
                 rects: false,
                 state: String::new(),
             });
@@ -748,6 +797,8 @@ impl HostPipeline {
             cull = g.rasterizer.CullMode.0,
             "host graphics state"
         );
+        let inputs = g.elements();
+        let vertex_texture_inputs = g.vertex_texture_inputs(&bound, &inputs);
         Some(HostPipeline {
             compute: false,
             mesh: false,
@@ -756,7 +807,8 @@ impl HostPipeline {
             stages: bound,
             name: format!("{shaders:?}"),
             slots: g.slots(),
-            inputs: g.elements(),
+            inputs,
+            vertex_texture_inputs,
             rects: rect_gs.is_some(),
             state: {
                 let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);

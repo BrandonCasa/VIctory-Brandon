@@ -8343,6 +8343,14 @@ impl<'a> Lower<'a> {
                     if !self.indexed_forms.scalar_records.contains(&entry) {
                         self.indexed_forms.scalar_records.push(entry);
                     }
+                } else if form == 8 && *first == 0 && matches!(leaf, Source::Loaded { .. })
+                    && (1..=9).contains(&(props.0 & 0xff))
+                    && let Some((_, input)) = self.x.res.vertex_inputs.iter().find(|(site, _)| site == load)
+                {
+                    let entry = (*input, (props.0 & 0xff) as u8);
+                    if !self.indexed_forms.vertex_inputs.contains(&entry) {
+                        self.indexed_forms.vertex_inputs.push(entry);
+                    }
                 } else if form & 16 != 0 && *first == 0 && exact && (1..=9).contains(&(props.0 & 0xff))
                     && let Some((_, index)) = self.x.res.buffer_indices.iter().find(|(site,index)| site == load
                         && index.word_step==0 && index.guard.is_none() && index.records.is_none())
@@ -12534,6 +12542,7 @@ impl<'a> Lower<'a> {
                     call_sample(self, "sampleLevel.f32", 62, &args, &mut gathered)
                 }
                 60 => {
+                    self.s.compute_derivatives |= compute_derivatives;
                     if offset_word {
                         // DXIL wants immediate offsets in -8..=7 here; the
                         // console's are 6-bit and may be computed. A
@@ -12572,6 +12581,7 @@ impl<'a> Lower<'a> {
                     };
                     args.extend(&os);
                     if implicit_derivatives {
+                        self.s.compute_derivatives |= compute_derivatives;
                         args.extend([bias, clamp]);
                         call_sample(self, "sampleBias.f32", 61, &args, &mut gathered)
                     } else {

@@ -341,6 +341,8 @@ pub struct IndexedAccess {
     /// Structured record fields selecting buffer UAV slots, with their access forms.
     pub buffer_uav_indices: Vec<(crate::resource::BufferIndex, u8)>,
     pub fixed_record_columns: Vec<(crate::resource::FixedRecordColumn, u8)>,
+    /// Texture SRV indices read as unmodified vertex attribute words.
+    pub vertex_inputs: Vec<(crate::resource::VertexInputIndex, u8)>,
     pub packed_material: Vec<(crate::resource::PackedMaterialColumn, u8)>,
     pub scalar_range_columns: Vec<(crate::resource::ScalarRangeColumn, u8)>,
     pub chains: Vec<(crate::resource::MaterialChain, u8)>,
@@ -1019,7 +1021,33 @@ fn vertex_output_interpolation(
     Ok(())
 }
 
-/// The rows of an `ISG1`/`OSG1` part.
+/// Resolves a full-width float vertex input channel to its IA semantic.
+pub fn vertex_input_semantic(
+    container: &[u8],
+    row: u8,
+    channel: u8,
+) -> Option<(String, u32)> {
+    if channel >= 4 {
+        return None;
+    }
+    let container = crate::dxbc::Container::parse(container).ok()?;
+    let part = container.part(FourCC::ISG1)?.data;
+    let base = crate::dxbc::u32_at(part, 4).ok()? as usize;
+    let mut elements = signature(part).ok()?.into_iter().enumerate().filter_map(|(i, element)| {
+        let mask = *part.get(base + 32 * i + 24)?;
+        (element.row == Some(u32::from(row)) && mask & (1 << channel) != 0)
+            .then_some((element, mask))
+    });
+    let (element, mask) = elements.next()?;
+    if elements.next().is_some() || element.kind != 0 || element.comp != 9 || element.half
+        || element.col != 0 || element.cols > 4 || mask != (1 << element.cols) - 1
+    {
+        return None;
+    }
+    Some((element.name, element.index))
+}
+
+/// The rows of an ISG1/OSG1 part.
 fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
     let count = u32_at(part, 0)? as usize;
@@ -1116,6 +1144,41 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn vertex_selector_semantics_preserve_only_contiguous_full_float_inputs() {
+        use super::container::SigElement;
+        use super::{FourCC, vertex_input_semantic};
+
+        let color = SigElement {
+            name: "COLOR".into(), index: 0, kind: 0, comp: 9, interp: 0,
+            row: Some(1), col: 0, cols: 4, usage: 0b10, half: false,
+        };
+        let container = |elements: &[SigElement]| {
+            let part = super::container::signature(elements, true);
+            crate::dxbc::build(&[(FourCC::ISG1, &part)])
+        };
+        let single = container(std::slice::from_ref(&color));
+        assert_eq!(vertex_input_semantic(&single, 1, 1), Some(("COLOR".into(), 0)));
+        assert!(vertex_input_semantic(&single, 1, 4).is_none());
+
+        let joined = container(&[color.clone(), SigElement { name: "TEXCOORD".into(), ..color.clone() }]);
+        assert!(vertex_input_semantic(&joined, 1, 1).is_none());
+        let mixed = container(&[color.clone(), SigElement { name: "OTHER".into(), comp: 5, ..color.clone() }]);
+        assert!(vertex_input_semantic(&mixed, 1, 1).is_none());
+        let shifted = container(&[SigElement { col: 1, cols: 3, ..color.clone() }]);
+        assert!(vertex_input_semantic(&shifted, 1, 1).is_none());
+
+        let mut half = super::container::signature(std::slice::from_ref(&color), true);
+        half[8 + 16] = 6;
+        let half = crate::dxbc::build(&[(FourCC::ISG1, &half)]);
+        assert!(vertex_input_semantic(&half, 1, 1).is_none());
+
+        let mut part = super::container::signature(&[color], true);
+        part[24 + 8] = 0b101;
+        let noncontiguous = crate::dxbc::build(&[(FourCC::ISG1, &part)]);
+        assert!(vertex_input_semantic(&noncontiguous, 1, 1).is_none());
+    }
 
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.

@@ -180,6 +180,15 @@ pub struct FixedRecordColumn {
     pub value_mask: u32,
 }
 
+/// A texture heap slot selected by the bits of one vertex input component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VertexInputIndex {
+    pub row: u8,
+    pub channel: u8,
+    pub bytes: u32,
+    pub value_mask: u32,
+}
+
 mod structured_index;
 mod guarded_index;
 mod material_chain;
@@ -285,6 +294,7 @@ pub struct Resources {
     /// Fields selecting the UAV of a typed buffer store waterfall.
     pub buffer_uav_indices: Vec<(Site, BufferIndex)>,
     pub fixed_record_columns: Vec<(Site, FixedRecordColumn)>,
+    pub vertex_inputs: Vec<(Site, VertexInputIndex)>,
     pub packed_material: Vec<(Site, PackedMaterialColumn)>,
     pub scalar_range_columns: Vec<(Site, ScalarRangeColumn)>,
     pub chains: Vec<(Site, MaterialChain)>,
@@ -583,7 +593,11 @@ pub(crate) fn track_with_used(
         if let Some(index) = t.typed_buffer_store_index(load, &out, used) {
             out.buffer_uav_indices.push((load, index));
         }
-        if let Some(index) = t.waterfall_buffer_index(load, &out)
+        if let crate::native::StageIo::Vs { inputs, .. } = io
+            && let Some(index) = t.waterfall_vertex_input(load, &out, inputs)
+        {
+            out.vertex_inputs.push((load, index));
+        } else if let Some(index) = t.waterfall_buffer_index(load, &out)
             .or_else(|| t.structured_buffer_index(load, &out, used)) {
             out.buffer_indices.push((load, index));
         } else if let Some((indices, packed, ranges)) = t.structured_indices(load, &out, used) {
@@ -1050,15 +1064,9 @@ impl<'a> Tracer<'a> {
         Some((base.slot, (table.offset >> 2).checked_add(u32::from(first))?))
     }
 
-    /// A proven waterfall takes each initial lane's own shifted buffer word.
-    /// Require the load and shift in its one preheader, with EXEC unchanged
-    /// from the producer to loop entry so no lane can supply an older VGPR.
-    fn waterfall_buffer_index(&self, load: Site, resources: &Resources) -> Option<BufferIndex> {
-        let pos = resources.scalar.binary_search_by_key(&load, |(s, _)| *s).ok()?;
-        let heap = resources.scalar[pos].1;
-        if self.layout.get(heap.param)?.root != RootType::ResourceHeap {
-            return None;
-        }
+    /// The vertex input or buffer word before it is scaled into a heap offset.
+    /// The shift takes place in the one preheader of the retry loop.
+    fn waterfall_shift_input(&self, load: Site) -> Option<(Site, Value)> {
         let shifted = self.first_lane_source(self.first_lane_offset(load)?)?;
         let shift_site = self.defs[shifted.0 as usize]?;
         let shift = self.inst(shift_site);
@@ -1070,17 +1078,63 @@ impl<'a> Tracer<'a> {
         {
             return None;
         }
-        let value = shift.read(Reg::V(*reg))?;
-        let read_site = self.defs[value.0 as usize]?;
         let [a, b] = self.p.blocks[load.0].preds.as_slice() else { return None };
         let preheader = if *a == load.0 { *b } else if *b == load.0 { *a } else { return None };
-        if read_site.0 != preheader || shift_site.0 != preheader || read_site.1 >= shift_site.1 {
+        (shift_site.0 == preheader).then_some((shift_site, shift.read(Reg::V(*reg))?))
+    }
+
+    fn unchanged_exec_since(&self, site: Site) -> bool {
+        self.p.blocks[site.0].insts[site.1..].iter().all(|inst|
+            inst.write(Reg::S(EXEC)).is_none() && inst.write(Reg::S(EXEC + 1)).is_none())
+    }
+
+    fn waterfall_vertex_input(
+        &self,
+        load: Site,
+        resources: &Resources,
+        inputs: &[crate::native::VsInput],
+    ) -> Option<VertexInputIndex> {
+        let pos = resources.scalar.binary_search_by_key(&load, |(s, _)| *s).ok()?;
+        let heap = resources.scalar[pos].1;
+        if self.stage != HwStage::Vs || self.layout.get(heap.param)?.root != RootType::ResourceHeap
+            || heap.offset != 0 || !self.image_only_in_waterfall(load, resources)
+        {
             return None;
         }
-        let pre = &self.p.blocks[preheader].insts;
-        let unchanged_exec = |start: usize| !pre[start..].iter().any(|i|
-            i.write(Reg::S(EXEC)).is_some() || i.write(Reg::S(EXEC + 1)).is_some());
-        if !unchanged_exec(read_site.1) {
+        let (shift, value) = self.waterfall_shift_input(load)?;
+        if !self.unchanged_exec_since(shift) {
+            return None;
+        }
+        let Reg::V(reg) = self.inputs[value.0 as usize]? else { return None };
+        let mut attributes = inputs.iter().filter_map(|input| {
+            let channel = reg.checked_sub(input.vgpr)?;
+            (input.usage == crate::native::Usage::Generic && channel < 4
+                && input.mask & (1 << channel) != 0).then_some((input.row, channel))
+        });
+        let (row, channel) = attributes.next()?;
+        if attributes.next().is_some() {
+            return None;
+        }
+        Some(VertexInputIndex {
+            row, channel, bytes: heap.offset,
+            // A 32-bit left shift by five drops the high five input bits.
+            value_mask: u32::MAX >> 5,
+        })
+    }
+
+    /// A proven waterfall takes each initial lane's own shifted buffer word.
+    /// Require the load and shift in its one preheader, with EXEC unchanged
+    /// from the producer to loop entry so no lane can supply an older VGPR.
+    fn waterfall_buffer_index(&self, load: Site, resources: &Resources) -> Option<BufferIndex> {
+        let pos = resources.scalar.binary_search_by_key(&load, |(s, _)| *s).ok()?;
+        let heap = resources.scalar[pos].1;
+        if self.layout.get(heap.param)?.root != RootType::ResourceHeap {
+            return None;
+        }
+        let (shift_site, value) = self.waterfall_shift_input(load)?;
+        let read_site = self.defs[value.0 as usize]?;
+        let preheader = shift_site.0;
+        if read_site.0 != preheader || read_site.1 >= shift_site.1 || !self.unchanged_exec_since(read_site) {
             return None;
         }
         let read = self.inst(read_site);
@@ -1095,7 +1149,7 @@ impl<'a> Tracer<'a> {
         let mut bytes = 0;
         if let Some(Term::Const(base)) = self.term(read, soffset)
             && let Some(at) = self.defs[read.read(Reg::V(*va))?.0 as usize]
-            && at.0 == preheader && unchanged_exec(at.1)
+            && at.0 == preheader && self.unchanged_exec_since(at)
             && let address = self.inst(at)
             && address.name() == "v_add_lshl_u32"
             && let Fields::Valu(a) = &address.fields
@@ -4052,6 +4106,39 @@ pub(crate) mod tests {
         assert_eq!(r.waterfall.compares.len(), 1);
         assert_eq!(r.waterfall.reads.len(), 1);
         assert_eq!(r.waterfall.loads, [load]);
+    }
+
+    #[test]
+    fn waterfall_vertex_input_requires_the_original_word_in_every_entering_lane() {
+        use crate::native::{StageIo, Usage, VsInput};
+
+        let layout = [param(ResourceHeap, 0, 1), param(Table, 1, 1)];
+        let io = StageIo::Vs {
+            inputs: vec![VsInput { usage: Usage::Generic, row: 1, mask: 0b10, vgpr: 6 }],
+            outputs: vec![],
+        };
+        let analyze = |words: &[u32]| {
+            let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 32).unwrap();
+            track_with_used(&p, &layout, HwStage::Vs, lanes(&p).as_ref(), &[], &io).unwrap()
+        };
+        let mut words = WATERFALL_INDEXED_WAVE32.to_vec();
+        let previous = word_at(&words, 0x360e_0081);
+        words[previous] = 0xbf80_0000; // The shift now reads the original v7 attribute.
+        let reflected = analyze(&words);
+        let [(load, index)] = reflected.vertex_inputs.as_slice() else {
+            panic!("expected one vertex selector, got {:?}", reflected.vertex_inputs);
+        };
+        assert!(reflected.waterfall.loads.contains(load));
+        assert_eq!(*index, VertexInputIndex { row: 1, channel: 1, bytes: 0, value_mask: 0x07ff_ffff });
+
+        // Lanes enabled after the shift can contribute their old, unshifted word.
+        let shift = word_at(&words, 0x340e_0e85);
+        words.insert(shift, 0x7da8_0090); // v_cmpx_gt_u32 exec, 16, v0
+        words.insert(shift + 2, 0xbefe_03c1); // s_mov_b32 exec_lo, -1
+        let uncertain = analyze(&words);
+        assert!(!uncertain.waterfall.loads.is_empty());
+        assert!(uncertain.vertex_inputs.is_empty());
     }
 
     #[test]

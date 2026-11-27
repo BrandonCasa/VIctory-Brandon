@@ -3948,21 +3948,33 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn bc1_tail_view_excludes_the_aliased_main_mip() {
-        let desc = ResourceDesc { layout: 0x105, flags: 0x300000, ..texture(1024, 1024, 71, 9) };
-        let texture = texture_layout(&desc).unwrap();
-        let layout = &texture.planes[0].layout;
-        let view = crate::descriptor::View::Shader(1, Some([71, 4, 5768, 0, 8, 1, 0, 0, 0, 0]));
-        let range = crate::texture::ViewRange::for_view(&view).unwrap();
-        let first = read_from(layout, range.mip());
+    fn compressed_mip_prefix_excludes_the_logged_aliases() {
+        let captures = [
+            // BC1, continue-packed:10956–57.
+            (texture(1024, 1024, 71, 9), [8, 1], 0xb6b468000, 0xab000, 0x1000, 0xb6b500000..0xb6b513000),
+            // BC5, continue-linked:7050–52.
+            (texture(512, 512, 83, 8), [7, 1], 0xb6c0e4000, 0x56000, 0x1000, 0xb6c100000..0xb6c13a000),
+            // BC7, continue-origin:11152–54.
+            (texture(512, 512, 98, 8), [2, 6], 0x7338c8000, 0x56000, 0x6000, 0x733900000..0x73391e000),
+        ];
+        for (desc, [mip, levels], at, whole, prefix, writer) in captures {
+            let desc = ResourceDesc { layout: 0x105, flags: 0x300000, ..desc };
+            assert!(matches!(element(desc.format), Some((_, 4))));
+            let texture = texture_layout(&desc).unwrap();
+            let layout = &texture.planes[0].layout;
+            let view = crate::descriptor::View::Shader(1, Some([desc.format, 4, 5768, 0, mip, levels, 0, 0, 0, 0]));
+            let range = crate::texture::ViewRange::for_view(&view).unwrap();
+            let first = read_from(layout, range.mip());
 
-        assert_eq!(range.mip(), 8);
-        assert!(!range.includes(0, 0));
-        assert_eq!(footprint(&desc).unwrap().size, 0xab000);
-        assert_eq!(layout.bytes_from(first), 0x1000);
-        assert_eq!(range.storage_runs(layout).unwrap(), [0..0x1000]);
-        let main: Vec<_> = layout.subresource_runs(0, 0).unwrap().collect();
-        assert_eq!(main, [0x2b000..0xab000]);
+            assert_eq!(range.mip(), mip);
+            assert!(!range.includes(0, 0));
+            assert_eq!(footprint(&desc).unwrap().size, whole);
+            assert_eq!(layout.bytes_from(first), prefix as u64);
+            assert_eq!(range.storage_runs(layout).unwrap(), [0..prefix]);
+            let main = layout.subresource_runs(0, 0).unwrap().next().unwrap();
+            assert!(at + main.start <= writer.start && writer.end <= at + main.end);
+            assert!(at + prefix <= writer.start);
+        }
     }
 
     #[cfg(windows)]

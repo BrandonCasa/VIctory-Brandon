@@ -33,6 +33,15 @@ fn valu(inst: &Inst) -> Option<&Valu> {
         .then_some(op)
 }
 
+fn unsigned_lane_compare(inst: &Inst) -> Option<([Value; 2], u8)> {
+    let op = valu(inst)?;
+    let [Operand::Scalar { code, dwords: 1 }, Operand::Vector { reg, dwords: 1 }] = op.src.as_slice() else {
+        return None;
+    };
+    let Operand::Scalar { code: dest, .. } = op.dst? else { return None; };
+    Some(([inst.read(Reg::S(*code))?, inst.read(Reg::V(*reg))?], dest))
+}
+
 impl Tracer<'_> {
     // Enumerate register writes feasible for a lane. An implicitly masked
     // write may preserve the old register even without a branch in the CFG.
@@ -121,6 +130,60 @@ impl Tracer<'_> {
             bound = bound.max(next);
         }
         Some(bound)
+    }
+
+    /// Vertex preparation may compare the same count and lane number that
+    /// the final export tests again after restoring EXEC. Both native
+    /// compares evaluate the same predicate. A lane exporting under the
+    /// later compare must have been active after the earlier compare when
+    /// the earlier compare began with all lanes active.
+    fn mesh_export_facts(&self, site: Site, known: &mut Known) {
+        let Some(lanes) = self.lanes else { return; };
+        if self.p.blocks.iter().enumerate().any(|(block, code)| {
+            self.rpo[block] != usize::MAX
+                && code.exit.successors().iter().any(|&next| self.rpo[next] <= self.rpo[block])
+        }) { return; }
+
+        let dom = self.dominators.get_or_init(|| {
+            crate::ir::idoms(&self.p.blocks, &crate::ir::reverse_postorder(&self.p.blocks), &self.rpo)
+        });
+        let mask = |inst: &Inst, reg, read| {
+            let get = |r| if read { inst.read(Reg::S(r)) } else { inst.write(Reg::S(r)) };
+            let high = if self.p.wave64 { Some(get(reg + 1)?) } else { None };
+            lanes.mask_bits(get(reg)?, high)
+        };
+        let mut compared = Vec::new();
+        let (mut block, mut end) = site;
+        loop {
+            let instructions = &self.p.blocks[block].insts;
+            for inst in instructions[..end].iter().rev() {
+                match inst.name() {
+                    "v_cmp_gt_u32" => {
+                        if let Some((inputs, dest)) = unsigned_lane_compare(inst)
+                            && let Some(after) = mask(inst, dest, false)
+                        {
+                            let mut excluded = known.clone();
+                            excluded.push((after, false));
+                            if !self.meet(lanes, &excluded) { compared.push(inputs); }
+                        }
+                    }
+                    "v_cmpx_gt_u32" => {
+                        if let Some((inputs, EXEC)) = unsigned_lane_compare(inst)
+                            && compared.contains(&inputs)
+                            && mask(inst, EXEC, true) == Some(Bool::TRUE)
+                            && let Some(after) = mask(inst, EXEC, false)
+                        {
+                            known.push((after, true));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let parent = dom[block];
+            if parent == block || parent == usize::MAX { break; }
+            block = parent;
+            end = self.p.blocks[block].insts.len();
+        }
     }
 
     pub(super) fn pixel_fields(
@@ -575,7 +638,12 @@ pub(crate) fn mesh_output_limits(
                 let bound = if exp.compressed {
                     None
                 } else {
-                    t.output_max(*v, &known, io, &mut 128)
+                    t.output_max(*v, &known, io, &mut 128).or_else(|| {
+                        let mut with_comparison = known.clone();
+                        t.mesh_export_facts(exp.site, &mut with_comparison);
+                        if with_comparison.len() == known.len() { return None; }
+                        t.output_max(*v, &with_comparison, io, &mut 128)
+                    })
                 };
                 let entry = maxima.entry((row, col as u8)).or_insert(Some(0u32));
                 *entry = entry.zip(bound).map(|(a, b)| a.max(b));
@@ -593,6 +661,41 @@ pub(crate) fn mesh_output_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mesh_export_reuses_the_exact_vertex_comparison_after_exec_restore() {
+        let prove = |late| {
+            let words: [u32; 13] = [
+                0xbefe_04c1,                 // All lanes initially run.
+                0xd765_0001, 0x0001_00c1,   // An unrelated, unbounded v1.
+                0x7da8_0028,                // EXEC = s40 > v0.
+                0xbf88_0001,                // Skip the bounded write if inactive.
+                0x7e02_0287,                // v1 = 7 on active lanes only.
+                0xbefe_04c1,                // Restore all lanes.
+                late,                       // VCC = the final vertex test.
+                0xbefe_046a,                // EXEC = VCC.
+                0xbf88_0002,                // No vertices to export.
+                0xf800_0211, 0x0000_0001,   // Export the material field.
+                0xbf81_0000,
+            ];
+            let code: Vec<_> = words.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, true, 32).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let t = Tracer::new(&p, &[], HwStage::Ms, Some(&st)).unwrap();
+            let (block, index, export) = p.blocks.iter().enumerate().find_map(|(b, code)| {
+                code.insts.iter().enumerate().find(|(_, inst)| inst.name() == "exp").map(|(i, inst)| (b, i, inst))
+            }).unwrap();
+            let exec = st.mask_bits(export.read(Reg::S(EXEC))?, export.read(Reg::S(EXEC + 1)))?;
+            let mut facts = vec![(st.reach[block], true), (exec, true)];
+            let v = export.read(Reg::V(1))?;
+            let io = Io::default();
+            assert_eq!(t.output_max(v, &facts, &io, &mut 128), None);
+            t.mesh_export_facts((block, index), &mut facts);
+            t.output_max(v, &facts, &io, &mut 128)
+        };
+        assert_eq!(prove(0x7d88_0028), Some(7));
+        assert_eq!(prove(0x7d88_0029), None); // Different count SSA operand.
+    }
 
     #[test]
     fn linked_fields_bound_a_broadcast_scalar_unsigned_minimum() {

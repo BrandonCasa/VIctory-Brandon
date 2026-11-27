@@ -280,6 +280,8 @@ pub(crate) struct Shader {
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
+    /// Whether the compute shader emits implicit-derivative sampling.
+    pub compute_derivatives: bool,
     /// The wave size a compute shader requires (`WaveSize`).
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
@@ -336,6 +338,7 @@ impl Shader {
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
+            compute_derivatives: false,
             wave_size: None,
             lds_dwords: 0,
             lds: None,
@@ -940,7 +943,15 @@ impl Shader {
         let six = i32c(&mut self, 6);
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
-        self.m.named_md("dx.valver", vec![version]);
+        let validator = if self.compute_derivatives {
+            // DXIL 1.6 supports these compute quads, but the validator's
+            // compute-stage rules for implicit sampling require version 1.8.
+            let eight = i32c(&mut self, 8);
+            self.m.md_node(vec![Some(one), Some(eight)])
+        } else {
+            version
+        };
+        self.m.named_md("dx.valver", vec![validator]);
         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
@@ -1021,6 +1032,7 @@ impl Shader {
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
+            entry_name: self.compute_derivatives.then_some("main"),
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);

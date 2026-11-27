@@ -186,9 +186,11 @@ pub(crate) struct Psv<'a> {
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
     pub wave_size: Option<u32>,
+    /// Validator 1.8 runtime info records the entry point's string offset.
+    pub entry_name: Option<&'a str>,
 }
 
-/// `PSV0` with runtime info version 2 (validator 1.6).
+/// `PSV0` with runtime info version 2 or version 3.
 pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let vectors = |els: &[SigElement]| {
         els.iter()
@@ -204,7 +206,7 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend(v.to_le_bytes());
         }
     };
-    u32s(&mut out, &[48]);
+    u32s(&mut out, &[if p.entry_name.is_some() { 52 } else { 48 }]);
     let mut info = [0u8; 48];
     info[0] = u8::from(p.flag);
     if p.stage == 0 {
@@ -245,6 +247,11 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[26..28].copy_from_slice(&(max_vertices as u16).to_le_bytes());
     }
     out.extend(info);
+    let entry_offset = p.entry_name.map(|_| {
+        let offset = out.len();
+        u32s(&mut out, &[0]);
+        offset
+    });
     u32s(&mut out, &[p.bindings.len() as u32]);
     if !p.bindings.is_empty() {
         u32s(&mut out, &[24]);
@@ -284,6 +291,11 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             None => (0, 0),
         };
         elements.push((name as u32, index as u32, start, e.cols | alloc, e));
+    }
+    if let (Some(name), Some(offset)) = (p.entry_name, entry_offset) {
+        out[offset..offset + 4].copy_from_slice(&(strings.len() as u32).to_le_bytes());
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
     }
     strings.resize(strings.len().next_multiple_of(4), 0);
     u32s(&mut out, &[strings.len() as u32]);
@@ -490,12 +502,34 @@ mod tests {
             bindings: &[],
             threads: [0; 3],
             wave_size: None,
+            entry_name: None,
         });
         recovered[1].interp = 2;
         super::super::vertex_output_interpolation(&psv, &mut recovered).unwrap();
         assert_eq!(recovered.iter().map(|e| e.interp).collect::<Vec<_>>(), [1, 1, 2]);
         assert!(super::super::vertex_output_interpolation(&psv[..psv.len() - 1], &mut recovered)
             .is_err());
+    }
+
+    #[test]
+    fn psv_for_validator_1_8_includes_the_compute_entry_name() {
+        let bytes = psv(&Psv {
+            stage: 5,
+            flag: false,
+            inputs: &[],
+            outputs: &[],
+            prims: &[],
+            mesh: None,
+            geometry: None,
+            bindings: &[],
+            threads: [32, 1, 1],
+            wave_size: Some(32),
+            entry_name: Some("main"),
+        });
+        assert_eq!(bytes[..4], 52u32.to_le_bytes());
+        assert_eq!(bytes[52..56], 1u32.to_le_bytes());
+        assert_eq!(bytes[60..64], 8u32.to_le_bytes());
+        assert_eq!(&bytes[64..72], b"\0main\0\0\0");
     }
 
     #[test]

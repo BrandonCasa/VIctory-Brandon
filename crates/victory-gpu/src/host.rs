@@ -894,6 +894,32 @@ pub(crate) fn gpu_progress() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_PROGRESS"))
 }
 
+/// Keep detailed rejection logs separate from the default first-reason reports.
+#[cfg(feature = "diagnostics")]
+pub(crate) struct IndexedFailureTrace<Key>(Mutex<(u64, usize, std::collections::VecDeque<Key>)>);
+
+#[cfg(feature = "diagnostics")]
+impl<Key: PartialEq> IndexedFailureTrace<Key> {
+    pub(crate) const fn new() -> Self {
+        Self(Mutex::new((0, 0, std::collections::VecDeque::new())))
+    }
+
+    pub(crate) fn report(&self, key: Key) -> bool {
+        if !gpu_progress() && !trace_texture_reads() { return false; }
+        let frame = crate::queue::presented();
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.0 != frame {
+            state.0 = frame;
+            state.1 = 0;
+        }
+        if state.1 >= 16 || state.2.contains(&key) { return false; }
+        if state.2.len() == 64 { state.2.pop_front(); }
+        state.2.push_back(key);
+        state.1 += 1;
+        true
+    }
+}
+
 #[cfg(feature = "diagnostics")]
 pub(crate) fn note_candidate_slots(catalogue: u64, requested: u64) {
     SUBMIT_CANDIDATE_SLOTS[0].fetch_add(catalogue, Ordering::Relaxed);
@@ -3284,11 +3310,17 @@ impl StageSelections {
     fn report_missing(&self, scope: usize, command: u32, pipeline: usize, logical: u32) {
         let Some(&UnresolvedSelector { input, word, native_spans, write_spans, merged }) = self.missing.get(&scope) else { return };
         static FIRST: std::sync::Once = std::sync::Once::new();
-        FIRST.call_once(|| tracing::warn!(scope, command, pipeline=format_args!("{pipeline:#x}"), logical, input,
-            native_spans, write_spans, merged, reason=word.map(|w| w.reason),
-            source_slot=word.map(|w| w.logical), address=word.map(|w| w.address),
-            bytes=word.map(|w| w.bytes), step=word.map(|w| w.step),
-            "unresolved indexed selector at a conflicting native command"));
+        static TRACE: IndexedFailureTrace<(usize, u32, u32, usize)> = IndexedFailureTrace::new();
+        let detailed = TRACE.report((pipeline, command, logical, input));
+        let mut first = false;
+        FIRST.call_once(|| first = true);
+        if first || detailed {
+            tracing::warn!(scope, command, pipeline=format_args!("{pipeline:#x}"), logical, input,
+                native_spans, write_spans, merged, reason=word.map(|w| w.reason),
+                source_slot=word.map(|w| w.logical), address=word.map(|w| w.address),
+                bytes=word.map(|w| w.bytes), step=word.map(|w| w.step),
+                "unresolved indexed selector at a conflicting native command");
+        }
     }
     /// Selectors for every actual SRV stage that accepts a candidate's view
     /// dimension. One unbounded stage of that kind retains the full heap.
@@ -9488,10 +9520,16 @@ impl HostList {
                     first_clear=?uses.first_clear(copy.texture.as_raw() as usize), shader_states=?uses.shader_states(copy.serial),
                     "first conflicting candidate color chronology"));
             }
-            SAID[usize::from(conflict.is_some())].call_once(|| tracing::info!(serial=copy.serial, initial, last=_last, kind, logical, ?conflict, ?selected,
-                pipeline=format_args!("{pipeline:#x}"),
-                target_views=?conflict.map(|(cmd,_,_,_)| uses.target_view(cmd, copy.texture.as_raw() as usize)),
-                "checked native texture state at opaque shader commands"));
+            static DETAILS: IndexedFailureTrace<(usize, u32, u32, u64)> = IndexedFailureTrace::new();
+            let detailed = conflict.is_some_and(|(command,_,_,_)| DETAILS.report((pipeline, command, logical, copy.serial)));
+            let mut first = false;
+            SAID[usize::from(conflict.is_some())].call_once(|| first = true);
+            if first || detailed {
+                tracing::info!(serial=copy.serial, initial, last=_last, kind, logical, ?conflict, ?selected,
+                    pipeline=format_args!("{pipeline:#x}"),
+                    target_views=?conflict.map(|(cmd,_,_,_)| uses.target_view(cmd, copy.texture.as_raw() as usize)),
+                    "checked native texture state at opaque shader commands");
+            }
         }
         conflict.is_none()
     }

@@ -1580,6 +1580,9 @@ fn workers() -> &'static Workers {
                         // A little while awake first: the next work comes
                         // within microseconds more often than not.
                         spin(|| workers.there.load(Ordering::Acquire) > 0);
+                        if workers.there.load(Ordering::Acquire) == 0 {
+                            crate::texture::trim_idle_read_scratch();
+                        }
                         let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
                             if let Some(job) = jobs.pop_front() {
