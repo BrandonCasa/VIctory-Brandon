@@ -731,6 +731,17 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
 /// bytes.
 static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Claimed footprint bytes covered by recorded views, by late views only,
+/// outside both, or without a known view, followed by bytes sent to the queue.
+#[cfg(feature = "diagnostics")]
+static UPLOAD_VIEW_BYTES: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn upload_view_bytes() -> [u64; 5] {
+    UPLOAD_VIEW_BYTES.each_ref().map(|bytes| bytes.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// The bytes of staging buffers alive ([`crate::residency`]).
 pub(crate) fn live_staging_bytes() -> u64 {
     STAGED[1].load(std::sync::atomic::Ordering::Relaxed)
@@ -1246,19 +1257,49 @@ pub(crate) fn missing_view(uploads: &[&PreludeUpload], view: ViewRange) -> Optio
         for upload in uploads {
             let s = &upload.staging;
             let source = s.memory as usize;
-            let spans = s.layout.subresource_runs(part.mip, part.slice).map(|runs| runs.map(|r| {
-                let start = source + r.start;
-                (format!("{start:#x}"), r.len(), mapped_bytes(start as *const u8, r.len()))
-            }).collect::<Vec<_>>());
             let captured = part.mip.checked_sub(s.first).and_then(|mip| {
                 let i = (part.slice * (s.mips - s.first) + mip) as usize;
                 s.parts.lock().unwrap_or_else(|e| e.into_inner()).get(i).and_then(|p| p.content)
             });
+            #[cfg(feature = "diagnostics")]
+            if crate::switch::on("VICTORY_TRACE_TEXTURE_OWNER") {
+                let mapping = crate::watch::title_memory_reading_now();
+                let mapping_stable = mapping.is_some();
+                let spans = s.layout.subresource_runs(part.mip, part.slice).map(|runs| {
+                    runs.map(|r| required_backing_span(source + r.start, r.len(), mapping_stable))
+                        .collect::<Vec<_>>()
+                });
+                drop(mapping);
+                tracing::warn!(image = s.serial, memory = format_args!("{source:#x}"), ?part, first = s.first,
+                    base = s.level0, ?captured, mapping_stable, ?spans, desc = ?s.layout.desc, "required texture backing");
+                continue;
+            }
+            let spans = s.layout.subresource_runs(part.mip, part.slice).map(|runs| runs.map(|r| {
+                let start = source + r.start;
+                (format!("{start:#x}"), r.len(), mapped_bytes(start as *const u8, r.len()))
+            }).collect::<Vec<_>>());
             tracing::warn!(image = s.serial, memory = format_args!("{source:#x}"), ?part, first = s.first,
                 base = s.level0, ?captured, ?spans, desc = ?s.layout.desc, "required texture backing");
         }
     }
     missing
+}
+
+#[cfg(feature = "diagnostics")]
+fn required_backing_span(start: usize, len: usize, mapping_stable: bool) -> String {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+
+    let shown = crate::inplace::shown_bytes(start, len);
+    let backing = crate::inplace::backing(start, len);
+    let sparse = crate::inplace::sparse_range(start, len);
+    let sparse_null = mapping_stable.then(|| crate::inplace::sparse_null_range(start, len));
+    let mapped = mapped_bytes(start as *const u8, len);
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the query only fills `info`, even if the title address is inaccessible.
+    let queried = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) } != 0;
+    let region = queried.then(|| format!("state={:#x} protect={:#x} allocation={:#x} base={:#x} size={:#x}",
+        info.State, info.Protect, info.AllocationBase as usize, info.BaseAddress as usize, info.RegionSize));
+    format!("address={start:#x} bytes={len} mapped={mapped} shown={shown:?} sparse={sparse} sparse_null={sparse_null:?} region={region:?} backing={backing:?}")
 }
 
 /// A title texture deferred to submission time so `staging.refresh()` runs
@@ -1277,6 +1318,11 @@ impl PreludeUpload {
     pub(crate) fn sent(&self) {
         if let Some(v) = &self.version {
             v.sent.store(true, std::sync::atomic::Ordering::Release);
+            #[cfg(feature = "diagnostics")]
+            if crate::copystat::memory_categories() {
+                let bytes = v.parts.iter().map(|(i, _)| self.staging.part_bytes(*i)).sum();
+                UPLOAD_VIEW_BYTES[4].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+            }
             let mut parts = self.staging.parts.lock().unwrap_or_else(|e| e.into_inner());
             for &(i, _) in &v.parts {
                 if let Some(part) = parts.get_mut(i) {
@@ -1361,6 +1407,25 @@ impl PreludeUpload {
         self.resource
     }
 
+    /// Compare the claimed native footprint with the views known to this
+    /// list. An uncovered part may still be sampled by a different list.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_claim_views(&self, recorded: &[ViewRange], has_late_views: bool, late_contains: impl Fn(u32, u32) -> bool) {
+        let Some(version) = &self.version else { return };
+        let mut bytes = [0u64; 4];
+        for (i, _) in &version.parts {
+            let (mip, slice) = self.staging.part(*i);
+            let class = if recorded.iter().any(|view| view.includes(mip, slice)) { 0 }
+                else if late_contains(mip, slice) { 1 }
+                else if !recorded.is_empty() || has_late_views { 2 }
+                else { 3 };
+            bytes[class] += self.staging.part_bytes(*i);
+        }
+        for (counter, bytes) in UPLOAD_VIEW_BYTES.iter().zip(bytes) {
+            if bytes != 0 { counter.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed); }
+        }
+    }
+
     /// Called on the submitting thread after `self.staging.refresh()` has
     /// completed for this submission. Returns `Some(first_upload)` when the
     /// list's prelude must record `CopyTextureRegion` into `self.copy.texture`.
@@ -1379,8 +1444,7 @@ impl PreludeUpload {
         let mut storage = self.staging.storage.lock().unwrap_or_else(|e| e.into_inner());
         for (i, part) in parts.iter().enumerate().filter(|(_, p)| p.dirty) {
             let fp = &self.staging.footprints[i];
-            let len = (u64::from(fp.Footprint.RowPitch) * u64::from(self.staging.rows[i]) * u64::from(fp.Footprint.Depth))
-                .min(self.staging.bytes - fp.Offset);
+            let len = self.staging.part_bytes(i);
             let offset = size.next_multiple_of(512);
             if part.captured.is_none() {
                 if let StageStorage::Cpu(blocks) = &*storage
@@ -1723,6 +1787,10 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
 // BC1 requires transparent index 3. BC7 mode 6 encodes zero RGBA endpoints.
 fn null_sample_block(format: u32) -> Option<&'static [u8]> {
     match format {
+        // R16_TYPELESS and R16_UNORM use the same zero bits. Every typed
+        // interpretation of the R16 backing, including FLOAT, decodes those
+        // bits as zero. The view supplies any missing channels.
+        53 | 56 => Some(&[0; 2]),
         70..=72 => Some(&[0, 0, 0, 0, 255, 255, 255, 255]),
         79..=81 => Some(&[0; 8]),
         73..=78 | 82..=84 | 94..=96 => Some(&[0; 16]),
@@ -1810,6 +1878,12 @@ impl Staging {
     fn part(&self, i: usize) -> (u32, u32) {
         let mips = self.mips - self.first;
         (self.first + i as u32 % mips, i as u32 / mips)
+    }
+
+    fn part_bytes(&self, i: usize) -> u64 {
+        let fp = &self.footprints[i];
+        (u64::from(fp.Footprint.RowPitch) * u64::from(self.rows[i]) * u64::from(fp.Footprint.Depth))
+            .min(self.bytes - fp.Offset)
     }
 
     /// The host copy holds what the staging buffer was filled from
@@ -2174,7 +2248,7 @@ impl Staging {
         (coverage, bytes)
     }
 
-    /// Xbox page mappings address the compressed blocks before detiling.
+    /// Xbox page mappings address the encoded texels or blocks before detiling.
     /// A partially resident mip can have valid artwork on one page and NULL
     /// texels on its neighbour, even inside a single native mip level.
     fn read_sparse_blocks(&self, at: usize, out: &mut [u8]) -> Option<usize> {
@@ -3018,6 +3092,19 @@ mod prelude_upload_tests {
         assert_eq!(previous.get(32..40), Some(&tiled[32..40]));
         previous.capture(&tiled, None);
         assert_eq!(previous.get(4080..4096), Some(&tiled[4080..4096]));
+    }
+
+    #[test]
+    fn sparse_r16_unorm_uses_zero_texels_for_explicit_null_pages() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM};
+
+        let format = DXGI_FORMAT_R16_UNORM.0 as u32;
+        let block = super::null_sample_block(format).unwrap();
+        assert_eq!(block.len(), 2);
+        let mut texels = [0xff; 8];
+        super::fill_null_blocks(&mut texels, block);
+        assert_eq!(texels, [0; 8]);
+        assert_eq!(super::null_sample_block(DXGI_FORMAT_R16_TYPELESS.0 as u32), Some(block));
     }
 
     #[test]

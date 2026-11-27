@@ -2529,9 +2529,10 @@ pub(crate) static SWEPT_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sy
 /// 26,517 copies of filled textures were let go to stay under the card's
 /// line.
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn targets_census() -> [u64; 12] {
+pub(crate) fn targets_census(trace_backing: bool) -> [u64; 20] {
     use std::sync::atomic::Ordering::Relaxed;
-    let mut c = [0u64; 12];
+    let mut c = [0u64; 20];
+    let mut spans = Vec::new();
     let all = textures();
     for &at in all.iter() {
         // SAFETY: as in `let_go_idle`.
@@ -2572,6 +2573,28 @@ pub(crate) fn targets_census() -> [u64; 12] {
         if placed {
             add(10);
         }
+        if trace_backing {
+            add(match r.backing {
+                Backing::Committed(_) => 12,
+                Backing::Placed { .. } => 14,
+                Backing::Address(_) => 16,
+            });
+            if let Some((start, bytes)) = guest_texture_span(at as This)
+                && start != 0 && bytes != 0 && let Some(end) = start.checked_add(bytes)
+            {
+                spans.push((start, end));
+                c[18] += bytes as u64;
+            }
+        }
+    }
+    drop(all);
+    // Count overlapping virtual addresses once. Distinct virtual mappings
+    // of the same console pages can still refer to the same physical bytes.
+    spans.sort_unstable();
+    let mut covered = 0;
+    for (start, end) in spans {
+        c[19] += end.saturating_sub(start.max(covered)) as u64;
+        covered = covered.max(end);
     }
     c
 }

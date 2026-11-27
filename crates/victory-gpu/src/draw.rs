@@ -50,6 +50,7 @@ impl TablePlan {
             .filter(|u| u.root == RootType::Table)
             .map(|u| u.slot)
             .collect();
+        slots.extend(indexed.iter().map(|view| view.table_slot));
         slots.sort_unstable();
         slots.dedup();
         let mut groups: Vec<_> = slots
@@ -1572,7 +1573,9 @@ impl State {
             return memory.map_or(0, |m| m.base);
         }
         // All of every group, unless the dispatch says otherwise.
-        if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
+        if matches!(kind, victory_shader::emit::USER_DISPATCH_THREADS_X
+            | victory_shader::emit::USER_DISPATCH_GROUP_BASE_X)
+        {
             return 0;
         }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
@@ -1677,8 +1680,10 @@ impl State {
             }
         }
         addresses.extend(views.iter().map(|v| v.at));
-        let ray_shader = (t.ray_tracing && self.dispatch_groups_x.is_some_and(|x| x != 0))
-            .then_some(shader);
+        let ray_shader = t.ray_tracing.then_some((
+            shader,
+            self.dispatch_groups_x.is_some_and(|x| x != 0),
+        ));
         crate::memory::ready(
             list,
             heap,
@@ -1955,7 +1960,6 @@ impl State {
                     *form &= !victory_shader::emit::BUFFER_WRITE_ACCESS;
                 }
             }
-            aliases.slots.merge(&stage_aliases.slots);
             let mut addresses = Few::<crate::memory::ViewSpan, 8>::default();
             for (&(slot, dword), &saved) in t.address_keys.iter().zip(snapshot.iter()) {
                 addresses.push(saved.unwrap_or_else(|| self.view_span(compute, slot, dword)));
@@ -2074,7 +2078,8 @@ impl State {
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // The common metadata for translated descriptor indices.
                         let stage_state = if stage.shader.stage == "pixel" { 0x80 } else { 0x40 };
-                        match self.heap_metadata(list, &t.host.indexed_forms, compute, &made, p, compute_tail, stage_state, &mut device_materials) {
+                        match self.heap_metadata(list, &t.host.indexed_forms, compute, &made, p, compute_tail,
+                            stage_state, &mut device_materials, &mut stage_aliases.slots) {
                             // SAFETY: an open list; the table lives as long
                             // as the heap the list holds.
                             Some(gpu) => unsafe {
@@ -2184,6 +2189,7 @@ impl State {
                     }
                 }
             }
+            aliases.slots.merge(&stage_aliases.slots);
         }
         if aliases.needs_check()
             && let Some(heap) = self.heaps.iter().copied().filter(|&h| h != 0)
@@ -2441,7 +2447,7 @@ impl State {
         let mut slots = self.indexed_root_slots(access, compute);
         let mut words_only = access.opaque & 8 == 0;
         for &(index, kind) in &access.buffer_indices {
-            let source = self.buffer_index(index, compute, tables);
+            let source = self.buffer_index(index, compute, tables, "texture SRV");
             if let Some(source) = &source {
                 if source.recording_static() && index.word_step == 0 && index.records.is_none() && crate::pipeline::static_table_word(self.pipeline as This, index.table_slot, index.table_dword) {
                     let mut exact = std::collections::BTreeSet::new();
@@ -2455,7 +2461,7 @@ impl State {
                 table_slot: g.table_slot, table_dword: g.table_dword,
                 word: victory_shader::resource::HeapOffset { bytes: g.offset, constant: None },
                 word_step: 0, bytes: 0, guard: None, records: None, value_mask: u32::MAX,
-            }, compute, tables));
+            }, compute, tables, "texture SRV guard"));
             if source.is_some() || guard.is_some() {
                 let input = crate::descriptor::index_words::SampleWords::direct(source, guard);
                 if !slots.words.contains(&input) { slots.words.push(input); }
@@ -2465,11 +2471,11 @@ impl State {
             }
             slots.opaque |= 8;
         }
-        use crate::descriptor::index_words::{DependentWords, MaterialWords, SampleWords};
+        use crate::descriptor::index_words::{DependentWords, MaterialWords, PackedMaterialWords, SampleWords};
         let capture = |(table_slot, table_dword)| self.buffer_index(victory_shader::resource::BufferIndex {
             table_slot, table_dword, word: victory_shader::resource::HeapOffset { bytes: 0, constant: None },
             word_step: 0, bytes: 0, guard: None, records: None, value_mask: u32::MAX,
-        }, compute, tables);
+        }, compute, tables, "dependent texture SRV");
         let mut bind = |words: Option<DependentWords>, kind: u8| {
             if let Some(words) = words {
                 let input = SampleWords { index: None, guard: None, chain: Some(Box::new(words)) };
@@ -2521,10 +2527,20 @@ impl State {
             let words = crate::descriptor::index_words::ScalarPrograms::capture(code, capture);
             bind(words.map(DependentWords::Programs), kind);
         }
+        let mut packed = std::collections::BTreeMap::new();
+        for &(column, kind) in &access.packed_material {
+            packed.entry((column.parent, column.records, column.parent_count, column.parent_stride, kind))
+                .or_insert_with(Vec::new).push(column);
+        }
+        for ((parent, records, _, _, kind), columns) in packed {
+            let words = capture(parent).zip(capture(records)).and_then(|(parent, records)|
+                PackedMaterialWords::new(parent, records, columns));
+            bind(words.map(DependentWords::PackedMaterial), kind);
+        }
         slots.words_only = words_only && !slots.words.is_empty();
         let mut uav_words_only = access.opaque & 16 == 0;
         for &(index, kind, write) in &access.uav_indices {
-            if let Some(source) = self.buffer_index(index, compute, tables) {
+            if let Some(source) = self.buffer_index(index, compute, tables, "texture UAV") {
                 let sample = SampleWords::direct(Some(source), None);
                 if !slots.uav_words.contains(&sample) { slots.uav_words.push(sample); }
             } else {
@@ -2540,10 +2556,40 @@ impl State {
         slots
     }
 
-    fn buffer_index(&self, index: victory_shader::resource::BufferIndex, compute: bool, tables: &[(u8, u32)]) -> Option<crate::descriptor::index_words::IndexWords> {
-        let missing = |reason: &'static str, bit: u32| {
+    fn buffer_index(&self, index: victory_shader::resource::BufferIndex, compute: bool, tables: &[(u8, u32)],
+        role: &'static str) -> Option<crate::descriptor::index_words::IndexWords> {
+        self.selector_index(index, compute, tables, true, role)
+    }
+
+    fn selector_index(&self, index: victory_shader::resource::BufferIndex, compute: bool, tables: &[(u8, u32)],
+        float: bool, role: &'static str) -> Option<crate::descriptor::index_words::IndexWords> {
+        #[cfg(feature = "diagnostics")]
+        let trace = {
+            static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *TRACE.get_or_init(|| crate::switch::on("VICTORY_TRACE_TEXTURE_OWNER"))
+        };
+        #[cfg(feature = "diagnostics")]
+        let trace_missing = |reason: &'static str, handle: Option<u64>, snapshot: Option<(u32, [u32; 3])>,
+            word: Option<crate::descriptor::index_words::MissingWord>| {
+            if !trace { return; }
+            type Key = (bool, &'static str, victory_shader::resource::BufferIndex, &'static str);
+            type Failures = std::collections::HashMap<usize, Vec<Key>>;
+            static SEEN: std::sync::LazyLock<std::sync::Mutex<Failures>> = std::sync::LazyLock::new(Default::default);
+            {
+                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                let key = (compute, role, index, reason);
+                let pipeline = seen.entry(self.pipeline).or_default();
+                if pipeline.contains(&key) { return; }
+                pipeline.push(key);
+            }
+            tracing::info!(pipeline = format_args!("{:#x}", self.pipeline), compute, role, ?index, reason,
+                handle = ?handle.map(|handle| format!("{handle:#x}")), ?snapshot, ?word,
+                "selector capture failed at a native root binding");
+        };
+        let missing = |reason: &'static str, bit: u32, handle: Option<u64>| {
             #[cfg(feature = "diagnostics")]
             {
+                trace_missing(reason, handle, None, None);
                 static SEEN: AtomicU64 = AtomicU64::new(0);
                 let mask = 1 << (bit * 3 + match index.word_step { 0 => 0, 1 => 1, _ => 2 });
                 if SEEN.load(Ordering::Relaxed) & mask == 0 && SEEN.fetch_or(mask, Ordering::Relaxed) & mask == 0 {
@@ -2553,17 +2599,18 @@ impl State {
                 }
             }
             #[cfg(not(feature = "diagnostics"))]
-            let _ = (reason, bit);
+            let _ = (reason, bit, handle, role);
             None
         };
         let roots = self.roots_ref(compute);
-        let Some(Root::Table(table)) = roots.get(usize::from(index.table_slot)) else { return missing("table root", 0); };
-        let handle = table.checked_add(u64::from(index.table_dword) * 4)?;
+        let Some(Root::Table(table)) = roots.get(usize::from(index.table_slot)) else { return missing("table root", 0, None); };
+        let Some(handle) = table.checked_add(u64::from(index.table_dword) * 4)
+        else { return missing("table handle overflow", 6, None); };
         let term = match index.word.constant {
             None => 0,
             Some((slot, dword, shift)) => {
-                let Some(Root::Constants(words)) = roots.get(usize::from(slot)) else { return missing("offset root", 1); };
-                let Some(word) = words.get(dword as usize) else { return missing("offset constant", 2); };
+                let Some(Root::Constants(words)) = roots.get(usize::from(slot)) else { return missing("offset root", 1, Some(handle)); };
+                let Some(word) = words.get(dword as usize) else { return missing("offset constant", 2, Some(handle)); };
                 word << shift
             }
         };
@@ -2572,20 +2619,33 @@ impl State {
         // table construction and heap preparation must not substitute its word.
         let snapshot = if let Some(&(_, first)) = tables.iter().find(|entry| entry.0 == index.table_slot) {
             let Some((_, fresh)) = self.fresh_tables.iter().find(|((start, _, _), f)| start == table && f.first == first / 32)
-            else { return missing("list-owned table", 3); };
+            else { return missing("list-owned table", 3, Some(handle)); };
             let entry = index.table_dword / 8;
-            let Some(record) = fresh.records.get(entry as usize) else { return missing("list-owned entry", 4); };
+            let Some(record) = fresh.records.get(entry as usize) else { return missing("list-owned entry", 4, Some(handle)); };
             Some((fresh.first.checked_add(entry)?, *record))
         } else { None };
-        let Some(heap) = self.heap_of(handle) else { return missing("guest view heap", 5); };
+        let Some(heap) = self.heap_of(handle) else { return missing("guest view heap", 5, Some(handle)); };
         let records = if let Some(records) = index.records {
             let word = |(slot, dword): (u8,u32)| {
                 let Root::Constants(words) = roots.get(usize::from(slot))? else { return None };
                 words.get(dword as usize).copied()
             };
-            Some((word(records.first)?, word(records.count)?, records.stride))
+            let Some(first) = word(records.first) else { return missing("record first constant", 7, Some(handle)); };
+            let Some(count) = word(records.count) else { return missing("record count constant", 8, Some(handle)); };
+            Some((first, count, records.stride, float))
         } else { None };
-        crate::descriptor::index_words::IndexWords::capture(heap, handle, snapshot, offset, index.word_step, index.bytes, records, index.value_mask)
+        let capture = || crate::descriptor::index_words::IndexWords::capture(heap, handle, snapshot, offset,
+            index.word_step, index.bytes, records, index.value_mask);
+        #[cfg(feature = "diagnostics")]
+        if trace {
+            let (source, issue) = crate::descriptor::index_words::diagnose_capture(capture);
+            if source.is_none() {
+                trace_missing(issue.map_or("view identity or selector span invalid", |word| word.reason),
+                    Some(handle), snapshot, issue);
+            }
+            return source;
+        }
+        capture()
     }
 
     fn reads_materials(pipeline: &HostPipeline) -> bool {
@@ -2616,8 +2676,9 @@ impl State {
     }
 
     fn heap_metadata(&self, list: &HostList, access: &victory_shader::emit::IndexedAccess, compute: bool, tables: &[(u8, u32)],
-        pipeline: &HostPipeline, compute_tail: bool, stage_state: u8, device_materials: &mut Vec<(usize, crate::descriptor::host::IndexedSlots)>) -> Option<u64> {
-        let slots = self.indexed_slots_for_tables(access, compute, tables, pipeline, stage_state == 0x80);
+        pipeline: &HostPipeline, compute_tail: bool, stage_state: u8, device_materials: &mut Vec<(usize, crate::descriptor::host::IndexedSlots)>,
+        buffer_aliases: &mut crate::descriptor::host::IndexedSlots) -> Option<u64> {
+        let mut slots = self.indexed_slots_for_tables(access, compute, tables, pipeline, stage_state == 0x80);
         let heap = self
             .heaps
             .iter()
@@ -2626,6 +2687,47 @@ impl State {
             .find(|h| !h.samplers())?;
         let host = heap.host()?;
         let gpu = host.strides_gpu()?;
+        if !access.buffer_uav_indices.is_empty() {
+            use crate::descriptor::index_words::SampleWords;
+            #[cfg(feature = "diagnostics")]
+            crate::descriptor::index_words::take_missing_word();
+            let mut selectors = std::collections::BTreeMap::<u8, Vec<SampleWords>>::new();
+            let mut unavailable = 0;
+            for &(index, form) in &access.buffer_uav_indices {
+                let Some(source) = self.selector_index(index, compute, tables, false, "buffer UAV") else {
+                    unavailable |= form;
+                    continue;
+                };
+                let words = SampleWords::direct(Some(source), None);
+                let group = selectors.entry(form).or_default();
+                if !group.contains(&words) { group.push(words); }
+            }
+            for (form, words) in selectors {
+                if unavailable & form != 0 { continue; }
+                let Some(proof) = list.recording_buffer_selection(words, host.count()) else {
+                    unavailable |= form;
+                    continue;
+                };
+                for &slot in proof.slots() {
+                    *slots.exact.entry(slot).or_default() |= form;
+                    *buffer_aliases.exact.entry(slot).or_default() |= form;
+                }
+                slots.buffer_writes.push(proof);
+            }
+            slots.opaque |= unavailable;
+            buffer_aliases.opaque |= unavailable;
+            #[cfg(feature = "diagnostics")]
+            {
+                static FIRST: [std::sync::Once; 2] = [const { std::sync::Once::new() }; 2];
+                FIRST[usize::from(unavailable != 0)].call_once(|| {
+                    let missing = crate::descriptor::index_words::take_missing_word();
+                    tracing::info!(pipeline = format_args!("{:#x}", self.pipeline), scopes = slots.buffer_writes.len(),
+                        selected = slots.buffer_writes.iter().map(|proof| proof.slots().len()).sum::<usize>(),
+                        opaque = slots.opaque, fallback = unavailable, reason = missing.map(|word| word.reason),
+                        source_slot = missing.map(|word| word.logical), "buffer write selector at native recording");
+                });
+            }
+        }
         let frame = crate::frame::current();
         // The binding also supplies physical slots to texture-only shaders and
         // explicit tables. Their resources and exact indexed buffers are
@@ -4182,19 +4284,26 @@ impl State {
             if !selected_slot(&fresh, slot) {
                 continue;
             }
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
-                continue;
+            let binding = (|| {
+                let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                    return Err("table root argument missing");
+                };
+                let heap = self.heap_of(table).ok_or("table outside bound heaps")?;
+                if heap.samplers() || (table - heap.start) % 32 != 0 {
+                    return Err("view table has the wrong heap type or alignment");
+                }
+                let host = heap.host().ok_or("bound heap has no native heap")?;
+                Ok((table, heap, host))
+            })();
+            let (table, heap, host) = match binding {
+                Ok(binding) => binding,
+                Err(reason) => {
+                    self.table_failure(shader, compute, slot, 0, None, reason);
+                    made.push((slot, u32::MAX));
+                    return made;
+                }
             };
             let entries = &group.entries;
-            let Some(heap) = self.heap_of(table) else {
-                continue;
-            };
-            if heap.samplers() || (table - heap.start) % 32 != 0 {
-                continue;
-            }
-            let Some(host) = heap.host() else {
-                continue;
-            };
             let mut selected: Vec<u32> = group
                 .indexed
                 .iter()
@@ -4823,24 +4932,24 @@ impl State {
         }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find_any(arguments, len) else {
-            why("arguments outside title buffers");
+            list.refused_command(self.pipeline, "indirect arguments outside title buffers");
             return false;
         };
         let counter = match count {
             Some(at) => match crate::shadow::find_any(at, 4) {
                 Some(s) => Some((s, at)),
                 None => {
-                    why("count outside title buffers");
+                    list.refused_command(self.pipeline, "indirect count outside title buffers");
                     return false;
                 }
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
-            .flatten()
-        else {
-            why("no host signature");
+        let split = kind == DISPATCH && crate::indirect::wide_enabled()
+            && compute_word(p, victory_shader::emit::USER_DISPATCH_GROUP_BASE_X).is_some();
+        let signature = if split { split_dispatch_signature(p) } else { host_signature(kind, stride) };
+        let Some(signature) = signature else {
+            list.refused_command(self.pipeline, "required indirect command has no host signature");
             return false;
         };
         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
@@ -4848,7 +4957,7 @@ impl State {
             return false;
         }
         // One record without a count: clamped in a batch (`batches`).
-        let batch = if batches() > 0 && max == 1 && count.is_none() {
+        let batch = if !split && batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
@@ -4917,11 +5026,12 @@ impl State {
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    let clamp_kind = if split { crate::indirect::SPLIT_DISPATCH } else { kind };
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (clamp_kind, step, records))
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
-                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                    list.refused_command(self.pipeline, "could not prepare required indirect arguments");
                     return false;
                 };
                 self.host_pipeline = 0;
@@ -4964,14 +5074,20 @@ impl State {
         }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
+        // Split commands already encode the count buffer as empty tail records.
+        let (commands, count) = if split {
+            (max * crate::indirect::DISPATCH_CHUNKS, None)
+        } else {
+            (max, counter.as_ref())
+        };
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
-                max,
+                commands,
                 &bounded,
                 at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                count.map(|(s, _)| &s.buffer),
+                count.map_or(0, |(s, at)| s.offset(*at)),
             )
         };
         list.issued_shader(self.pipeline);
@@ -5088,6 +5204,22 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     }
     let signature = signature?;
     made.push(((kind, stride), signature.clone()));
+    Some(signature)
+}
+
+/// A split dispatch changes only the translated group-base constant.
+fn split_dispatch_signature(p: &HostPipeline) -> Option<ID3D12CommandSignature> {
+    let (param, word) = compute_word(p, victory_shader::emit::USER_DISPATCH_GROUP_BASE_X)?;
+    type Entry = (ID3D12RootSignature, u32, u32, ID3D12CommandSignature);
+    static MADE: std::sync::Mutex<Vec<Entry>> = std::sync::Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, _, _, signature)) = made.iter()
+        .find(|(root, slot, offset, _)| root == &p.root && *slot == param && *offset == word)
+    {
+        return Some(signature.clone());
+    }
+    let signature = crate::indirect::split_signature(&crate::host::host()?.device, &p.root, param, word)?;
+    made.push((p.root.clone(), param, word, signature.clone()));
     Some(signature)
 }
 

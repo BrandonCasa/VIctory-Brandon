@@ -266,14 +266,18 @@ pub(crate) struct IndexedSlots {
     pub words_only: bool,
     pub uav_words: Vec<super::index_words::SampleWords>,
     pub uav_words_only: bool,
+    pub buffer_writes: Vec<crate::host::BufferWriteSelection>,
 }
 
 impl IndexedSlots {
     pub(crate) fn empty(&self) -> bool {
-        self.opaque == 0 && self.exact.is_empty()
+        self.opaque == 0 && self.exact.is_empty() && self.buffer_writes.is_empty()
     }
 
     pub(crate) fn merge(&mut self, other: &Self) {
+        for proof in &other.buffer_writes {
+            if !self.buffer_writes.contains(proof) { self.buffer_writes.push(proof.clone()); }
+        }
         let bounded_uavs = (self.opaque & 16 == 0 || self.uav_words_only)
             && (other.opaque & 16 == 0 || other.uav_words_only);
         self.uav_words_only = (self.opaque | other.opaque) & 16 != 0 && bounded_uavs;
@@ -2898,9 +2902,14 @@ impl HostHeap {
                     let slot = (self as *const Self as usize, logical);
                     if stages.is_some_and(|s| s.excludes(texture_kind(&binding.view).map_or(0, |(_, k)| k), logical))
                         || list.indexed_texture_matches(slot, (record, image.serial, None), false).is_ok()
-                        || late.as_deref_mut().is_some_and(|samples|
-                            list.prepare_late_sampled_texture(binding.object, &binding.view, &image, samples,
-                                Some(crate::host::SampleAccess { heap: self as *const Self as usize, kind: texture_kind(&binding.view).map_or(0, |(_, k)| k), logical, stages })))
+                        || late.as_deref_mut().is_some_and(|samples| {
+                            let access = crate::host::SampleAccess { heap: slot.0,
+                                kind: texture_kind(&binding.view).map_or(0, |(_, k)| k), logical, stages };
+                            let ready = list.prepare_late_sampled_texture(binding.object, &binding.view, &image, samples, Some(access));
+                            #[cfg(feature = "diagnostics")]
+                            if ready { samples.note_upload_origin(image.serial, record, &binding.view, access, is_exact, sampled_slots.is_some()); }
+                            ready
+                        })
                     { continue; }
                 }
                 let prepared_or_deferred = |proof: &PlainMaterial| {
@@ -2965,6 +2974,21 @@ impl HostHeap {
             }
             if !self.buffer_ready(logical) {
                 return reject(logical, "native descriptor creation failed");
+            }
+            if form == 4 && slots.buffer_writes.iter().any(|proof| proof.slots().contains(&logical)) {
+                let binding = if let Some((shadow, address, bytes)) = buffer_copy(&view)
+                    && self.keeps_resource(logical, &shadow.buffer) {
+                    (key, shadow.id(), address, bytes)
+                } else if matches!(&view, View::Unordered(0, 0, Some(d)) if d[1] == 1)
+                    || matches!(&view, View::Placed(true, r, d) if r[0] == 1 && d[1] == 1 && d[4] == 0) {
+                    (key, 0, 0, 0)
+                } else {
+                    return reject(logical, "bounded buffer write has no matching native binding");
+                };
+                let slot = (self as *const Self as usize, logical);
+                if !list.indexed_buffer_writer_matches(slot, binding, recording) {
+                    return reject(logical, "bounded buffer write binding changed since recording");
+                }
             }
             if matches!(form, 8 | 16) {
                 let topology = crate::resource::alias_generation();
@@ -3047,7 +3071,7 @@ impl HostHeap {
                     let placed = matches!(view, View::Placed(false, ..));
                     let ordinary = matches!(view, View::Shader(..));
                     let cpu_owned = crate::resource::title_fills(this) && !crate::texture::host_wrote(object);
-                    let same_object = matches!(old_view, Some(View::Shader(old, _)) if ordinary && old == object)
+                    let same_object = matches!(old_view.as_ref(), Some(View::Shader(old, _)) if ordinary && *old == object)
                         || matches!(addresses, (Some(old), Some(new)) if placed && old == new);
                     if !is_exact && matches!(view, View::Unordered(..)) && kind == victory_shader::ResourceType::Uav
                         && source.is_none() && crate::resource::twin(this).is_none()
@@ -3113,8 +3137,16 @@ impl HostHeap {
                         // allocation after earlier lists. prepare_late_native_sample
                         // checks for incompatible states inside this recording.
                         else if let Some(producer) = source {
-                            if !recording && late.as_deref_mut().is_some_and(|samples|
-                                list.prepare_late_alias_sample(this, producer, &resolved, &copy, samples)) { None }
+                            if !recording && late.as_deref_mut().is_some_and(|samples| {
+                                let ready = list.prepare_late_alias_sample(this, producer, &resolved, &copy, samples);
+                                #[cfg(feature = "diagnostics")]
+                                if ready {
+                                    let access = crate::host::SampleAccess { heap: slot.0,
+                                        kind: texture_kind(&view).map_or(0, |(_, k)| k), logical, stages };
+                                    samples.note_upload_origin(copy.serial, key, &view, access, is_exact, sampled_slots.is_some());
+                                }
+                                ready
+                            }) { None }
                             else { Some("separate alias image needs ordered copy") }
                         }
                         else if !cpu_owned && placed && crate::resource::placed_span(this).is_some()
@@ -3144,7 +3176,19 @@ impl HostHeap {
                             // views contribute their required subresources to its upload.
                             let same_allocation = previous.is_some_and(|(_, serial, producer)| serial == copy.serial && producer.is_none())
                                 && same_object;
-                            if opaque_writer && !(placed && same_allocation && copy.flags() & 7 == 0) {
+                            let plain_placement = placed && same_allocation && copy.flags() & 7 == 0;
+                            // A placed SRV's host image can carry UAV capability
+                            // even when the guest description has no writer flag.
+                            let deferred_mips = opaque_writer && !plain_placement && same_allocation
+                                && old_view.as_ref().is_some_and(|old| same_placed_srv_mip_window(old, &view));
+                            #[cfg(feature = "diagnostics")]
+                            if opaque_writer && same_allocation && !plain_placement {
+                                static FIRST: [std::sync::Once; 2] = [const { std::sync::Once::new() }; 2];
+                                FIRST[usize::from(deferred_mips)].call_once(|| tracing::info!(logical, serial=copy.serial,
+                                    native_flags=copy.flags(), previous=?old_view, current=?view, deferred_mips,
+                                    "checked a republished mip window on a UAV-capable sampled image"));
+                            }
+                            if opaque_writer && !(plain_placement || deferred_mips) {
                                 Some("sampled guest bytes may be written by this recording")
                             } else if same_allocation
                                 && list.advance_sampled_view(slot, previous, version)
@@ -3152,12 +3196,24 @@ impl HostHeap {
                                 // Check the execution-time upload against the actual write
                                 // ranges under the pinned descriptor publication.
                                 if opaque_writer { list.note_volatile_sample(slot); }
-                                crate::draw::readable_resolved(list, kind, &resolved, placed, source, false);
+                                if deferred_mips {
+                                    // The final descriptor chooses the upload
+                                    // range after real writer and alias checks.
+                                    const SHADER_RESOURCE: u32 = 0xc0;
+                                    crate::list::ensure_state(list, this, SHADER_RESOURCE);
+                                } else {
+                                    crate::draw::readable_resolved(list, kind, &resolved, placed, source, false);
+                                }
                                 None
                             } else { Some("recorded draw requires a different texture allocation") }
                         } else if !late.as_deref_mut().is_some_and(|late| {
                             let access = crate::host::SampleAccess { heap: self as *const Self as usize, kind: texture_kind(&view).map_or(0, |(_, k)| k), logical, stages };
-                            if cpu_owned { list.prepare_late_sampled_texture(object, &resolved, &copy, late, Some(access)) }
+                            if cpu_owned {
+                                let ready = list.prepare_late_sampled_texture(object, &resolved, &copy, late, Some(access));
+                                #[cfg(feature = "diagnostics")]
+                                if ready { late.note_upload_origin(copy.serial, key, &view, access, is_exact, sampled_slots.is_some()); }
+                                ready
+                            }
                             else { list.prepare_late_native_sample(&copy, &resolved, late, access) }
                         }) {
                             if cpu_owned { Some("CPU-owned sampled upload or recorded SRV state unavailable") }
@@ -6810,6 +6866,17 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
     }
 }
 
+/// The title republished only the mip window of a placed sampled view.
+fn same_placed_srv_mip_window(a: &View, b: &View) -> bool {
+    let (View::Placed(false, resource, old), View::Placed(false, _, new)) = (a, b) else { return false; };
+    resource[12] & 7 == 0 && same_placed_texture(a, b) && old[..3] == new[..3]
+        && match old[1] {
+            4 => old[6] == new[6],
+            5 => old[6..9] == new[6..9],
+            _ => false,
+        }
+}
+
 /// A shader view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
@@ -7294,6 +7361,25 @@ mod tests {
         let View::Placed(_, resource, desc) = low.clone() else { unreachable!() };
         assert!(!same_placed_texture(&low, &View::Placed(true, resource, desc)));
         assert!(!same_placed_texture(&low, &View::Shader(0, None)));
+    }
+
+    #[test]
+    fn placed_srv_mip_window_preserves_the_sampled_type_and_layers() {
+        let texture = [3, 0, 0, 0, 256, 0, 256, 0x7_0002, 28, 1, 0, 266, 0x300000, 0];
+        let old = [28, 5, 5768, 0, 3, 4, 0, 2, 0, 0, 0x0b80_0000, 11, 0, 0, 0, 3];
+        let mut new = old;
+        new[4] = 2;
+        new[5] = 5;
+        let a = View::Placed(false, texture, old);
+        assert!(same_placed_srv_mip_window(&a, &View::Placed(false, texture, new)));
+        let mut authored = texture;
+        authored[12] |= 4;
+        assert!(!same_placed_srv_mip_window(&View::Placed(false, authored, old), &View::Placed(false, authored, new)));
+        new[6] = 1;
+        assert!(!same_placed_srv_mip_window(&a, &View::Placed(false, texture, new)));
+        new[6] = 0;
+        new[8] = 1;
+        assert!(!same_placed_srv_mip_window(&a, &View::Placed(false, texture, new)));
     }
 
     #[test]

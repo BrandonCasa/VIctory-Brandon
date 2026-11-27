@@ -122,7 +122,7 @@ pub use lower::{host_settings, host_wave_range, set_host_max_wave, set_host_rdna
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    mapped_views, VIEW_CONSTANT_BOUNDS, FRESH_TABLE_SIZES, MAPPED_DYNAMIC, SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, VIEW_MAPPING, VIEW_MAPPING_BYTES, USER_CBV_BYTES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_PREFIX_SHIFT, VIEW_RAW_RGB32, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    mapped_views, VIEW_CONSTANT_BOUNDS, FRESH_TABLE_SIZES, MAPPED_DYNAMIC, SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, VIEW_MAPPING, VIEW_MAPPING_BYTES, USER_CBV_BYTES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_PREFIX_SHIFT, VIEW_RAW_RGB32, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_DISPATCH_GROUP_BASE_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -139,12 +139,17 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// such loops are what makes a frame slow. The value is part of the
 /// translation, so the shader cache must key on it (`victory-gpu`'s does).
 pub fn loop_limit() -> u32 {
-    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    loop_limit_override().unwrap_or(DEFAULT_LOOP_LIMIT)
+}
+
+/// Exact logical waves need a loop guard only when a valid cap was requested.
+pub fn loop_limit_override() -> Option<u32> {
+    static LIMIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
         if cfg!(feature = "diagnostics") {
             parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
         } else {
-            lower::LOOP_LIMIT
+            None
         }
     })
 }
@@ -311,19 +316,15 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
     parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
 }
 
-/// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
-/// unreadable or 0. Pure, for testing.
-fn parse_loop_limit(value: Option<&str>) -> u32 {
-    let parsed = value
+/// A valid nonzero decimal or hexadecimal diagnostic loop cap.
+fn parse_loop_limit(value: Option<&str>) -> Option<u32> {
+    value
         .map(str::trim)
         .and_then(|v| match v.strip_prefix("0x") {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
-        });
-    match parsed {
-        Some(n) if n > 0 => n,
-        _ => lower::LOOP_LIMIT,
-    }
+        })
+        .filter(|&n| n != 0)
 }
 
 /// Per-access reachability for descriptors selected directly from the guest heap.
@@ -337,6 +338,9 @@ pub struct IndexedAccess {
     pub buffer_indices: Vec<(crate::resource::BufferIndex, u8)>,
     /// Exact uniform storage-texture slot, DXIL resource kind, and whether it is written.
     pub uav_indices: Vec<(crate::resource::BufferIndex, u8, bool)>,
+    /// Structured record fields selecting buffer UAV slots, with their access forms.
+    pub buffer_uav_indices: Vec<(crate::resource::BufferIndex, u8)>,
+    pub packed_material: Vec<(crate::resource::PackedMaterialColumn, u8)>,
     pub chains: Vec<(crate::resource::MaterialChain, u8)>,
     pub scalar_records: Vec<(crate::resource::ScalarRecordChain, u8)>,
     pub pointer_fields: Vec<(crate::resource::PointerField, u8)>,
@@ -460,6 +464,17 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
         }
         other => other,
     }
+}
+
+/// Host lowering required by compute shader workloads with a known layout.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ComputeTranslation {
+    DispatchBase,
+    Derivatives,
+}
+
+pub fn translate_compute(container: &[u8], mode: ComputeTranslation) -> Result<HostShader, ShaderError> {
+    lower::with_compute_translation(mode, || translate(container))
 }
 
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -1236,12 +1251,13 @@ mod tests {
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
-        assert_eq!(parse_loop_limit(None), LOOP_LIMIT);
-        assert_eq!(parse_loop_limit(Some("4096")), 4096);
-        assert_eq!(parse_loop_limit(Some(" 0x1000 ")), 4096);
-        assert_eq!(parse_loop_limit(Some("1")), 1);
+        assert_eq!(parse_loop_limit(None), None);
+        assert_eq!(parse_loop_limit(Some("4096")), Some(4096));
+        assert_eq!(parse_loop_limit(Some(" 0x1000 ")), Some(4096));
+        assert_eq!(parse_loop_limit(Some("1")), Some(1));
+        assert_eq!(parse_loop_limit(Some("1048576")), Some(LOOP_LIMIT));
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
-            assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
+            assert_eq!(parse_loop_limit(Some(bad)), None, "{bad:?}");
         }
     }
     use super::container::SigElement;

@@ -88,6 +88,20 @@ enum Stop {
     Fail(ShaderError),
 }
 
+thread_local! {
+    static COMPUTE_TRANSLATION: std::cell::Cell<Option<super::ComputeTranslation>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn with_compute_translation<R>(mode: super::ComputeTranslation, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<super::ComputeTranslation>);
+    impl Drop for Restore {
+        fn drop(&mut self) { COMPUTE_TRANSLATION.set(self.0); }
+    }
+    let _restore = Restore(COMPUTE_TRANSLATION.replace(Some(mode)));
+    f()
+}
+
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     lower_counted(parts, counted_in_threads(parts))
 }
@@ -2858,7 +2872,7 @@ impl<'a> Lower<'a> {
         // Exact logical waves leave a loop only at its guest exit. An
         // explicitly requested debug iteration cap still applies.
         let limit_loops =
-            !EXACT_WAVES.get() || std::env::var_os("VICTORY_SHADER_LOOP_LIMIT").is_some();
+            !EXACT_WAVES.get() || super::loop_limit_override().is_some();
         for &b in &order {
             let header = p.blocks[b]
                 .preds
@@ -3091,7 +3105,17 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => {
+                let group = self.compute_id("groupId.i32", 94, c);
+                if let Val::I32(x) = group
+                    && c == 0 && self.x.native.stage == HwStage::Cs
+                    && COMPUTE_TRANSLATION.get() == Some(super::ComputeTranslation::DispatchBase)
+                {
+                    let base = self.host_word(RootType::Other(super::USER_DISPATCH_GROUP_BASE_X), 0, 0);
+                    return Val::I32(self.s.m.bin(self.s.entry, Bin::Add, x, base));
+                }
+                return group;
+            }
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
@@ -8279,6 +8303,17 @@ impl<'a> Lower<'a> {
                     } else {
                         self.indexed_forms.offsets.push((offset, form));
                     }
+                } else if props.0 & 0xff == 10 && *first == 0
+                    && (form == (4 | super::BUFFER_WRITE_ACCESS) || (form == 4 && site == *load))
+                    && let Some((_, index)) = self.x.res.buffer_uav_indices.iter().find(|(site, _)| site == load)
+                {
+                    // descriptor_data also makes a handle for a dimension
+                    // query. The store-only proof excludes numeric uses of
+                    // these descriptor words, so this query is dead.
+                    let entry = (*index, 4 | super::BUFFER_WRITE_ACCESS);
+                    if !self.indexed_forms.buffer_uav_indices.contains(&entry) {
+                        self.indexed_forms.buffer_uav_indices.push(entry);
+                    }
                 } else if form == 8 && *first == 0 && exact && (1..=9).contains(&(props.0 & 0xff))
                     && let Some((_,program)) = self.x.res.scalar_programs.iter().find(|(site,_)| site == load)
                 {
@@ -8318,6 +8353,15 @@ impl<'a> Lower<'a> {
                         *written |= store;
                     } else {
                         self.indexed_forms.uav_indices.push((*index,kind,store));
+                    }
+                } else if form == 8 && *first == 0 && matches!(leaf, Source::Loaded { .. }) && (1..=9).contains(&(props.0 & 0xff))
+                    && self.x.res.packed_material.iter().any(|(site, _)| site == load)
+                {
+                    for &(_, column) in self.x.res.packed_material.iter().filter(|(site, _)| site == load) {
+                        let entry = (column, (props.0 & 0xff) as u8);
+                        if !self.indexed_forms.packed_material.contains(&entry) {
+                            self.indexed_forms.packed_material.push(entry);
+                        }
                     }
                 } else if form == 8 && matches!(leaf, Source::Loaded { .. }) && (1..=9).contains(&(props.0 & 0xff))
                     && self.x.res.buffer_indices.iter().any(|(site, _)| site == load)
@@ -12193,6 +12237,13 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let has_cl = name.ends_with("_cl");
+        // In these Wave32 compute shaders the guest arranges consecutive
+        // groups of four X lanes into quads. SM 6.6 has the same quad layout
+        // for a 1D group of 32 threads. Other group layouts need their own proof.
+        let compute_derivatives = COMPUTE_TRANSLATION.get() == Some(super::ComputeTranslation::Derivatives)
+            && self.x.native.stage == HwStage::Cs && !self.x.native.wave64
+            && self.s.threads == Some([32, 1, 1]);
+        let implicit_derivatives = self.s.pixel || compute_derivatives;
         let (op, sample) = match name {
             "image_sample" | "image_sample_o" | "image_sample_cl" => (60, true),
             "image_sample_lz" | "image_sample_l" | "image_sample_lz_o" => (62, true),
@@ -12346,7 +12397,7 @@ impl<'a> Lower<'a> {
                 let f32t = self.s.t.f32;
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
-                    let lod = self.s.op(
+                    let mut lod = self.s.op(
                         c,
                         "calculateLOD.f32",
                         Attr::ReadOnly,
@@ -12354,6 +12405,22 @@ impl<'a> Lower<'a> {
                         81,
                         &[h, sh, cs[0], cs[1], cs[2], clamped],
                     );
+                    if let Some((index, regs)) = &sampler_choice {
+                        for (arm, &reg) in regs.iter().enumerate().skip(1) {
+                            let sampler = self.s.sampler_handle(c, reg);
+                            let value = self.s.op(
+                                c,
+                                "calculateLOD.f32",
+                                Attr::ReadOnly,
+                                f32t,
+                                81,
+                                &[h, sampler, cs[0], cs[1], cs[2], clamped],
+                            );
+                            let arm = self.s.m.i32(arm as u32);
+                            let selected = self.s.m.cmp(c, pred::EQ, *index, arm);
+                            lod = self.s.m.select(c, selected, value, lod);
+                        }
+                    }
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
                 }
@@ -12442,16 +12509,10 @@ impl<'a> Lower<'a> {
                 last_r
             };
             match op {
-                // Outside a pixel shader there are no screen derivatives:
-                // the validator refuses `sample` there ("features
-                // incompatible with the shader stage": 730 compute programs,
-                // among them the G-buffer resolves and the sky), and what a
-                // driver does with it is its own affair.
-                // shortcut: such a sample reads level 0 (a bias: that
-                // level). The console takes derivatives from neighbouring
-                // lanes there; compute them from the lanes if a resolve
-                // shows the wrong mip.
-                60 if !self.s.pixel => {
+                // Keep the compatibility path for stages whose guest quad
+                // layout is still unknown. The proven 1D compute layout uses
+                // the implicit Sample path and retains mip selection.
+                60 if !implicit_derivatives => {
                     args.extend(&os);
                     args.push(self.s.m.f32(0));
                     call_sample(self, "sampleLevel.f32", 62, &args, &mut gathered)
@@ -12494,7 +12555,7 @@ impl<'a> Lower<'a> {
                         self.as_float(bias)
                     };
                     args.extend(&os);
-                    if self.s.pixel {
+                    if implicit_derivatives {
                         args.extend([bias, clamp]);
                         call_sample(self, "sampleBias.f32", 61, &args, &mut gathered)
                     } else {
@@ -12694,6 +12755,8 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
+        // A static sampler choice merges its results in the current block.
+        let c = self.cur;
         let channels: Vec<u32> = if op == 73 {
             vec![0, 1, 2, 3]
         } else {

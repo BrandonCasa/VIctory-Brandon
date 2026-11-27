@@ -448,13 +448,25 @@ unsafe impl Sync for Library {}
 static LOADING: std::sync::LazyLock<(Mutex<HashSet<String>>, std::sync::Condvar)> =
     std::sync::LazyLock::new(Default::default);
 
+static ABANDONED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn abandon_after_worker_fault() {
+    let _active = LOADING.0.lock().unwrap_or_else(|e| e.into_inner());
+    ABANDONED.store(true, Ordering::Release);
+    LOADING.1.notify_all();
+    tracing::warn!("shared native pipeline library abandoned after a worker fault");
+}
+
 struct LoadingName<'a>(&'a str);
 
-fn same_name(name: &str) -> LoadingName<'_> {
+fn same_name(name: &str) -> Option<LoadingName<'_>> {
     let active = LOADING.0.lock().unwrap_or_else(|e| e.into_inner());
-    let mut active = LOADING.1.wait_while(active, |names| names.contains(name)).unwrap_or_else(|e| e.into_inner());
+    let mut active = LOADING.1.wait_while(active, |names| {
+        !ABANDONED.load(Ordering::Acquire) && names.contains(name)
+    }).unwrap_or_else(|e| e.into_inner());
+    if ABANDONED.load(Ordering::Acquire) { return None; }
     active.insert(name.to_owned());
-    LoadingName(name)
+    Some(LoadingName(name))
 }
 
 impl Drop for LoadingName<'_> {
@@ -464,12 +476,30 @@ impl Drop for LoadingName<'_> {
     }
 }
 
+// A worker suspended in the driver can retain a guard indefinitely. Leave
+// waiters a way out once the fault handler abandons this library instance.
+fn library_guard<T>(mut acquire: impl FnMut() -> std::sync::TryLockResult<T>) -> Option<T> {
+    while !ABANDONED.load(Ordering::Acquire) {
+        match acquire() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(error)) => return Some(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+    None
+}
+
 /// With `VICTORY_LIBRARY_LOCK=1`: held by every library call, as before.
-fn one_call() -> Option<MutexGuard<'static, ()>> {
+fn one_call() -> Option<Option<MutexGuard<'static, ()>>> {
     static ON: OnceLock<bool> = OnceLock::new();
     static CALLING: Mutex<()> = Mutex::new(());
-    ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_LOCK").is_some_and(|v| v == "1"))
-        .then(|| CALLING.lock().unwrap_or_else(|e| e.into_inner()))
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_LOCK").is_some_and(|v| v == "1")) {
+        library_guard(|| CALLING.try_lock()).map(Some)
+    } else {
+        (!ABANDONED.load(Ordering::Acquire)).then_some(None)
+    }
 }
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
@@ -483,6 +513,7 @@ const EARLY_MAX: usize = 100_000;
 
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
+    if ABANDONED.load(Ordering::Acquire) { return None; }
     LIBRARY
         .get_or_init(|| {
             let _opening = crate::timeline::span("pipeline: open the host pipeline library");
@@ -611,14 +642,16 @@ pub(crate) fn pipeline(
         return create();
     };
     let began = std::time::Instant::now();
-    let loaded = {
+    let loaded = (|| {
         let mut loading = crate::timeline::span("pipeline: acquire library load guards");
-        let _all = one_call();
-        let _one = same_name(name);
+        let unavailable = || windows::core::Error::from(windows::Win32::Foundation::E_FAIL);
+        let _all = one_call().ok_or_else(unavailable)?;
+        let _one = same_name(name).ok_or_else(unavailable)?;
         let _call = call("load", name);
         loading.next("pipeline: load a PSO from the driver library");
+        let _fault = super::make::shared_library_call();
         load(&library.library, PCWSTR(wide.as_ptr()))
-    };
+    })();
     // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
     TRIMMED.store(false, Ordering::Relaxed);
@@ -659,10 +692,11 @@ pub(crate) fn pipeline(
         pso
     };
     let mut storing = crate::timeline::span("pipeline: acquire library store guards");
-    let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+    let Some(_all) = one_call() else { return Ok(pso) };
+    let Some(_stores) = library_guard(|| library.saving.try_read()) else { return Ok(pso) };
     let _call = call("store", name);
     storing.next("pipeline: store a PSO in the driver library");
+    let _fault = super::make::shared_library_call();
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
     if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
@@ -780,9 +814,9 @@ pub(crate) fn save(now: bool) {
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
     // of the library again: run 60's second save).
     let bytes = {
-        let _all = one_call();
+        let Some(_all) = one_call() else { return };
         // No store between asking the size and writing; loads go on.
-        let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
+        let Some(_alone) = library_guard(|| library.saving.try_write()) else { return };
         let added = library.added.load(Ordering::Relaxed);
         if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
             return;

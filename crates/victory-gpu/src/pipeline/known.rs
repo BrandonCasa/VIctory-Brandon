@@ -253,6 +253,7 @@ pub fn keys(dir: &Path) -> Vec<String> {
 pub fn fingerprint() -> String {
     let mut h = blake3::Hasher::new();
     h.update(&crate::shader_cache::translation());
+    h.update(crate::shader_cache::SOURCE.as_bytes());
     if let Some(host) = crate::host::host() {
         h.update(&host.driver().to_le_bytes());
     }

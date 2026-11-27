@@ -1,5 +1,5 @@
 use super::*;
-use victory_shader::resource::ScalarRecordChain;
+use victory_shader::resource::{PackedMaterialColumn, ScalarRecordChain};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum DependentWords {
@@ -7,6 +7,88 @@ pub(crate) enum DependentWords {
     Scalar { spec: ScalarRecordChain, sources: [IndexWords; 3] },
     Fields { pointer: IndexWords, records: IndexWords, offset: u32, fields: Vec<u32> },
     Programs(ScalarPrograms),
+    PackedMaterial(PackedMaterialWords),
+}
+
+/// Gather the slots from a bounded first table of packed record indices.
+/// All columns in a group share this exact parent prefix and record view.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PackedMaterialWords {
+    parent: IndexWords,
+    records: IndexWords,
+    columns: Vec<PackedMaterialColumn>,
+}
+
+impl PackedMaterialWords {
+    pub(crate) fn new(parent: IndexWords, records: IndexWords, mut columns: Vec<PackedMaterialColumn>) -> Option<Self> {
+        let first = columns.first()?;
+        let parent_bytes = first.parent_count.checked_mul(first.parent_stride)?;
+        if first.parent_count == 0 || first.parent_count > 256 || parent_bytes > SELECTOR_READ_BUDGET as u32
+            || !first.parent_stride.is_multiple_of(4)
+        {
+            return None;
+        }
+        for column in &columns {
+            if column.parent != first.parent || column.records != first.records
+                || column.parent_count != first.parent_count || column.parent_stride != first.parent_stride
+                || !column.packed_field.is_multiple_of(4) || column.packed_field.checked_add(4)? > first.parent_stride
+                || !matches!(column.shift, 0 | 16) || column.index_mask != 0xffff
+                || !column.record_stride.is_multiple_of(4) || !column.handle_field.is_multiple_of(4)
+                || column.handle_field.checked_add(4)? > column.record_stride
+            {
+                return None;
+            }
+            column.index_mask.checked_mul(column.record_stride)?.checked_add(column.handle_field)?.checked_add(3)?;
+        }
+        columns.sort_unstable_by_key(|c| (c.packed_field, c.shift, c.record_stride, c.handle_field, c.bytes));
+        columns.dedup();
+        Some(Self { parent, records, columns })
+    }
+
+    fn evaluate(
+        &self, writes: &[(usize, usize)], limit: u32, out: &mut BTreeSet<u32>,
+        device: Option<&DeviceBytes>, pending: &mut DeviceRanges,
+    ) -> bool {
+        let first = self.columns[0];
+        let bytes = self.parent.size.min(u64::from(first.parent_count * first.parent_stride)) as usize & !3;
+        let mut indices = BTreeSet::new();
+        let complete = if bytes == 0 {
+            self.parent.validated_bytes((self.parent.base as usize, 0), writes, device,
+                |b| packed_material_indices(&self.columns, b, &mut indices))
+        } else {
+            self.parent.dependent_bytes(0, bytes, writes, device, pending,
+                |b| packed_material_indices(&self.columns, b, &mut indices))
+        };
+        if !complete { return false; }
+        // A zero handle leaf and an out-of-view record can both name the
+        // same zero-relative slot. Preserve it even if the gathered fields
+        // happen to contain only nonzero handles.
+        for column in &self.columns {
+            insert_slot(0, column.bytes, limit, out);
+        }
+        let mut complete = true;
+        for (offset, bias) in indices {
+            // Missing words are added to the ordered readback together.
+            if let Some(slot) = self.records.dependent_word(offset, writes, device, pending) {
+                insert_slot(slot, bias, limit, out);
+            } else {
+                complete = false;
+            }
+        }
+        complete
+    }
+}
+
+fn packed_material_indices(columns: &[PackedMaterialColumn], parent: &[u8], out: &mut BTreeSet<(u32, u32)>) {
+    for column in columns {
+        for row in 0..column.parent_count {
+            let offset = (row * column.parent_stride + column.packed_field) as usize;
+            let packed = parent.get(offset..offset + 4)
+                .map_or(0, |word| u32::from_le_bytes(word.try_into().unwrap()));
+            let index = (packed >> column.shift) & column.index_mask;
+            out.insert((index * column.record_stride + column.handle_field, column.bytes));
+        }
+    }
 }
 
 impl DependentWords {
@@ -16,6 +98,7 @@ impl DependentWords {
             Self::Scalar { sources, .. } => sources.iter().any(|s| s.device_input().is_some()),
             Self::Fields { pointer, records, .. } => pointer.device_input().is_some() || records.device_input().is_some(),
             Self::Programs(programs) => programs.device_sources().next().is_some(),
+            Self::PackedMaterial(words) => words.parent.device_input().is_some() || words.records.device_input().is_some(),
         }
     }
 
@@ -29,6 +112,10 @@ impl DependentWords {
                 records.device_input().map(|b| b.id()), None,
             ],
             Self::Programs(_) => [None; 3],
+            Self::PackedMaterial(words) => [
+                words.parent.device_input().map(|b| b.id()),
+                words.records.device_input().map(|b| b.id()), None,
+            ],
         }
         .into_iter().flatten().chain(programs.into_iter().flat_map(ScalarPrograms::device_sources))
     }
@@ -44,6 +131,7 @@ impl DependentWords {
         match self {
             Self::Compute(chain) => chain.evaluate(writes, limit, out, device, pending),
             Self::Programs(programs) => programs.evaluate(writes, limit, out, device, pending),
+            Self::PackedMaterial(words) => words.evaluate(writes, limit, out, device, pending),
             Self::Scalar { spec, sources } => {
                 scalar_handles(spec, |table, offset| sources[table].dependent_word(offset, writes, device, pending),
                     |slot| insert_slot(slot, 0, limit, out))
@@ -89,6 +177,23 @@ fn read_fields(base: u32, fields: impl Iterator<Item = u32>, mut read: impl FnMu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_material_columns_gather_unique_records_and_include_out_of_bounds_zero() {
+        let column = PackedMaterialColumn {
+            parent: (1, 24), records: (0, 368), parent_count: 3, parent_stride: 16,
+            packed_field: 0, shift: 0, index_mask: 0xffff, record_stride: 64,
+            handle_field: 36, bytes: 0,
+        };
+        let columns = [column, PackedMaterialColumn { packed_field: 4, shift: 16, handle_field: 40, ..column }];
+        let mut parent = [0; 20];
+        parent[0..4].copy_from_slice(&0xffff_0002u32.to_le_bytes());
+        parent[4..8].copy_from_slice(&0x0003_ffffu32.to_le_bytes());
+        parent[16..20].copy_from_slice(&0x0009_0002u32.to_le_bytes());
+        let mut offsets = BTreeSet::new();
+        packed_material_indices(&columns, &parent, &mut offsets);
+        assert_eq!(offsets.into_iter().collect::<Vec<_>>(), [(36, 0), (40, 0), (164, 0), (232, 0)]);
+    }
 
     fn chain() -> ScalarRecordChain {
         ScalarRecordChain {

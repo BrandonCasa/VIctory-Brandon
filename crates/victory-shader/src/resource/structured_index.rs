@@ -1,13 +1,20 @@
 use super::*;
 use crate::gfx10::Valu;
+use crate::ir::VCC;
 use crate::{ResourceType, UsedResource};
 
-fn plain(inst: &Inst) -> Option<&Valu> {
+pub(super) fn plain(inst: &Inst) -> Option<&Valu> {
     let Fields::Valu(f) = &inst.fields else {
         return None;
     };
     (f.sdwa.is_none() && f.dpp.is_none() && f.abs == 0 && f.neg == 0 && !f.clamp && f.omod == 0 && f.opsel == 0)
         .then_some(f)
+}
+
+#[derive(Default)]
+struct Columns {
+    coarse: Vec<BufferIndex>,
+    packed: Option<Vec<PackedMaterialColumn>>,
 }
 
 #[cfg(test)]
@@ -63,7 +70,7 @@ mod tests {
                 .unwrap();
             let high = if wave64 { Some(shift.read(Reg::S(EXEC + 1))?) } else { None };
             let active = lanes.mask_bits(shift.read(Reg::S(EXEC))?, high)?;
-            let mut out = Vec::new();
+            let mut out = Columns::default();
             t.selector_branches(
                 shift.write(Reg::V(18))?,
                 true,
@@ -74,7 +81,7 @@ mod tests {
                 &mut out,
                 &mut 128,
             )?;
-            let mut fields: Vec<_> = out
+            let mut fields: Vec<_> = out.coarse
                 .iter()
                 .map(|index| {
                     assert_eq!(index.word_step, 64);
@@ -102,6 +109,83 @@ mod tests {
         assert_eq!(prove(&wave32, false), Some(vec![52]));
         wave32[8] = 0x7e0c_0281; // Another literal is outside the column proof.
         assert_eq!(prove(&wave32, false), None);
+    }
+
+    #[test]
+    fn packed_material_columns_require_the_bounded_parent_and_executed_loads() {
+        let words = [
+            0xbe84_0308, // Record table pointer.
+            0xbe85_0380,
+            0xf408_0402,
+            0xfa00_05c0, // s[16:19] from record table dword 368.
+            0xbe86_0309, // Parent table pointer.
+            0xbe87_0380,
+            0xf408_0503,
+            0xfa00_0060, // s[20:23] from parent table dword 24.
+            0xd548_000f,
+            0x0221_1100, // v15 = v_bfe_u32(v0, 8, 8).
+            0xe030_2008,
+            0x8005_060f, // v6 = parent[v15].dword_at_8.
+            0x2c0e_0c90, // v7 = v6 >> 16.
+            0xe030_2024,
+            0x8004_0607, // v6 = records[v7].dword_at_36.
+            0x3424_0c85, // v18 = v6 << 5.
+            0xbf81_0000,
+        ];
+        let prove = |words: &[u32], parent_stride| {
+            let code: Vec<_> = words.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, true, 32).unwrap();
+            let lanes = crate::structure::structure(&p).unwrap();
+            let layout = [0u8, 1].map(|slot| RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 8 + slot,
+                slot,
+            });
+            let used = [(0, 368, 64), (1, 24, parent_stride)].map(|(slot, table_offset_dwords, stride)| {
+                UsedResource {
+                    root: RootType::Table,
+                    kind: ResourceType::Srv,
+                    table_offset_dwords,
+                    lower_bound: 0,
+                    stride,
+                    dwords: 4,
+                    user_data: 8 + slot,
+                    slot,
+                }
+            });
+            let resources = track(&p, &layout, HwStage::Ps, Some(&lanes)).unwrap();
+            let tracer = Tracer::new(&p, &layout, HwStage::Ps, Some(&lanes)).unwrap();
+            let shift = p.blocks.last().unwrap().insts.iter().find(|inst| inst.name() == "v_lshlrev_b32")?;
+            let active = lanes.mask_bits(shift.read(Reg::S(EXEC))?, shift.read(Reg::S(EXEC + 1)))?;
+            let mut out = Columns { packed: Some(Vec::new()), ..Default::default() };
+            tracer.selector_branches(shift.write(Reg::V(18))?, true, &vec![(active, true)],
+                &resources, &used, 0, &mut out, &mut 128)?;
+            out.packed
+        };
+        assert_eq!(prove(&words, 16), Some(vec![PackedMaterialColumn {
+            parent: (1, 24),
+            records: (0, 368),
+            parent_count: 256,
+            parent_stride: 16,
+            packed_field: 8,
+            shift: 16,
+            index_mask: 0xffff,
+            record_stride: 64,
+            handle_field: 36,
+            bytes: 0,
+        }]));
+        assert_eq!(prove(&words, 32), None);
+        let mut wrong = words;
+        wrong[9] = 0x0225_1100; // Nine bits do not fit the parent capture.
+        assert_eq!(prove(&wrong, 16), None);
+        let mut alternate = words.to_vec();
+        alternate.splice(12..13, [
+            0x360e_0cff, 0xffff, // v7 = v6 & 0xffff.
+        ]);
+        assert_eq!(prove(&alternate, 16).unwrap()[0].shift, 0);
     }
 
     #[test]
@@ -184,6 +268,118 @@ mod tests {
             assert_eq!(prove(&changed), None);
         }
     }
+
+    #[test]
+    fn typed_store_waterfall_reflects_only_the_masked_field_in_selected_records() {
+        let words = [
+            0xbe98_0301, // Table pointer in s[24:25].
+            0xbe99_0380,
+            0xbe9a_0300, // Heap pointer in s[26:27].
+            0xbe9b_0380,
+            0xf408_040c,
+            0xfa00_0000, // Load the input view into s[16:19].
+            0x7e16_02c1, // v11 = -1
+            0xbe89_0380, // i = 0
+            0xbf06_8007, // count == 0
+            0xbf85_0009, // skip the loop
+            0xbe82_037e, // save EXEC
+            0xbf82_0000, // enter the loop
+            0x8104_0609, // s4 = first + i
+            0x7e16_0204, // v11 = s4 in active lanes
+            0xbf88_0003, // exit if no lanes remain
+            0x8109_8109, // i += 1
+            0xbf09_0709, // i >= count
+            0xbf84_fffa, // repeat while i < count
+            0xbefe_0302, // restore EXEC
+            0x7daa_16c1, // exclude lanes with v11 == -1
+            0xbf88_0010, // skip the waterfall when no record was selected
+            0xe034_2038,
+            0x8004_100b, // load two dwords at record byte 56 into v[16:17]
+            0x3624_22ff,
+            0x00ff_ffff, // v18 = v17 & 0x00ffffff
+            0x3424_2485, // v18 <<= 5
+            0xbe97_037e, // save EXEC for restoration
+            0xbe95_037e, // remaining lanes
+            0x7e28_0512, // v_readfirstlane_b32 s20, v18
+            0x7da4_2414, // select lanes with the same index
+            0xf408_030d,
+            0x2800_0000, // read the selected heap descriptor into s[12:15]
+            0xe01c_2000,
+            0x8003_0000, // typed four-channel store
+            0xbe95_4715, // drop lanes already served
+            0xbf89_fff8, // repeat for remaining lanes
+            0xbefe_0317, // restore EXEC
+            0xbf81_0000,
+        ];
+        let analyze = |words: &[u32]| {
+            let code = words.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>();
+            let p = crate::ir::build(&code, false, 32).unwrap();
+            let lanes = crate::structure::structure(&p).unwrap();
+            let layout = [
+                (RootType::ResourceHeap, 0, 0, 1),
+                (RootType::Table, 1, 1, 1),
+                (RootType::Constants, 2, 6, 2),
+            ].map(|(root, slot, user_data, sgprs)| RootParam {
+                root,
+                slot,
+                user_data,
+                sgprs,
+                base_register: 0,
+                table_offset_dwords: 0,
+            });
+            let used = [UsedResource {
+                root: RootType::Table,
+                kind: ResourceType::Srv,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 176,
+                dwords: 4,
+                user_data: 1,
+                slot: 1,
+            }];
+            let resources = track_with_used(&p, &layout, HwStage::Cs, Some(&lanes), &used, &crate::native::StageIo::None).unwrap();
+            let tracer = Tracer::new(&p, &layout, HwStage::Cs, Some(&lanes)).unwrap();
+            let read = p.blocks.iter().flat_map(|block| &block.insts)
+                .find(|inst| inst.name() == "buffer_load_dwordx2").unwrap();
+            let selected = tracer.selected_records(read.read(Reg::V(11)).unwrap(), read.read(Reg::S(EXEC)).unwrap());
+            let reachable_store = resources.waterfall.loads.iter().any(|&load| tracer.wave32_waterfall_shift(load).is_some());
+            let indices = resources.buffer_uav_indices.into_iter().map(|(_, index)| index).collect::<Vec<_>>();
+            (indices, selected, reachable_store)
+        };
+        let (indices, selected, reachable_store) = analyze(&words);
+        assert_eq!(selected, Some(((2, 0), (2, 1))));
+        assert!(reachable_store);
+        assert_eq!(indices, [BufferIndex {
+            table_slot: 1,
+            table_dword: 0,
+            word: HeapOffset { bytes: 60, constant: None },
+            word_step: 0,
+            bytes: 0,
+            guard: None,
+            records: Some(IndexRecords { first: (2, 0), count: (2, 1), stride: 176 }),
+            value_mask: 0x00ff_ffff,
+        }]);
+        let mut wrong = words;
+        wrong[24] = 0x0fff_ffff; // Not the required mask.
+        assert!(analyze(&wrong).0.is_empty());
+
+        // The counter's count-zero test can skip through VCC instead of SCC.
+        // Empty EXEC can take the loop, but cannot select a lane's write index.
+        let mut masked = words.to_vec();
+        masked.splice(9..10, [
+            0x8503_807e, // s3 = count == 0 ? EXEC : 0
+            0x876a_037e, // VCC = EXEC & s3
+            0xbf87_0009, // skip the loop when VCC is nonempty
+        ]);
+        let (masked_indices, scalar_bound, _) = analyze(&masked);
+        assert_eq!(masked_indices, indices);
+        assert_eq!(scalar_bound, None);
+        masked[9] = 0x8503_7e80; // The zero-count arm has no active mask.
+        assert!(analyze(&masked).0.is_empty());
+        let mut wrong = words;
+        wrong[16] = 0xbf08_0709; // The loop no longer proves i < count.
+        assert!(analyze(&wrong).0.is_empty());
+    }
 }
 
 impl Tracer<'_> {
@@ -195,7 +391,7 @@ impl Tracer<'_> {
         load: Site,
         resources: &Resources,
         used: &[UsedResource],
-    ) -> Option<Vec<BufferIndex>> {
+    ) -> Option<(Vec<BufferIndex>, Vec<PackedMaterialColumn>)> {
         if used.is_empty() {
             return None;
         }
@@ -237,7 +433,10 @@ impl Tracer<'_> {
             return None;
         }
         let shifted = self.first_lane_source(offset)?;
-        let mut out = Vec::new();
+        let mut out = Columns {
+            packed: (self.stage == HwStage::Ps && resources.waterfall.loads.contains(&load)).then(Vec::new),
+            ..Default::default()
+        };
         let mut fuel = 128;
         self.selector_branches(
             shifted,
@@ -249,15 +448,25 @@ impl Tracer<'_> {
             &mut out,
             &mut fuel,
         )?;
-        if out.is_empty() || !self.p.wave64 && !self.image_only_in_waterfall(load, resources) {
+        if out.coarse.is_empty() || !self.p.wave64 && !self.image_only_in_waterfall(load, resources) {
             return None;
         }
-        Some(out)
+        let packed = out.packed.filter(|columns| !columns.is_empty() && self.image_only_in_waterfall(load, resources));
+        Some((out.coarse, packed.unwrap_or_default()))
     }
 
     /// The image proof only bounds lanes active at waterfall entry. A
     /// scalar descriptor use can run even when no lane is active.
     fn image_only_in_waterfall(&self, load: Site, resources: &Resources) -> bool {
+        self.descriptor_only_in_waterfall(load, resources, |inst| matches!(inst.fields, Fields::Image { .. }))
+    }
+
+    fn descriptor_only_in_waterfall(
+        &self,
+        load: Site,
+        resources: &Resources,
+        accepts: impl Fn(&Inst) -> bool,
+    ) -> bool {
         let outputs = &self.inst(load).writes;
         let descriptor_word = |v| outputs.iter().any(|&(_, word)| word == v);
         for (b, block) in self.p.blocks.iter().enumerate() {
@@ -268,7 +477,7 @@ impl Tracer<'_> {
                 if !inst.reads.iter().any(|&(_, v)| descriptor_word(v)) {
                     continue;
                 }
-                if b != load.0 || !matches!(inst.fields, Fields::Image { .. })
+                if b != load.0 || !accepts(inst)
                     || !resources.descriptors.iter().any(|d| {
                         d.site == (b, i) && d.role == Role::Resource
                             && matches!(d.source, Source::Loaded { load: read, first: 0 } if read == load)
@@ -320,7 +529,7 @@ impl Tracer<'_> {
         resources: &Resources,
         used: &[UsedResource],
         bias: u32,
-        out: &mut Vec<BufferIndex>,
+        out: &mut Columns,
         fuel: &mut usize,
     ) -> Option<()> {
         *fuel = fuel.checked_sub(1)?;
@@ -458,8 +667,17 @@ impl Tracer<'_> {
             records: None,
             value_mask: u32::MAX,
         };
-        if !out.contains(&index) {
-            out.push(index);
+        if !out.coarse.contains(&index) {
+            out.coarse.push(index);
+        }
+        if let Some(columns) = &mut out.packed {
+            if let Some(column) = self.packed_material_column(inst, &here, resources, used, index, field, stride) {
+                if !columns.contains(&column) { columns.push(column); }
+            } else {
+                // We can replace the coarse scan only if every reachable
+                // load has a bounded address chain.
+                out.packed = None;
+            }
         }
         Some(())
     }
@@ -529,11 +747,15 @@ impl Tracer<'_> {
 
     // i = phi(0, i+1); the only back edge tests i+1 < count. The unique
     // entry edge is guarded by count != 0, so every visit has i < count.
-    fn counter_bound(&self, v: Value) -> Option<(u8, u32)> {
-        self.root_word(self.guarded_counter_limit(v, false)?)
+    fn counter_bound(&self, v: Value, lane: Option<Value>) -> Option<(u8, u32)> {
+        self.root_word(self.counter_limit(v, false, lane)?)
     }
 
     pub(super) fn guarded_counter_limit(&self, v: Value, signed: bool) -> Option<Value> {
+        self.counter_limit(v, signed, None)
+    }
+
+    fn counter_limit(&self, v: Value, signed: bool, lane: Option<Value>) -> Option<Value> {
         let (head, i) = self.phis[v.0 as usize]?;
         let block = &self.p.blocks[head];
         let phi = &block.phis[i];
@@ -589,27 +811,57 @@ impl Tracer<'_> {
                 return None;
             }
             let skip = guard.insts.last()?;
-            if skip.name() != "s_cbranch_scc1" {
-                return None;
+            match skip.name() {
+                "s_cbranch_scc1" => {
+                    return self.counter_zero_test(skip.read(Reg::Scc)?, count, signed)?.then_some(count);
+                }
+                "s_cbranch_vccnz" if !signed => {
+                    return self.lane_counter_zero_test(skip, count, lane?).then_some(count);
+                }
+                _ => return None,
             }
-            let test = self.def(skip.read(Reg::Scc)?)?;
-            let Fields::Sop { src, .. } = &test.fields else {
-                return None;
-            };
-            let a = self.term(test, &src[0])?;
-            let b = self.term(test, &src[1])?;
-            let no_entries = if signed {
-                test.name() == "s_cmp_lt_i32" && (a, b) == (Term::Value(count), Term::Const(1))
-            } else {
-                test.name() == "s_cmp_eq_u32" && ((a, b) == (Term::Value(count), Term::Const(0))
-                    || (b, a) == (Term::Value(count), Term::Const(0)))
-            };
-            return no_entries.then_some(count);
         }
         None
     }
 
+    fn counter_zero_test(&self, scc: Value, count: Value, signed: bool) -> Option<bool> {
+        let test = self.def(scc)?;
+        let Fields::Sop { src, .. } = &test.fields else { return None };
+        let [left, right] = src.as_slice() else { return None };
+        let a = self.term(test, left)?;
+        let b = self.term(test, right)?;
+        Some(if signed {
+            test.name() == "s_cmp_lt_i32" && (a, b) == (Term::Value(count), Term::Const(1))
+        } else {
+            test.name() == "s_cmp_eq_u32" && ((a, b) == (Term::Value(count), Term::Const(0))
+                || (b, a) == (Term::Value(count), Term::Const(0)))
+        })
+    }
+
+    /// A zero count skips the counter for any lane the later record selection
+    /// could use. The other arm can still run scalar code with EXEC empty.
+    fn lane_counter_zero_test(&self, branch: &Inst, count: Value, lane: Value) -> bool {
+        let Some((_, [Term::Value(a), Term::Value(b)])) = branch.read(Reg::S(VCC))
+            .and_then(|vcc| self.sop2(vcc, &["s_and_b32"]))
+        else { return false };
+        let covers = |choice, mask| {
+            let (scc, Term::Value(when_zero), Term::Const(0)) = self.picked(choice)? else { return None };
+            if !self.counter_zero_test(scc, count, false)? { return None; }
+            let lanes = self.lanes?;
+            let active = lanes.mask_bits(lane, None)?;
+            let left = lanes.mask_bits(when_zero, None)?;
+            let right = lanes.mask_bits(mask, None)?;
+            (!self.meet(lanes, &[(active, true), (left, false)])
+                && !self.meet(lanes, &[(active, true), (right, false)])).then_some(())
+        };
+        covers(a, b).or_else(|| covers(b, a)).is_some()
+    }
+
     fn selected_records(&self, index: Value, mask: Value) -> Option<((u8, u32), (u8, u32))> {
+        self.record_range(index, mask, false)
+    }
+
+    fn record_range(&self, index: Value, mask: Value, lane_guard: bool) -> Option<((u8, u32), (u8, u32))> {
         let test = self.def(self.saved_mask(mask, &mut 64)?)?;
         let [sentinel, Operand::Vector { reg, .. }] = plain(test)?.src.as_slice() else {
             return None;
@@ -621,6 +873,7 @@ impl Tracer<'_> {
             return None;
         }
         let active = self.saved_mask(test.read(Reg::S(EXEC))?, &mut 64)?;
+        let lane = lane_guard.then_some(active);
         let mut seen = std::collections::BTreeSet::new();
         let mut pending = vec![index];
         let mut bounds = None;
@@ -649,8 +902,8 @@ impl Tracer<'_> {
                     };
                     let range = self
                         .root_word(a)
-                        .zip(self.counter_bound(b))
-                        .or_else(|| self.root_word(b).zip(self.counter_bound(a)))?;
+                        .zip(self.counter_bound(b, lane))
+                        .or_else(|| self.root_word(b).zip(self.counter_bound(a, lane)))?;
                     if bounds.is_some_and(|old| old != range) {
                         return None;
                     }
@@ -666,15 +919,88 @@ impl Tracer<'_> {
         bounds
     }
 
-    pub(super) fn structured_buffer_index(
+    /// A typed store can only address slots named in the live input records.
+    /// The waterfall's selected lanes must have executed the load and both
+    /// integer operations. An inactive lane can retain older VGPR values.
+    pub(super) fn typed_buffer_store_index(
         &self,
         load: Site,
         resources: &Resources,
         used: &[UsedResource],
     ) -> Option<BufferIndex> {
-        if self.p.wave64 || used.is_empty() {
+        if self.p.wave64 || !resources.waterfall.loads.contains(&load) {
             return None;
         }
+        let lanes = self.lanes?;
+        let (shift, input, mask, preheader) = self.wave32_waterfall_shift(load)?;
+        let masked = self.def(input)?;
+        if masked.name() != "v_and_b32" {
+            return None;
+        }
+        let [a, b] = plain(masked)?.src.as_slice() else { return None; };
+        let (Operand::Vector { reg, .. }, constant) =
+            (if matches!(a, Operand::Vector { .. }) { (a, b) } else { (b, a) })
+        else { return None; };
+        let Term::Const(value_mask @ 0x00ff_ffff) = self.term(masked, constant)? else { return None; };
+        let word = masked.read(Reg::V(*reg))?;
+        let read_site = self.defs[word.0 as usize]?;
+        let read = self.inst(read_site);
+        let Fields::Buffer {
+            data: Some(Operand::Vector { reg: dest, .. }),
+            addr: Operand::Vector { reg: idx, .. },
+            soffset,
+            offset,
+            offen: false,
+            idxen: true,
+            format: None,
+            lds: false,
+            tfe: false,
+            ..
+        } = &read.fields else { return None; };
+        let count = match read.name() {
+            "buffer_load_dword" => 1,
+            "buffer_load_dwordx2" => 2,
+            "buffer_load_dwordx3" => 3,
+            "buffer_load_dwordx4" => 4,
+            _ => return None,
+        };
+        let component = reg.checked_sub(*dest)?;
+        if component >= count || read.write(Reg::V(*reg)) != Some(word)
+            || self.term(read, soffset)? != Term::Const(0)
+        {
+            return None;
+        }
+        let active = lanes.mask_bits(mask, None)?;
+        for inst in [read, masked, shift] {
+            let written = lanes.mask_bits(inst.read(Reg::S(EXEC))?, None)?;
+            if self.meet(lanes, &[(lanes.reach[preheader], true), (active, true), (written, false)]) {
+                return None;
+            }
+        }
+        let (table_slot, table_dword) = self.buffer_index_table(read_site, resources)?;
+        let field = u32::from(*offset) + 4 * u32::from(component);
+        let stride = self.record_stride(table_slot, table_dword, field, used)?;
+        let (first, count) = self.record_range(read.read(Reg::V(*idx))?, read.read(Reg::S(EXEC))?, true)?;
+        let heap = resources.scalar.iter().find(|(s, _)| *s == load)?.1;
+        if self.layout.get(heap.param)?.root != RootType::ResourceHeap
+            || !self.descriptor_only_in_waterfall(load, resources, |inst|
+                inst.name() == "buffer_store_format_xyzw")
+        {
+            return None;
+        }
+        Some(BufferIndex {
+            table_slot,
+            table_dword,
+            word: HeapOffset { bytes: field, constant: None },
+            word_step: 0,
+            bytes: heap.offset,
+            guard: None,
+            records: Some(IndexRecords { first, count, stride }),
+            value_mask,
+        })
+    }
+
+    fn wave32_waterfall_shift(&self, load: Site) -> Option<(&Inst, Value, Value, usize)> {
         let offset = self.first_lane_offset(load)?;
         let shifted = self.first_lane_source(offset)?;
         let shift = self.def(shifted)?;
@@ -684,7 +1010,26 @@ impl Tracer<'_> {
         if shift.name() != "v_lshlrev_b32" || self.term(shift, bits)? != Term::Const(5) {
             return None;
         }
-        let input = shift.read(Reg::V(*reg))?;
+        let (phi_block, phi_index) = self.phis[self.def(offset)?.read(Reg::S(EXEC))?.0 as usize]?;
+        let block = &self.p.blocks[load.0];
+        if phi_block != load.0 || block.preds.len() != 2 || !block.preds.contains(&load.0) {
+            return None;
+        }
+        let pre = block.preds.iter().position(|&b| b != load.0)?;
+        let mask = block.phis[phi_index].args[pre];
+        Some((shift, shift.read(Reg::V(*reg))?, mask, block.preds[pre]))
+    }
+
+    pub(super) fn structured_buffer_index(
+        &self,
+        load: Site,
+        resources: &Resources,
+        used: &[UsedResource],
+    ) -> Option<BufferIndex> {
+        if self.p.wave64 || used.is_empty() {
+            return None;
+        }
+        let (shift, input, mask, _) = self.wave32_waterfall_shift(load)?;
         let cvt = self.def(input).filter(|i| i.name() == "v_cvt_u32_f32");
         let word = if let Some(cvt) = cvt {
             let [Operand::Vector { reg, .. }] = plain(cvt)?.src.as_slice() else {
@@ -717,13 +1062,7 @@ impl Tracer<'_> {
         {
             return None;
         }
-        let (phi_block, phi_index) = self.phis[self.def(offset)?.read(Reg::S(EXEC))?.0 as usize]?;
-        let block = &self.p.blocks[load.0];
-        if phi_block != load.0 || block.preds.len() != 2 || !block.preds.contains(&load.0) {
-            return None;
-        }
-        let pre = block.preds.iter().position(|&b| b != load.0)?;
-        let mask = self.saved_mask(block.phis[phi_index].args[pre], &mut 64)?;
+        let mask = self.saved_mask(mask, &mut 64)?;
         for inst in [Some(read), cvt, Some(shift)].into_iter().flatten() {
             if self.saved_mask(inst.read(Reg::S(EXEC))?, &mut 64)? != mask {
                 return None;

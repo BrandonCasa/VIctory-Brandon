@@ -120,6 +120,8 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 /// Visible extent of a raw root constant buffer, starting at the guest VA.
 pub const USER_CBV_BYTES: u32 = 0x107;
+/// Guest group X corresponding to native group X zero in a split dispatch.
+pub const USER_DISPATCH_GROUP_BASE_X: u32 = 0x108;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

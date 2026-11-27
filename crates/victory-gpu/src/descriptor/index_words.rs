@@ -10,7 +10,7 @@ mod scalar_records;
 mod scalar_program;
 pub(crate) use scalar_program::ScalarPrograms;
 pub(crate) use material_chain::{IndirectGroups, MaterialWords};
-pub(crate) use scalar_records::DependentWords;
+pub(crate) use scalar_records::{DependentWords, PackedMaterialWords};
 
 struct NativeOwner<T>(Weak<T>);
 impl<T> Clone for NativeOwner<T> {
@@ -25,6 +25,7 @@ enum Outcome {
     Captured, MissingRecord, UnsupportedView, UnknownShadow, UnsafeShadow, UnalignedWord,
     TooLarge, ReleasedHeap, ChangedRecord, ChangedShadow, OverlappingProducer, Unreadable,
     ChangedDuringRead, Read, DifferentNativeBuffer, UnverifiedMapping, GpuOnlySource, NativeBytesDiffer, QueuedWrite, MissingNativeBytes, ChangedNativeBinding, PendingWriter, ChangedBounds, OrderedSource,
+    GpuCaptureBudget,
 }
 
 #[cfg(feature = "diagnostics")]
@@ -43,6 +44,15 @@ thread_local! {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn take_missing_word() -> Option<MissingWord> { MISSING_WORD.take() }
 
+#[cfg(feature = "diagnostics")]
+pub(crate) fn diagnose_capture<T>(capture: impl FnOnce() -> T) -> (T, Option<MissingWord>) {
+    let previous = MISSING_WORD.take();
+    let words = capture();
+    let failure = MISSING_WORD.get();
+    if failure.is_none() { MISSING_WORD.set(previous); }
+    (words, failure)
+}
+
 /// Print the first observation of each outcome and scan stride across recording workers.
 #[inline]
 fn note(outcome: Outcome, step: u32, logical: u32, address: u64, bytes: u64, ownership: Option<(bool, bool, bool)>) {
@@ -50,6 +60,12 @@ fn note(outcome: Outcome, step: u32, logical: u32, address: u64, bytes: u64, own
     {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         let reason = match outcome {
+            Outcome::MissingRecord => "guest descriptor record missing",
+            Outcome::UnsupportedView => "guest descriptor is not a supported buffer view",
+            Outcome::UnknownShadow => "buffer view has no matching shadow",
+            Outcome::UnsafeShadow => "buffer shadow requires ordered presentation or lacks the view span",
+            Outcome::DifferentNativeBuffer => "published descriptor keeps a different native buffer",
+            Outcome::GpuCaptureBudget => "device-authored selector exceeds the ordered capture budget",
             Outcome::MissingNativeBytes => "GPU bytes absent from this occurrence's readback",
             Outcome::QueuedWrite => "GPU write overlaps the source before its consumer",
             Outcome::OverlappingProducer => "texture producer overlaps the word",
@@ -132,16 +148,16 @@ struct RecordWindow {
 }
 
 impl RecordWindow {
-    fn new(field: u32, first: u32, count: u32, stride: u32, size: u64) -> Option<Self> {
+    fn new(field: u32, first: u32, count: u32, stride: u32, size: u64, float: bool) -> Option<Self> {
         if stride < 4 || !stride.is_multiple_of(4) || !field.is_multiple_of(4) || field.checked_add(4)? > stride { return None; }
-        if count == 0 { return Some(Self { start: 0, stride, words: 0, out_of_bounds: false, float: true }); }
+        if count == 0 { return Some(Self { start: 0, stride, words: 0, out_of_bounds: false, float }); }
         // The emitted buffer address uses 32-bit multiply/add. If it wraps,
         // the accesses no longer describe one interval in the declared view.
         first.checked_add(count - 1)?.checked_mul(stride)?.checked_add(field)?.checked_add(3)?;
         let start = u64::from(first) * u64::from(stride) + u64::from(field);
         let available = size.checked_sub(start + 4).map_or(0, |rest| 1 + rest / u64::from(stride));
         let words = u64::from(count).min(available) as u32;
-        Some(Self { start: start.min(size), stride, words, out_of_bounds: words != count, float: true })
+        Some(Self { start: start.min(size), stride, words, out_of_bounds: words != count, float })
     }
 
     fn integer_column(start: u32, stride: u32, size: u64) -> Option<Self> {
@@ -178,8 +194,10 @@ pub(crate) const WIDE_SELECTOR_READ_BUDGET: usize = 512 * 1024;
 impl RecordWindow {
     // Tiny sparse gathers cost at most 64 copy commands. For larger compact
     // tables copy one interval and extract its columns from that snapshot.
+    // Integer scans can share the wide snapshot of the same raw view.
     fn copy_interval(self) -> bool {
-        self.words > 64 && self.stride <= 16 && self.len() <= SELECTOR_READ_BUDGET
+        let budget = if self.float { SELECTOR_READ_BUDGET } else { WIDE_SELECTOR_READ_BUDGET };
+        self.words > 64 && self.stride <= 16 && self.len() <= budget
     }
 }
 
@@ -226,14 +244,15 @@ impl SampleWords {
             #[cfg(feature = "diagnostics")]
             if let Some(bytes) = device {
                 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-                static USES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+                static USES: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
                 let scalar = matches!(**chain, DependentWords::Scalar { .. });
                 let fields = matches!(**chain, DependentWords::Fields { .. });
                 let program = matches!(**chain, DependentWords::Programs(_));
-                let kind = usize::from(scalar) + 2 * usize::from(fields) + 3 * usize::from(program);
+                let packed = matches!(**chain, DependentWords::PackedMaterial(_));
+                let kind = usize::from(scalar) + 2 * usize::from(fields) + 3 * usize::from(program) + 4 * usize::from(packed);
                 let uses = USES[kind * 2 + usize::from(complete)].fetch_add(1, Relaxed) + 1;
                 if uses.is_power_of_two() {
-                    tracing::info!(uses, complete, scalar_records=scalar, pointer_fields=fields, scalar_program=program, native_spans=bytes.len(), still_missing=missing.len(),
+                    tracing::info!(uses, complete, scalar_records=scalar, pointer_fields=fields, scalar_program=program, packed_material=packed, native_spans=bytes.len(), still_missing=missing.len(),
                         sampled=out.len(), "validated a dependent material selector");
                 }
             }
@@ -268,7 +287,7 @@ impl SampleWords {
 
 impl IndexWords {
     /// Capture identities and bounds at the same root-table binding as the shader.
-    pub(crate) fn capture(heap: &Heap, handle: u64, snapshot: Option<(u32, [u32; 3])>, offset: u32, step: u32, bias: u32, records: Option<(u32,u32,u32)>, value_mask: u32) -> Option<Self> {
+    pub(crate) fn capture(heap: &Heap, handle: u64, snapshot: Option<(u32, [u32; 3])>, offset: u32, step: u32, bias: u32, records: Option<(u32,u32,u32,bool)>, value_mask: u32) -> Option<Self> {
         let logical = heap.index(handle)?;
         if heap.samplers() || heap.handle(logical)? != handle || (step != 0 && !step.is_power_of_two()) {
             return None;
@@ -296,8 +315,8 @@ impl IndexWords {
             return None;
         };
         let records = match records {
-            Some((first,count,stride)) if !constant => {
-                let range = RecordWindow::new(offset,first,count,stride,size)?;
+            Some((first, count, stride, float)) if !constant => {
+                let range = RecordWindow::new(offset, first, count, stride, size, float)?;
                 #[cfg(feature = "diagnostics")]
                 {
                     static LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -340,7 +359,10 @@ impl IndexWords {
             card_candidate = bytes <= 256 || records.map_or(bytes <= budget as u64, RecordWindow::copy_interval);
             if device_input {
                 note(Outcome::GpuOnlySource, step, logical, base + first, bytes, Some(ownership));
-                if !card_candidate { return None; }
+                if !card_candidate {
+                    note(Outcome::GpuCaptureBudget, step, logical, base + first, bytes, Some(ownership));
+                    return None;
+                }
             }
         }
         note(Outcome::Captured, step, logical, base, size, Some(ownership));
@@ -535,12 +557,65 @@ mod tests {
         let mut slots = BTreeSet::new();
         window.decode(&bytes[4..], u32::MAX, 0, 1024, &mut slots);
         assert_eq!(slots, std::iter::once(0).chain(200..296).collect());
-        assert!(!RecordWindow::integer_column(4,8,128 << 10).unwrap().copy_interval());
+        assert!(!RecordWindow::integer_column(4, 8, 1 << 20).unwrap().copy_interval());
+        assert!(!RecordWindow::integer_column(4, 32, 128 << 10).unwrap().copy_interval());
+    }
+
+    #[test]
+    fn a_wide_raw_table_shares_its_device_range_between_byte_and_dword_scans() {
+        use super::super::{HeapDesc, Placement, HEAP_IIDS, SHADER_VISIBLE, VIEWS_KIND, create_heap, create_srv, heap, release, view};
+        use crate::object::{S_OK, This, slot};
+        const BYTES: usize = 300_000;
+        let column = RecordWindow::integer_column(0, 4, BYTES as u64).unwrap();
+        assert!(column.copy_interval());
+        assert_eq!((column.start, column.len()), (0, BYTES));
+        let Some(_) = crate::host::host() else { return };
+        let null = std::ptr::null();
+        let buffer = crate::resource::test_buffer(16 << 20);
+        #[repr(C)]
+        struct Extended(HeapDesc, Placement);
+        let desc = Extended(
+            HeapDesc { kind: VIEWS_KIND, count: 64, flags: SHADER_VISIBLE, nodes: 0 },
+            Placement { address: 0, size: 0 },
+        );
+        let mut handle = null;
+        assert_eq!(create_heap(null, &desc.0, &HEAP_IIDS[0], &mut handle), S_OK);
+        let views = heap(handle);
+        let source = views.handle(0).unwrap();
+        // A raw R32_TYPELESS buffer view of the leading 300,000 bytes.
+        create_srv(null, buffer, &[39, 1, 5768, 0, 0, 0, (BYTES / 4) as u32, 0, 1, 0], source);
+        views.host().unwrap().mirror(0, source, true);
+        let (shadow, address, len) = buffer_copy(&view(source).unwrap()).unwrap();
+        assert_eq!(len, BYTES as u64);
+        if shadow.carded() {
+            shadow.keep_stores();
+            let capture = |step| {
+                let index = IndexWords::capture(views, source, None, 0, step, 0, None, u32::MAX).unwrap();
+                SampleWords::direct(Some(index), None)
+            };
+            let byte_scan = capture(1);
+            let dword_scan = capture(4);
+            let key = (shadow.id(), address as usize, BYTES);
+            let mut ranges = DeviceRanges::new();
+            byte_scan.device_ranges(&mut ranges);
+            dword_scan.device_ranges(&mut ranges);
+            assert_eq!(ranges.keys().copied().collect::<Vec<_>>(), [key]);
+            let mut snapshot = vec![0; BYTES];
+            snapshot[BYTES - 4..].copy_from_slice(&17u32.to_le_bytes());
+            let bytes = DeviceBytes::from([(key, snapshot)]);
+            for scan in [byte_scan, dword_scan] {
+                let mut slots = BTreeSet::new();
+                assert!(scan.values_after(&[], 64, &mut slots, Some(&bytes)));
+                assert_eq!(slots, BTreeSet::from([0, 17]));
+            }
+        }
+        release(handle);
+        slot::<extern "system" fn(This) -> u32>(buffer, 0x10)(buffer);
     }
 
     #[test]
     fn structured_selectors_read_only_the_converted_field_in_the_dispatch_range() {
-        let window = RecordWindow::new(80, 2, 4, 176, 5 * 176).unwrap();
+        let window = RecordWindow::new(80, 2, 4, 176, 5 * 176, true).unwrap();
         assert_eq!((window.start, window.words, window.len()), (432, 3, 356));
         let mut bytes = vec![0x41; window.len()];
         for (index, f) in [47.75f32, f32::NAN, -9.0].into_iter().enumerate() {
@@ -549,13 +624,26 @@ mod tests {
         let mut slots = BTreeSet::new();
         window.decode(&bytes, u32::MAX, 32, 99, &mut slots);
         assert_eq!(slots, BTreeSet::from([1, 48]));
-        assert!(RecordWindow::new(80, u32::MAX / 176, 2, 176, 4096).is_none());
-        assert!(RecordWindow::new(80, u32::MAX, 0, 176, 4096).is_some_and(|r| r.words == 0 && !r.out_of_bounds));
+        assert!(RecordWindow::new(80, u32::MAX / 176, 2, 176, 4096, true).is_none());
+        assert!(RecordWindow::new(80, u32::MAX, 0, 176, 4096, true).is_some_and(|r| r.words == 0 && !r.out_of_bounds));
         let raw = RecordWindow::integer_column(76, 512, 32768).unwrap();
         assert_eq!(raw.words, 64);
         let mut slots = BTreeSet::new();
         raw.decode(&0xfa00_0025u32.to_le_bytes(), 0xff_ffff, 0, 256, &mut slots);
         assert_eq!(slots, BTreeSet::from([0, 37]));
+    }
+
+    #[test]
+    fn bounded_uav_records_keep_the_integer_selector_mask() {
+        let window = RecordWindow::new(60, 2, 3, 176, 4 * 176, false).unwrap();
+        assert_eq!((window.start, window.words, window.len()), (412, 2, 180));
+        let mut bytes = vec![0x41; window.len()];
+        for (index, value) in [0xfa00_0007u32, 0x8000_000b].into_iter().enumerate() {
+            bytes[index * 176..index * 176 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let mut slots = BTreeSet::new();
+        window.decode(&bytes, 0x00ff_ffff, 0, 64, &mut slots);
+        assert_eq!(slots, BTreeSet::from([0, 7, 11]));
     }
 
     #[test]

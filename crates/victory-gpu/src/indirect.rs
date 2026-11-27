@@ -42,6 +42,42 @@ use crate::host::{HostList, host, transition};
 
 pub(crate) mod batch;
 
+pub(crate) const SPLIT_DISPATCH: u32 = 0x102;
+pub(crate) const DISPATCH_CHUNKS: u32 = (1u32 << 20).div_ceil(65_535);
+pub(crate) const DISPATCH_CHUNK_BYTES: u32 = 16;
+
+/// Each generated record sets the logical group-X base before dispatching.
+pub(crate) fn split_signature(device: &ID3D12Device, root: &ID3D12RootSignature, slot: u32, word: u32)
+    -> Option<ID3D12CommandSignature>
+{
+    let arguments = [
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                    RootParameterIndex: slot,
+                    DestOffsetIn32BitValues: word,
+                    Num32BitValuesToSet: 1,
+                },
+            },
+        },
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        },
+    ];
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: DISPATCH_CHUNK_BYTES,
+        NumArgumentDescs: arguments.len() as u32,
+        pArgumentDescs: arguments.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature = None;
+    // SAFETY: the matching root signature and argument descriptions are live.
+    unsafe { device.CreateCommandSignature(&desc, root, &mut signature) }.ok()?;
+    signature
+}
+
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
@@ -90,6 +126,8 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     bool active = id.x < eff_count;
     uint src_at = args_offset + id.x * stride;
     uint dst_at = id.x * stride;
+    uint command = kind & 255;
+    bool split = kind != command;
     uint cost = 0;
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
@@ -98,7 +136,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         largest_asked = 0;
         all_asked = 0;
     }
-    if (active && kind <= 1) {
+    if (active && command <= 1) {
         // Draws: vertex or index count, then instances.
         uint2 want = src_args.Load2(src_at);
         if (ahead && (want.x > (1u << 24) || want.y > (1u << 24))) {
@@ -115,10 +153,14 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         uint instances = min(want.y, (1u << 26) / max(count, 1u));
         cost = count * instances;
         draw_counts = uint2(count, instances);
-    } else if (active && kind == 2) {
+    } else if (active && command == 2) {
         uint3 g = src_args.Load3(src_at);
         // Up to WIDEST groups in x run as asked (`widest`).
-        g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+        if (!split) {
+            g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+        } else if (g.x > GROUPS || g.y > 65535u || g.z > 65535u) {
+            g = uint3(0, 0, 0);
+        }
         // x * y fits 32 bits where it is looked at; the whole count may not.
         if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
             g = uint3(0, 0, 0);
@@ -142,7 +184,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
     costs[gi] = cost;
     GroupMemoryBarrierWithGroupSync();
-    if (active && kind > 2) {
+    if (active && command > 2) {
         // Diagnostics, in the budget buffer's next words (below): the
         // largest group count a mesh record asked for, and the groups
         // asked in all.
@@ -202,16 +244,31 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
     }
     GroupMemoryBarrierWithGroupSync();
-    if (gi == 0 && kind > 2 && n > 0) {
+    if (gi == 0 && command > 2 && n > 0) {
         uint was;
         budget.InterlockedMax(4, largest_asked, was);
         budget.InterlockedAdd(8, all_asked, was);
     }
-    if (!active) {
+    if (split && id.x < records) {
+        // One root constant followed by DISPATCH. Empty records and chunks
+        // are initialized because the native command count includes all slots.
+        uint3 dims = uint3(0, 0, 0);
+        if (active && fits[gi] != 0) {
+            dims = groups;
+        }
+        uint out_at = id.x * DISPATCH_CHUNKS * 16u;
+        [loop]
+        for (uint i = 0; i < DISPATCH_CHUNKS; ++i) {
+            uint base = i * 65535u;
+            uint groups_x = dims.x > base ? min(dims.x - base, 65535u) : 0u;
+            dst_args.Store4(out_at + i * 16u, uint4(base, groups_x, dims.y, dims.z));
+        }
+    }
+    if (split || !active) {
         return;
     }
     bool over = fits[gi] == 0;
-    if (kind <= 1) {
+    if (command <= 1) {
         if (over) {
             draw_counts = uint2(0, 0);
         }
@@ -277,8 +334,12 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// dispatch packets and group numbers are the same; D3D12 does not look at
 /// indirect counts. Other cards stay at 65,535.
 fn widest(amd: bool) -> u32 {
-    let on = std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0");
-    if amd && on { 1 << 20 } else { 65_535 }
+    if amd && wide_enabled() { 1 << 20 } else { 65_535 }
+}
+
+pub(crate) fn wide_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0"))
 }
 
 /// Whether `device` is an AMD card's.
@@ -306,7 +367,10 @@ fn rest() -> u32 {
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
+    let source = &format!(
+        "#define WIDEST {}u\n#define REST {}\n#define DISPATCH_CHUNKS {}u\n{source}",
+        widest(amd(device)), rest(), DISPATCH_CHUNKS,
+    );
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -363,7 +427,7 @@ fn min_stride(kind: u32) -> Option<u32> {
     match kind {
         0 => Some(16),
         1 => Some(20),
-        2 | 10 => Some(12),
+        2 | 10 | SPLIT_DISPATCH => Some(12),
         _ => None,
     }
 }
@@ -400,6 +464,13 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let bytes = if spec.0 == SPLIT_DISPATCH {
+        let bytes = u64::from(spec.2) * u64::from(DISPATCH_CHUNKS * DISPATCH_CHUNK_BYTES);
+        if bytes > u64::from(u32::MAX) || spec.2.div_ceil(64) > 65_535 { return None; }
+        bytes
+    } else {
+        bytes
+    };
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
 }
@@ -3025,6 +3096,57 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 assert_eq!((wrong, word(4 + runs as usize)), (None, 0), "every group once, asked for {asked}");
             }
         }
+    }
+
+    #[test]
+    fn split_indirect_dispatch_visits_every_group_and_ignores_the_count_tail() {
+        const CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0)"
+cbuffer Parameters : register(b0) { uint group_base; };
+RWByteAddressBuffer seen : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID) {
+    uint original = group.x + group_base;
+    uint ignored;
+    seen.InterlockedAdd(0, 1, ignored);
+    seen.InterlockedAdd(4 + original * 4, 1, ignored);
+}
+"#;
+        const GROUPS: u32 = 67_440;
+        let Some(mut gpu) = WarpHarness::on(false) else { return };
+        let worker = compile_cs(&gpu.device, CS).expect("the group verification shader must compile");
+        let signature = split_signature(&gpu.device, &worker.root, 0, 0).unwrap();
+        let (source, args, _) = gpu.shared_buffer(256);
+        let (count, active, _) = gpu.shared_buffer(256);
+        let (_budget, budget, budget_gpu) = gpu.shared_buffer(256);
+        let generated = gpu.default_uav(64 << 10);
+        let bytes = u64::from((GROUPS + 2) * 4);
+        let seen = gpu.default_uav(bytes);
+        let (readback, output, _) = gpu.shared_buffer(bytes);
+        // SAFETY: the source buffers are mapped and not yet read by the GPU.
+        // The direct list is open and holds every named resource until it retires.
+        unsafe {
+            std::ptr::write_bytes(budget, 0, 256);
+            std::ptr::copy_nonoverlapping([GROUPS, 1, 1, 511, 1, 1].as_ptr(), args.cast::<u32>(), 6);
+            active.cast::<u32>().write(1);
+            assert!(record_clamp_as(&gpu.clamp, &gpu.list, (&generated, D3D12_RESOURCE_STATE_COMMON),
+                budget_gpu, (&source, 0), Some((&count, 0)), (SPLIT_DISPATCH, 12, 2), false));
+            gpu.list.SetComputeRootSignature(&worker.root);
+            gpu.list.SetPipelineState(&worker.pso);
+            gpu.list.SetComputeRootUnorderedAccessView(1, seen.GetGPUVirtualAddress());
+            gpu.list.ExecuteIndirect(&signature, 2 * DISPATCH_CHUNKS, &generated, 0, None, 0);
+            gpu.list.ResourceBarrier(&[uav_barrier()]);
+            gpu.list.ResourceBarrier(&[transition(&seen, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            gpu.list.CopyBufferRegion(&readback, 0, &seen, 0, bytes);
+        }
+        gpu.submit_and_wait();
+        // SAFETY: the direct fence has retired the copy to this mapped buffer.
+        let word = |offset: usize| unsafe { output.cast::<u32>().add(offset).read_volatile() };
+        assert_eq!(word(0), GROUPS);
+        assert_eq!((0..GROUPS as usize).find(|&group| word(1 + group) != 1), None);
+        assert_eq!(word(1 + GROUPS as usize), 0);
+        println!("verified {GROUPS} indirect group IDs and their count-buffer tail on the graphics adapter");
     }
 
     /// What a batch's table says of records added to it: one job per

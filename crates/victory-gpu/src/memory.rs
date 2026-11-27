@@ -1572,7 +1572,7 @@ fn discover_instances(ranges: &[[u64; 3]]) -> Option<InstanceGraph> {
 /// original instance dependencies. For an external TLAS, retail XDXR
 /// reads the byte offset at +52, strides its instances by 128, and shifts
 /// the dword at instance+60 left eight to obtain the referenced BLAS.
-fn reserve_trace_views(mut views: Vec<ViewSpan>, observe: bool) -> Option<Option<(u64, u64)>> {
+fn reserve_trace_views(mut views: Vec<ViewSpan>, rays: bool, observe: bool) -> Option<Option<(u64, u64)>> {
     use std::collections::HashSet;
     views.sort_unstable();
     views.dedup();
@@ -1611,8 +1611,8 @@ fn reserve_trace_views(mut views: Vec<ViewSpan>, observe: bool) -> Option<Option
                     }
                     // Retail raw SRVs can expose a TLAS just as an AS SRV
                     // can. Follow it if its unpacked header identifies one.
-                    if len >= 64 && at % 256 == 0 {
-                        external.push((at, false, None));
+                    if rays && len >= 64 && at % 256 == 0 {
+                        external.push((at, false, Some(len)));
                     }
                 } else {
                     if at % 256 != 0 || at < 1 << 32 || at >= (u64::from(MEMORY_PAGES) - 1) * PAGE {
@@ -1637,14 +1637,15 @@ fn reserve_trace_views(mut views: Vec<ViewSpan>, observe: bool) -> Option<Option
                 }
                 let size = ((header >> 32) + 1) * 64;
                 if size > 2 << 30 || limit.is_some_and(|bytes| size > bytes) {
+                    if !required { continue; }
                     tracing::error!(address = format_args!("{at:#x}"), size, ?limit, "acceleration structure exceeds its view");
                     return None;
                 }
-                spans.push((at, size));
                 if header & (1 << 31) == 0 {
                     let count = words[1] >> 32;
                     let offset = words[2] >> 32;
                     if count != 0 && (offset < 64 || offset % 64 != 0 || offset + 128 * count > size) {
+                        if !required { continue; }
                         return None;
                     }
                     for start in (0..count).step_by(2048) {
@@ -1656,6 +1657,7 @@ fn reserve_trace_views(mut views: Vec<ViewSpan>, observe: bool) -> Option<Option
                         }));
                     }
                 }
+                spans.push((at, size));
             }
         }
         std::mem::swap(&mut views, &mut next);
@@ -2161,7 +2163,7 @@ pub(crate) fn ready(
     ranges: &[[u64; 3]],
     views: &[ViewSpan],
     indexed: crate::descriptor::host::IndexedSlots,
-    ray_shader: Option<&str>,
+    ray_shader: Option<(&str, bool)>,
 ) -> Option<Ready> {
     let declared = ranges.first().filter(|_| matches!(use_, Use::Builds { .. }))
         .map(|first| list.builder_inputs(first[2] >> 8, Arc::as_ptr(heap) as usize));
@@ -2254,9 +2256,10 @@ pub(crate) fn ready(
             return Some(ready);
         }
         let spans = ranges.to_vec();
-        let trace = ray_shader.filter(|_| use_ == Use::Reads && trace_enabled()
+        let rays = ray_shader.is_some();
+        let trace = ray_shader.filter(|&(_, issued)| issued && use_ == Use::Reads && trace_enabled()
                 && TRAVERSALS_REPORTED.load(Ordering::Relaxed) < TRACE_LIMIT)
-            .map(|shader| (shader.to_owned(), list.traversal_trace()));
+            .map(|(shader, _)| (shader.to_owned(), list.traversal_trace()));
         list.defer_builder(move || (|| {
             let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
             let m = guard.as_mut()?;
@@ -2294,17 +2297,12 @@ pub(crate) fn ready(
                 }
                 drop(guard);
                 for at in untyped {
-                    let bytes = if at % 256 == 0 && discover_words(&[at])?.first()? & 0xffff == 6 {
-                        None
-                    } else {
-                        let len = crate::shadow::in_buffer(at, 1).map(|(base, len)| len - (at - base))
-                            .or_else(|| crate::shadow::mapped_root_bytes(at))?;
-                        Some(len)
-                    };
-                    views.push(ViewSpan { at, bytes });
+                    let len = crate::shadow::in_buffer(at, 1).map(|(base, len)| len - (at - base))
+                        .or_else(|| crate::shadow::mapped_root_bytes(at))?;
+                    views.push(ViewSpan { at, bytes: Some(len) });
                 }
                 let count = views.len();
-                let published = reserve_trace_views(views, trace.is_some())
+                let published = reserve_trace_views(views, rays, trace.is_some())
                     .or_else(|| { tracing::error!(count, "could not reserve traversal views"); None })?;
                 if let (Some((shader, trace)), Some((address, generation))) = (&trace, published) {
                     let mut trace = trace.lock().unwrap_or_else(|e| e.into_inner());

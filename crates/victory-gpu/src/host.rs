@@ -5,6 +5,8 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
+#[cfg(feature = "diagnostics")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -558,6 +560,8 @@ fn sweep() {
         return;
     }
     #[cfg(feature = "diagnostics")]
+    let _timer = SubmitTimer::start(&SUBMIT_SWEEP_US);
+    #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
     if crate::residency::pressured() {
@@ -859,6 +863,47 @@ fn card_clock_watch(clock: &'static CardClock) {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+static SUBMIT_SWEEP_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static SUBMIT_HEAP_SYNC_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static SUBMIT_SELECTOR_READ_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static SUBMIT_CANDIDATES_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static SUBMIT_PIN_CHECKS_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static SUBMIT_HEAP_RETRIES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static SUBMIT_BATCH_RETRIES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "diagnostics")]
+fn gpu_progress() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_PROGRESS"))
+}
+
+#[cfg(feature = "diagnostics")]
+struct SubmitTimer {
+    started: std::time::Instant,
+    total: &'static AtomicU64,
+}
+
+#[cfg(feature = "diagnostics")]
+impl SubmitTimer {
+    fn start(total: &'static AtomicU64) -> Option<Self> {
+        gpu_progress().then(|| Self { started: std::time::Instant::now(), total })
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for SubmitTimer {
+    fn drop(&mut self) {
+        self.total.fetch_add(self.started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
 /// Unlike the frame summaries, this remains observable if the title stops
 /// presenting. Reading the existing native fence submits no additional work
 /// and does not wait for the submission lock.
@@ -880,6 +925,13 @@ fn card_progress(clock: &'static CardClock) {
             bvh_commit_resident = crate::texture::BVH_COMMIT_CHECKS[1].load(Ordering::Relaxed),
             bvh_commit_queries = crate::texture::BVH_COMMIT_CHECKS[2].load(Ordering::Relaxed),
             bvh_commit_query_us = crate::texture::BVH_COMMIT_CHECKS[3].load(Ordering::Relaxed),
+            submit_sweep_us = SUBMIT_SWEEP_US.load(Ordering::Relaxed),
+            submit_heap_sync_us = SUBMIT_HEAP_SYNC_US.load(Ordering::Relaxed),
+            submit_selector_read_us = SUBMIT_SELECTOR_READ_US.load(Ordering::Relaxed),
+            submit_candidates_us = SUBMIT_CANDIDATES_US.load(Ordering::Relaxed),
+            submit_pin_checks_us = SUBMIT_PIN_CHECKS_US.load(Ordering::Relaxed),
+            submit_heap_retries = SUBMIT_HEAP_RETRIES.load(Ordering::Relaxed),
+            submit_batch_retries = SUBMIT_BATCH_RETRIES.load(Ordering::Relaxed),
             submission_work_us = worked(), "native queue progress"
         );
         if completed == u64::MAX { break; } // device removed
@@ -2614,6 +2666,7 @@ struct Deferred {
     alias_writes: std::collections::HashMap<u64, u64>,
     alias_copies: std::collections::HashMap<u64, (u64, u64)>,
     indexed_textures: std::collections::HashMap<(usize, u32), (u64, u64, Option<u64>), std::hash::BuildHasherDefault<AddressHash>>,
+    indexed_buffer_writers: std::collections::HashMap<(usize, u32), (u64, u64, u64, u64)>,
     volatile_samples: std::collections::HashSet<(usize, u32)>,
     /// Sampled views whose mip upload and shader-read state this recording already prepared.
     sampled_indexed_slots: std::collections::HashMap<(usize, u32, u64), PreparedSample, std::hash::BuildHasherDefault<AddressHash>>,
@@ -3069,6 +3122,18 @@ struct LateSample {
     first: u32,
     view: crate::texture::ViewRange,
     additional: Vec<crate::texture::ViewRange>,
+    #[cfg(feature = "diagnostics")]
+    origins: Vec<LateSampleOrigin>,
+}
+
+#[cfg(feature = "diagnostics")]
+struct LateSampleOrigin {
+    heap: usize,
+    logical: u32,
+    kind: u32,
+    record: u64,
+    class: &'static str,
+    view: crate::descriptor::View,
 }
 
 impl LateSample {
@@ -3080,13 +3145,43 @@ impl LateSample {
     }
 }
 
-struct SampleSelection {
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SampleSelection {
     words: std::sync::Arc<[crate::descriptor::index_words::SampleWords]>,
     slots: std::collections::BTreeSet<u32>,
     heap_count: u32,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct BufferWriteSelection {
+    selection: SampleSelection,
+    preceding: std::sync::Arc<[(usize, usize)]>,
+    indexed: upcheck::PriorIndexedWrites,
+}
+
+impl BufferWriteSelection {
+    pub(crate) fn slots(&self) -> &std::collections::BTreeSet<u32> { &self.selection.slots }
+
+    fn stays_current(&self, prior_lists: Option<&[(usize, usize)]>) -> bool {
+        let Some(prior_lists) = prior_lists else { return false };
+        let mut writes = self.preceding.to_vec();
+        merge_coverage(&mut writes, prior_lists);
+        self.indexed.extend(&mut writes).is_some()
+            && self.selection.stays_current(Some(&writes), None)
+    }
+}
+
+#[derive(Default)]
+struct IndexedViewProofs {
+    samples: Vec<SampleSelection>,
+    buffers: Vec<BufferWriteSelection>,
+}
+
 impl SampleSelection {
+    fn stays_current(&self, writes: Option<&[(usize, usize)]>, device: Option<&crate::descriptor::index_words::DeviceBytes>) -> bool {
+        Self::read(&self.words, self.heap_count, writes, device).is_some_and(|current| current.is_subset(&self.slots))
+    }
+
     fn read(
         words: &[crate::descriptor::index_words::SampleWords], heap_count: u32, writes: Option<&[(usize, usize)]>,
         device: Option<&crate::descriptor::index_words::DeviceBytes>,
@@ -3216,6 +3311,24 @@ fn extend_sample_writes(writes: &mut Option<Vec<(usize, usize)>>, list: &HostLis
 }
 
 impl LateSamples {
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_upload_origin(&mut self, serial: u64, record: u64, view: &crate::descriptor::View,
+        access: SampleAccess<'_>, exact: bool, selected: bool) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| crate::switch::on("VICTORY_TRACE_TEXTURE_OWNER")) { return; }
+        let Some(sample) = self.uploads.get_mut(&serial) else { return; };
+        if sample.origins.iter().any(|origin| origin.heap == access.heap && origin.logical == access.logical && origin.record == record) { return; }
+        let class = if exact { "exact slot" }
+            else if selected { "bounded list selection" }
+            else if access.stages.is_some_and(|stages| stages.readers.iter().all(|&(kinds, scope)| {
+                (access.kind != 0 && kinds != 0 && access.kind & kinds == 0)
+                    || scope.is_some_and(|id| stages.entries.contains_key(&id))
+            })) { "bounded stage selection" }
+            else { "broad candidate" };
+        sample.origins.push(LateSampleOrigin { heap: access.heap, logical: access.logical, kind: access.kind,
+            record, class, view: view.clone() });
+    }
+
     fn mip_barriers(&self, restore: bool) -> Vec<D3D12_RESOURCE_BARRIER> {
         let render = D3D12_RESOURCE_STATE_RENDER_TARGET;
         let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -3246,6 +3359,8 @@ impl LateSamples {
                 std::collections::hash_map::Entry::Occupied(mut e) => {
                     let held = e.get_mut();
                     held.guest_slot = held.guest_slot.or(sample.guest_slot);
+                    #[cfg(feature = "diagnostics")]
+                    held.origins.extend(sample.origins);
                     if sample.first < held.first {
                         held.first = sample.first;
                         held.upload = sample.upload;
@@ -4902,7 +5017,7 @@ impl Host {
             .as_ref()?;
         WATCH.call_once(|| {
             #[cfg(feature = "diagnostics")]
-            if crate::switch::on("VICTORY_GPU_PROGRESS") {
+            if gpu_progress() {
                 if let Err(e) = std::thread::Builder::new().name("victory-gpu-progress".into())
                     .spawn(move || card_progress(clock))
                 {
@@ -6461,16 +6576,20 @@ impl Host {
         let behind = late && flying();
         // Materialize earlier guest descriptor writes, then pin the complete
         // observation before preparing copies, texture states, or BVH addresses.
+        #[cfg(feature = "diagnostics")]
+        let heap_sync = SubmitTimer::start(&SUBMIT_HEAP_SYNC_US);
         let began = std::time::Instant::now();
         drop(heaps_synced);
         crate::port_journal::heaps_waited(began.elapsed().as_nanos() as u64, heaps_on);
         crate::descriptor::make_waiting();
         let mut heaps = Vec::new();
         let mut select_sources = false;
+        let mut buffer_proofs = false;
         for run in runs {
             let deferred = run.deferred();
-            select_sources |= deferred.indexed_heaps.iter().any(|(_, _, s)| s.words_only)
+            select_sources |= deferred.indexed_heaps.iter().any(|(_, _, s)| s.words_only || s.uav_words_only)
                 || !run.sample_uses.lock().unwrap_or_else(|e| e.into_inner()).sources().is_empty();
+            buffer_proofs |= deferred.indexed_heaps.iter().any(|(_, _, s)| !s.buffer_writes.is_empty());
             heaps.extend(deferred.indexed_heaps.iter().map(|(_, heap, _)| heap.clone()));
             heaps.extend(deferred.buffer_aliases.iter().map(|(heap, _)| heap.clone()));
             if victory_shader::emit::mapped_views() {
@@ -6479,26 +6598,84 @@ impl Host {
         }
         heaps.sort_unstable_by_key(|h| std::sync::Arc::as_ptr(h) as usize);
         heaps.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
-        if select_sources && behind { self.settle(&mut submitted, WHY_READ); }
+        #[cfg(feature = "diagnostics")]
+        drop(heap_sync);
+        if (select_sources || buffer_proofs) && behind { self.settle(&mut submitted, WHY_READ); }
         let device_words = selector_ranges.as_ref().and_then(|ranges| {
+            #[cfg(feature = "diagnostics")]
+            let _timer = SubmitTimer::start(&SUBMIT_SELECTOR_READ_US);
             // Publish and pin the current heap versions while taking the source
             // bytes. Descriptor identity is rechecked under the final reader pins.
             let _pins: Vec<_> = heaps.iter().map(|h| h.last_reader.write().unwrap_or_else(|e| e.into_inner())).collect();
             selector_reads::read(self, runs[0], ranges)
         });
         let mut attempts = 0;
-        let (mut pins, late_samples) = loop {
+        let prepared_submission = loop {
             let mut versions = Vec::new();
             let mut sampled = Vec::with_capacity(runs.len());
             let mut proofs = Vec::with_capacity(runs.len());
-            let mut writes = select_sources.then(Vec::new);
-            if let Err(reason) = runs.iter().try_for_each(|list| {
-                extend_sample_writes(&mut writes, list);
-                let mut selections = Vec::new();
-                sampled.push(list.prepare_indexed_views(&mut versions, writes.as_deref(), &mut selections, device_words.as_ref())?);
+            let mut preceding = (select_sources || buffer_proofs).then(Vec::new);
+            #[cfg(feature = "diagnostics")]
+            let prepare_timer = SubmitTimer::start(&SUBMIT_CANDIDATES_US);
+            let prepared = runs.iter().try_for_each(|list| {
+                let mut through_list = preceding.clone();
+                extend_sample_writes(&mut through_list, list);
+                let mut selections = IndexedViewProofs::default();
+                sampled.push(list.prepare_indexed_views(
+                    &mut versions,
+                    if select_sources { through_list.as_deref() } else { None },
+                    &mut selections,
+                    device_words.as_ref(),
+                )?);
                 proofs.push(selections);
+                preceding = through_list;
                 Ok::<_, &'static str>(())
-            }) {
+            });
+            #[cfg(feature = "diagnostics")]
+            drop(prepare_timer);
+            if let Err(reason) = prepared {
+                break Err(reason);
+            }
+            #[cfg(feature = "diagnostics")]
+            let pin_timer = SubmitTimer::start(&SUBMIT_PIN_CHECKS_US);
+            let pins: Vec<_> = heaps.iter()
+                .map(|heap| heap.last_reader.write().unwrap_or_else(|e| e.into_inner())).collect();
+            if versions.iter().all(|(heap, version)| heap.publication_version() == *version) {
+                // A CPU-supplied material table can change after recording. Recheck
+                // both the data and its producers with the actual heap publication
+                // pinned before the first command or texture upload is prepared.
+                let mut writes = (select_sources || buffer_proofs).then(Vec::new);
+                let mut samples_current = true;
+                let mut buffers_current = true;
+                for (list, selections) in runs.iter().zip(&proofs) {
+                    buffers_current &= selections.buffers.iter().all(|s| s.stays_current(writes.as_deref()));
+                    extend_sample_writes(&mut writes, list);
+                    samples_current &= selections.samples.iter().all(|s| s.stays_current(writes.as_deref(), device_words.as_ref()));
+                }
+                if !buffers_current {
+                    break Err("bound buffer write selector changed under the final descriptor pins");
+                }
+                if samples_current { break Ok((pins, sampled)); }
+                drop(pins);
+                select_sources = false;
+                #[cfg(feature = "diagnostics")]
+                if pin_timer.is_some() { SUBMIT_BATCH_RETRIES.fetch_add(1, Ordering::Relaxed); }
+                continue;
+            }
+            // A later list can materialize a slot in the same heap and advance
+            // an earlier list's version. Recheck the full batch before refusing.
+            drop(pins);
+            attempts += 1;
+            #[cfg(feature = "diagnostics")]
+            if pin_timer.is_some() { SUBMIT_BATCH_RETRIES.fetch_add(1, Ordering::Relaxed); }
+            #[cfg(feature = "diagnostics")]
+            drop(pin_timer);
+            if attempts == 2 { tracing::debug!("descriptor writers advanced while preparing the batch; rechecking publication"); }
+            std::thread::yield_now();
+        };
+        let (mut pins, late_samples) = match prepared_submission {
+            Ok(ready) => ready,
+            Err(reason) => {
                 refuse_frame(format_args!("{reason}"));
                 #[cfg(feature = "diagnostics")]
                 trace_rejected_writes(runs, reason);
@@ -6507,31 +6684,13 @@ impl Host {
                 submitting(0, 0);
                 return None;
             }
-            let pins: Vec<_> = heaps.iter()
-                .map(|heap| heap.last_reader.write().unwrap_or_else(|e| e.into_inner())).collect();
-            if versions.iter().all(|(heap, version)| heap.publication_version() == *version) {
-                // A CPU-supplied material table can change after recording. Recheck
-                // both the data and its producers with the actual heap publication
-                // pinned before the first command or texture upload is prepared.
-                let mut writes = proofs.iter().any(|p| !p.is_empty()).then(Vec::new);
-                let verified = runs.iter().zip(&proofs).all(|(list, selections)| {
-                    extend_sample_writes(&mut writes, list);
-                    selections.iter().all(|s| SampleSelection::read(&s.words, s.heap_count, writes.as_deref(), device_words.as_ref())
-                        .is_some_and(|actual| actual.is_subset(&s.slots)))
-                });
-                if verified { break (pins, sampled); }
-                drop(pins);
-                select_sources = false;
-                continue;
-            }
-            // A later list can materialize a slot in the same heap and advance
-            // an earlier list's version. Recheck the full batch before refusing.
-            drop(pins);
-            attempts += 1;
-            if attempts == 2 { tracing::debug!("descriptor writers advanced while preparing the batch; rechecking publication"); }
-            std::thread::yield_now();
         };
-        if let Some((address, length)) = upcheck::late_sample_conflict(runs, &late_samples) {
+        let upload_conflict = {
+            #[cfg(feature = "diagnostics")]
+            let _timer = SubmitTimer::start(&SUBMIT_PIN_CHECKS_US);
+            upcheck::late_sample_conflict(runs, &late_samples)
+        };
+        if let Some((address, length)) = upload_conflict {
             refuse_frame(format_args!("late sampled image at {address:#x}+{length:#x} overlaps a write in the same submission"));
             #[cfg(feature = "diagnostics")]
             trace_rejected_writes(runs, "late sampled image overlaps a write");
@@ -9185,6 +9344,28 @@ impl HostList {
         SampleSelection::read(&slots.words, count, self.indexed_write_ranges().as_deref(), None)
     }
 
+    pub(crate) fn recording_buffer_selection(
+        &self,
+        words: Vec<crate::descriptor::index_words::SampleWords>,
+        count: u32,
+    ) -> Option<BufferWriteSelection> {
+        let (preceding, indexed) = upcheck::indexed_write_history(self)?;
+        let mut writes = preceding.clone();
+        indexed.extend(&mut writes)?;
+        let slots = SampleSelection::read(&words, count, Some(&writes), None)?;
+        Some(BufferWriteSelection {
+            selection: SampleSelection { words: words.into(), slots, heap_count: count },
+            preceding: preceding.into(),
+            indexed,
+        })
+    }
+
+    pub(crate) fn indexed_buffer_writer_matches(&self, slot: (usize, u32), binding: (u64, u64, u64, u64), recording: bool) -> bool {
+        let mut d = self.deferred();
+        if recording { *d.indexed_buffer_writers.entry(slot).or_insert(binding) == binding }
+        else { d.indexed_buffer_writers.get(&slot) == Some(&binding) }
+    }
+
     pub(crate) fn prepare_late_sampled_texture(
         &self, resource: usize, view: &crate::descriptor::View,
         copy: &std::sync::Arc<crate::resource::HostTexture>, sampled: &mut LateSamples, access: Option<SampleAccess<'_>>,
@@ -9215,7 +9396,11 @@ impl HostList {
             held.include(range);
         } else {
             let Some(upload) = upload() else { return false };
-            sampled.uploads.insert(copy.serial, LateSample { upload, first, view: range, additional: Vec::new(), guest_slot });
+            sampled.uploads.insert(copy.serial, LateSample {
+                upload, first, view: range, additional: Vec::new(), guest_slot,
+                #[cfg(feature = "diagnostics")]
+                origins: Vec::new(),
+            });
         }
         true
     }
@@ -9246,7 +9431,8 @@ impl HostList {
 
     fn prepare_indexed_views(
         &self, versions: &mut Vec<(std::sync::Arc<crate::descriptor::host::HostHeap>, u64)>,
-        writes: Option<&[(usize, usize)]>, proofs: &mut Vec<SampleSelection>,
+        writes: Option<&[(usize, usize)]>,
+        proofs: &mut IndexedViewProofs,
         device: Option<&crate::descriptor::index_words::DeviceBytes>,
     ) -> Result<LateSamples, &'static str> {
         let mut sampled = LateSamples::default();
@@ -9305,12 +9491,13 @@ impl HostList {
                             && host.indexed_resident(heap, &forms, self, false, Some(&mut candidates), selection.as_ref(), Some((&stages,&uav_stages)))
                     })
                 }).unwrap_or(false);
-                if !ready { return false; }
                 let after = host.stable_version();
                 if before == after {
+                    if !ready { return false; }
                     sampled.merge(candidates);
-                    proofs.extend(stages.entries.into_values().chain(uav_stages.entries.into_values())
+                    proofs.samples.extend(stages.entries.into_values().chain(uav_stages.entries.into_values())
                         .filter_map(|(proof, used)| used.get().then_some(proof)));
+                    proofs.buffers.extend(forms.buffer_writes);
                     if let Some(slots) = selection {
                         #[cfg(feature = "diagnostics")]
                         {
@@ -9320,12 +9507,14 @@ impl HostList {
                                 tracing::info!(uses=n, selected=slots.len(), inputs=forms.words.len(), "material buffer words select sampled texture candidates");
                             }
                         }
-                        proofs.push(SampleSelection { words: forms.words.into(), slots, heap_count: count });
+                        proofs.samples.push(SampleSelection { words: forms.words.into(), slots, heap_count: count });
                     }
                     versions.push((host, before));
                     return true;
                 }
                 retries += 1;
+                #[cfg(feature = "diagnostics")]
+                if gpu_progress() { SUBMIT_HEAP_RETRIES.fetch_add(1, Ordering::Relaxed); }
                 if retries >= 2 && retries.is_power_of_two() {
                     tracing::info!(retries, before, after, "rechecking indexed heap after publication");
                 }
@@ -9657,10 +9846,26 @@ impl HostList {
         batch.refresh_textures();
         for sample in sampled.uploads.values() {
             if let Some(part) = sample.views().find_map(|r| crate::texture::missing_view(&[&sample.upload], r)) {
+                #[cfg(feature = "diagnostics")]
+                for origin in &sample.origins {
+                    let uses = self.sample_uses.lock().unwrap_or_else(|e| e.into_inner());
+                    // With no image state, the existing walk finds a reader of
+                    // this shape without applying any publication proof.
+                    let compatible_reader = uses.conflict(0, 0, origin.heap, origin.kind, false, |_| true)
+                        .map(|(command, stage, _, scope)| (command, stage, scope, uses.pipeline(command)));
+                    // SAFETY: the pending upload owns the native image.
+                    let native = unsafe { sample.upload.copy.texture.GetDesc() };
+                    tracing::warn!(serial=sample.upload.copy.serial, resource=format_args!("{:#x}", sample.upload.resource()),
+                        slot=origin.logical, heap=format_args!("{:#x}", origin.heap), record=origin.record,
+                        origin=origin.class, view=?origin.view, ?native, ?part, ?compatible_reader,
+                        "late sampled texture provenance");
+                }
                 refuse_frame(format_args!("late sampled texture {:#x} lacks its published view subresources {part:?}", sample.upload.resource()));
                 return Vec::new();
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let recorded_claim_views;
         {
             let d = self.deferred();
             let mut by_resource = std::collections::HashMap::<_, Vec<_>>::new();
@@ -9681,10 +9886,21 @@ impl HostList {
                     }
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            { recorded_claim_views = crate::copystat::memory_categories().then(|| d.texture_reads.clone()); }
         }
         let mut uploads = Vec::new();
         for upload in textures.iter().chain(sampled.uploads.values().map(|sample| &sample.upload)) {
             if let Some(claimed) = upload.finish_refresh() {
+                #[cfg(feature = "diagnostics")]
+                if let Some(views) = &recorded_claim_views {
+                    let key = (upload.resource(), upload.copy.serial);
+                    let recorded = views.get(&key).map_or(&[][..], Vec::as_slice);
+                    let late = sampled.uploads.get(&key.1).filter(|sample| sample.upload.resource() == key.0);
+                    claimed.0.note_claim_views(recorded, late.is_some(), |mip, slice| {
+                        late.is_some_and(|sample| sample.views().any(|view| view.includes(mip, slice)))
+                    });
+                }
                 uploads.push(claimed);
             }
         }

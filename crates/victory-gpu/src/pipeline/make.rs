@@ -170,6 +170,7 @@ const MAX_SLOTS: usize = 128;
 /// Per worker slot: its compile crashed (set in the handler), where.
 static CRASHED: [AtomicBool; MAX_SLOTS] = [const { AtomicBool::new(false) }; MAX_SLOTS];
 static FAULT_ADDR: [AtomicU64; MAX_SLOTS] = [const { AtomicU64::new(0) }; MAX_SLOTS];
+static FAULT_IN_LIBRARY: [AtomicBool; MAX_SLOTS] = [const { AtomicBool::new(false) }; MAX_SLOTS];
 static FAULT_RIP: [AtomicU64; MAX_SLOTS] = [const { AtomicU64::new(0) }; MAX_SLOTS];
 static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
 /// The event the handler signals (a Win32 handle).
@@ -227,6 +228,17 @@ thread_local! {
     static WORKER_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
     /// Whether this thread is inside the compile of a pipeline.
     static COMPILING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static IN_SHARED_LIBRARY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) struct SharedLibraryCall(bool);
+
+pub(super) fn shared_library_call() -> SharedLibraryCall {
+    SharedLibraryCall(IN_SHARED_LIBRARY.replace(true))
+}
+
+impl Drop for SharedLibraryCall {
+    fn drop(&mut self) { IN_SHARED_LIBRARY.set(self.0); }
 }
 
 /// A worker's compile of `p`: noted for the guard while it lasts.
@@ -321,6 +333,7 @@ unsafe extern "system" fn compiler_crashed(
     #[cfg(target_arch = "x86_64")]
     // SAFETY: the system passes a live context.
     FAULT_RIP[slot].store(unsafe { (*(*info).ContextRecord).Rip }, Ordering::Relaxed);
+    FAULT_IN_LIBRARY[slot].store(IN_SHARED_LIBRARY.try_with(|v| v.get()).unwrap_or(false), Ordering::Relaxed);
     CRASHED[slot].store(true, Ordering::Release);
     let event = CRASH_EVENT.load(Ordering::Acquire);
     if event != 0 {
@@ -350,6 +363,9 @@ fn watch() {
 
 /// The worker at `slot` is gone with the pipeline it was making.
 fn lost(slot: usize) {
+    if FAULT_IN_LIBRARY[slot].swap(false, Ordering::Relaxed) {
+        super::library::abandon_after_worker_fault();
+    }
     // A faulted driver thread stays suspended and cannot drop its permit.
     leave_driver_compile(slot);
     let job = {
@@ -747,7 +763,13 @@ fn spawn_worker(screens_only: bool) -> bool {
                     // (If the compiler crashes in here this thread never
                     // returns: `lost` does what follows for it.)
                     let _compile = Compile::begin(slot, &p, screens_only);
-                    p.make();
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.make())).is_err() {
+                        tracing::error!(key = p.key, shaders = ?p.shaders, "pipeline worker panicked");
+                        p.publish(None);
+                        let (lock, done) = &DONE;
+                        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        done.notify_all();
+                    }
                 }
                 release_prefetch(&p);
                 if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {

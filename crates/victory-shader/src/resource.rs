@@ -172,6 +172,7 @@ pub struct IndexRecords {
 mod structured_index;
 mod guarded_index;
 mod material_chain;
+mod packed_material;
 mod scalar_records;
 mod linked_fields;
 pub(crate) use linked_fields::mesh_output_limits;
@@ -184,6 +185,21 @@ pub struct MaterialChain {
     pub records: (u8, u32),
     pub parent: u32,
     pub handle: u32,
+}
+
+/// A material handle reached through one halfword of a bounded record table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PackedMaterialColumn {
+    pub parent: (u8, u32),
+    pub records: (u8, u32),
+    pub parent_count: u32,
+    pub parent_stride: u32,
+    pub packed_field: u32,
+    pub shift: u8,
+    pub index_mask: u32,
+    pub record_stride: u32,
+    pub handle_field: u32,
+    pub bytes: u32,
 }
 
 /// Uniform SRV reads that select a record and walk its signed-count member list.
@@ -243,6 +259,9 @@ pub struct Resources {
     /// Direct heap loads whose byte offset is a constant or a shifted root constant.
     pub heap_offsets: Vec<(Site, HeapOffset)>,
     pub buffer_indices: Vec<(Site, BufferIndex)>,
+    /// Fields selecting the UAV of a typed buffer store waterfall.
+    pub buffer_uav_indices: Vec<(Site, BufferIndex)>,
+    pub packed_material: Vec<(Site, PackedMaterialColumn)>,
     pub chains: Vec<(Site, MaterialChain)>,
     pub scalar_records: Vec<(Site, ScalarRecordChain)>,
     pub pointer_fields: Vec<(Site, PointerField)>,
@@ -533,11 +552,15 @@ pub(crate) fn track_with_used(
         }
     }
     for &load in &out.waterfall.loads {
+        if let Some(index) = t.typed_buffer_store_index(load, &out, used) {
+            out.buffer_uav_indices.push((load, index));
+        }
         if let Some(index) = t.waterfall_buffer_index(load, &out)
             .or_else(|| t.structured_buffer_index(load, &out, used)) {
             out.buffer_indices.push((load, index));
-        } else if let Some(indices) = t.structured_indices(load, &out, used) {
+        } else if let Some((indices, packed)) = t.structured_indices(load, &out, used) {
             out.buffer_indices.extend(indices.into_iter().map(|index| (load, index)));
+            out.packed_material.extend(packed.into_iter().map(|index| (load, index)));
         }
     }
     // SMEM descriptor fields also supply numeric texture queries. These
@@ -545,7 +568,7 @@ pub(crate) fn track_with_used(
     for &(load, addr) in &out.scalar {
         if !out.waterfall.loads.contains(&load) && t.p.wave64
             && t.layout.get(addr.param).is_some_and(|p| p.root == RootType::ResourceHeap)
-            && let Some(indices) = t.structured_indices(load, &out, used) {
+            && let Some((indices, _)) = t.structured_indices(load, &out, used) {
             out.buffer_indices.extend(indices.into_iter().map(|index| (load, index)));
         }
     }

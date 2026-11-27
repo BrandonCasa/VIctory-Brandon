@@ -31,6 +31,12 @@ use crate::shadow::Shadow;
 /// Sorted guest write intervals for a recording, or None when an operation
 /// can write an unknown address. Call without holding the recording's lock.
 pub(super) fn indexed_write_ranges(list: &HostList) -> Option<Vec<(usize, usize)>> {
+    let (mut ranges, indexed) = indexed_write_history(list)?;
+    indexed.extend(&mut ranges)?;
+    Some(ranges)
+}
+
+pub(super) fn indexed_write_history(list: &HostList) -> Option<(Vec<(usize, usize)>, PriorIndexedWrites)> {
     let d = list.deferred();
     let mut added = Vec::new();
     let mut add = |at: usize, bytes: usize| {
@@ -55,20 +61,58 @@ pub(super) fn indexed_write_ranges(list: &HostList) -> Option<Vec<(usize, usize)
             for i in 0..*rows { add(dst.saturating_add(i.saturating_mul(*pitch)), *row); }
         }
     }
-    for (_, heap, slots) in &d.indexed_heaps {
-        match heap.writable_candidates(slots) {
-            Some(spans) => for span in spans {
-                if let Some(bytes) = span.bytes { add(span.at as usize, bytes as usize); } else { unknown = true; }
-            }
-            None => unknown = true,
-        }
-    }
     added.extend(d.texture_backs.iter().map(crate::texback::Back::range));
     added.extend(d.size_results.iter().map(crate::memory::SizeResult::range));
     if unknown { return None; }
     let mut ranges = Vec::new();
     join_ranges(&mut ranges, added);
-    Some(ranges)
+    let write = victory_shader::emit::BUFFER_WRITE_ACCESS;
+    let indexed = d.indexed_heaps.iter().filter_map(|(_, heap, slots)| {
+        let opaque = slots.opaque & write;
+        let exact = slots.exact.iter().filter(|(_, form)| **form & write != 0)
+            .map(|(&slot, &form)| (slot, form));
+        let slots = crate::descriptor::host::IndexedSlots {
+            opaque,
+            exact: exact.collect(),
+            ..Default::default()
+        };
+        (!slots.empty()).then(|| (std::sync::Arc::downgrade(heap), slots))
+    }).collect();
+    Some((ranges, PriorIndexedWrites(indexed)))
+}
+
+/// The indexed writers in front of a dispatch. Resolve their current ranges
+/// again under the same heap pins used to validate the dispatch's selector.
+#[derive(Clone)]
+pub(super) struct PriorIndexedWrites(Vec<(std::sync::Weak<crate::descriptor::host::HostHeap>, crate::descriptor::host::IndexedSlots)>);
+
+impl PartialEq for PriorIndexedWrites {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self.0.iter().zip(&other.0).all(|((a, lhs), (b, rhs))|
+                std::sync::Weak::ptr_eq(a, b) && lhs.opaque == rhs.opaque && lhs.exact == rhs.exact)
+    }
+}
+
+impl Eq for PriorIndexedWrites {}
+
+impl PriorIndexedWrites {
+    pub(super) fn extend(&self, writes: &mut Vec<(usize, usize)>) -> Option<()> {
+        let mut indexed = Vec::new();
+        for (heap, slots) in &self.0 {
+            for span in heap.upgrade()?.writable_candidates(slots)? {
+                let bytes = span.bytes? as usize;
+                let at = span.at as usize;
+                if bytes != 0 {
+                    indexed.push((at, at.saturating_add(bytes)));
+                }
+            }
+        }
+        if !indexed.is_empty() {
+            join_ranges(writes, indexed);
+        }
+        Some(())
+    }
 }
 
 /// Test reads against the accumulated write history in native execution order.

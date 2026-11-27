@@ -634,6 +634,7 @@ fn start_memory_sampler() {
             let extra_copies = crate::shadow::EXTRA_COPY_BYTES.each_ref().map(|n| n.load(Relaxed));
             let pool_mb = crate::pool::memory();
             let [window_heaps, window_placements, committed_windows] = crate::pool::window_memory();
+            let [recorded_views, late_views, outside_views, unknown_views, sent] = crate::texture::upload_view_bytes();
             let fields = [
                 ("working set", working), ("private total", private),
                 ("free physical", free), ("commit headroom", headroom),
@@ -647,6 +648,11 @@ fn start_memory_sampler() {
                 ("sparse texture mapped tiles", crate::tiles::given_total()),
                 ("sparse texture tile heaps", crate::tiles::STATS[3].load(Relaxed)),
                 ("live texture staging", crate::texture::live_staging_bytes()),
+                ("texture upload claims inside recorded views so far", recorded_views),
+                ("texture upload claims inside late views only so far", late_views),
+                ("texture upload claims outside known views so far", outside_views),
+                ("texture upload claims without known views so far", unknown_views),
+                ("texture upload footprint bytes submitted so far", sent),
                 ("texture read scratch capacity", crate::texture::READ_SCRATCH_CAPACITY.load(Relaxed)),
                 ("exact texture snapshots", crate::texture::PREVIOUS_BYTES.load(Relaxed)),
                 ("snapshots without physical views", crate::texture::SNAPSHOT_OWNERS[0].load(Relaxed)),
@@ -958,7 +964,8 @@ fn log_memory() {
         let [textures, staging] = pool;
         tracing::info!("memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers");
     }
-    let targets = crate::resource::targets_census();
+    let trace_backing = memory_categories();
+    let targets = crate::resource::targets_census(trace_backing);
     tracing::info!(
         "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
         targets[0],
@@ -974,6 +981,15 @@ fn log_memory() {
         targets[8],
         mb(targets[9]),
     );
+    if trace_backing {
+        tracing::info!(
+            committed = targets[12], committed_mib = targets[13] >> 20,
+            placed_in_heap = targets[14], placed_in_heap_mib = targets[15] >> 20,
+            placed_at_address = targets[16], placed_at_address_mib = targets[17] >> 20,
+            known_guest_spans_mib = targets[18] >> 20, unique_guest_va_mib = targets[19] >> 20,
+            "native texture target bytes by original backing",
+        );
+    }
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \

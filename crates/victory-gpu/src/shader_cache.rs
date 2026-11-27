@@ -44,7 +44,7 @@ static REFRESHED: AtomicU64 = AtomicU64::new(0);
 static CHANGED: AtomicU64 = AtomicU64::new(0);
 
 /// The build of the translator (the BLAKE3 of its sources, `build.rs`).
-const SOURCE: &str = env!("VICTORY_TRANSLATOR");
+pub(crate) const SOURCE: &str = env!("VICTORY_TRANSLATOR");
 
 /// How cached translations are keyed (`VICTORY_SHADER_KEY`).
 fn keyed_by_source() -> bool {
@@ -105,6 +105,9 @@ fn build() -> [u8; 32] {
         };
         bytes.extend_from_slice(&FORMAT.to_le_bytes());
         bytes.extend_from_slice(&limit.to_le_bytes());
+        if victory_shader::emit::loop_limit_override().is_some() {
+            bytes.extend_from_slice(b"explicit loop cap");
+        }
         // Which group barriers wait is part of the translation too.
         bytes.push(victory_shader::emit::group_sync());
         // So are the switches that pick the form of a wave64 program:
@@ -157,6 +160,37 @@ pub(crate) fn translation() -> [u8; 32] {
     build()
 }
 
+fn compute_translation(container: &[u8]) -> Option<victory_shader::emit::ComputeTranslation> {
+    use victory_shader::emit::ComputeTranslation;
+    let digest = blake3::hash(container);
+    match &digest.to_hex()[..16] {
+        // One workgroup per tile. The title can dispatch over 65,535 in X.
+        "2dc364df5d3278b8" | "940c2635dc1312f4" => Some(ComputeTranslation::DispatchBase),
+        // Original CS programs use 32x1x1 groups and whole-quad execution.
+        "e79dd4bd900b4200" | "d6dba265fd10bc2b" => Some(ComputeTranslation::Derivatives),
+        _ => None,
+    }
+}
+
+fn translate(container: &[u8]) -> Result<HostShader, String> {
+    let translated = match compute_translation(container) {
+        Some(mode) => victory_shader::emit::translate_compute(container, mode),
+        None => victory_shader::emit::translate(container),
+    };
+    translated.map_err(|e| e.to_string())
+}
+
+fn stale_compute_translation(shader: &HostShader, container: &[u8]) -> bool {
+    use victory_shader::emit::{ComputeTranslation, USER_DISPATCH_GROUP_BASE_X};
+    if shader.stage != HwStage::Cs { return false; }
+    match compute_translation(container) {
+        Some(ComputeTranslation::DispatchBase) => !shader.user_data.iter()
+            .any(|u| u.root == RootType::Other(USER_DISPATCH_GROUP_BASE_X)),
+        Some(ComputeTranslation::Derivatives) => true,
+        None => false,
+    }
+}
+
 /// Puts the translation of `container` into the cache before any title asks
 /// for it (`victory shaders`): whether it was there already, or why it does
 /// not translate. The host is opened first, as a run does: what the card
@@ -164,7 +198,6 @@ pub(crate) fn translation() -> [u8; 32] {
 pub fn precompile(container: &[u8]) -> Result<bool, String> {
     let _ = crate::host::host();
     let misses = MISSES.load(Ordering::Relaxed);
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, true)?,
         None => translate(container)?,
@@ -176,7 +209,6 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, refresh_in_runs()),
         None => translate(container),
@@ -204,19 +236,63 @@ impl WarmReplacement {
 }
 
 fn legacy_scheduler(bytes: &[u8]) -> bool {
-    !bytes.starts_with(MAGIC) && decode(bytes).is_some_and(|(shader, source)| {
+    !bytes.starts_with(MAGIC) && !bytes.starts_with(PACKED_MAGIC) && decode(bytes).is_some_and(|(shader, source)| {
         source != SOURCE.as_bytes() && shader.stage == HwStage::Cs && cooperative::scheduler(&shader.dxil)
     })
 }
 
-// Refresh the observed material shader that predated Wave32 structured
-// waterfall reflection. Its cached DXIL and native pipeline key can be reused.
-fn stale_material_reflection(shader: &HostShader, container: &[u8]) -> bool {
-    shader.stage == HwStage::Ps && shader.indexed_forms.opaque & 8 != 0
-        && shader.indexed_forms.texture_kinds[0] & (1 << 2) != 0
-        && container.len() == 29448
+// This material family predates Wave32 structured waterfall reflection.
+// Re-translate matching older entries in place, leaving the native keys
+// available when the revised reflection emits the same DXIL.
+fn stale_material_reflection(shader: &HostShader) -> bool {
+    let access = &shader.indexed_forms;
+    if shader.stage != HwStage::Ps || access.opaque != 8 || access.texture_kinds != [1 << 2, 0]
+        || access.buffer_indices.len() != 4
+    {
+        return false;
+    }
+    let column = |field| victory_shader::resource::BufferIndex {
+        table_slot: 0,
+        table_dword: 216,
+        word: victory_shader::resource::HeapOffset { bytes: field, constant: None },
+        word_step: 512,
+        bytes: 0,
+        guard: None,
+        records: None,
+        value_mask: 0x00ff_ffff,
+    };
+    [(column(48), 2), (column(76), 2), (column(48), 5), (column(76), 5)]
+        .iter().all(|entry| access.buffer_indices.contains(entry))
+}
+
+// These skinning variants were cached before their integer write selector
+// was reflected. Refresh their containers under the existing cache keys.
+fn stale_skinning_reflection(shader: &HostShader, container: &[u8]) -> bool {
+    let access = &shader.indexed_forms;
+    shader.stage == HwStage::Cs && access.opaque == 71 && access.offsets.is_empty()
+        && access.buffer_uav_indices.is_empty()
+        && matches!(blake3::hash(container).to_hex().as_str(),
+            "90a0692af43201294c2af6879636a6206ec3d8dd85996d8343df6f92a729acfd"
+                | "3cf39f4495b908d07377a85ce80cae27c86f3bf5701679de0f4d0cdb2b922ecb"
+                | "e06a21f3cea46973e418744f49e10c92f0018c68e4f29215ae63ee39b177e942"
+                | "4518151afe8c6c093a95c362ea19d5fc73d0055668be55405268ea16657f91f0"
+                | "904e7a51e3fab26cc037487b4811021b9370de1fedc7dc2ae7f52fcd651df432"
+                | "b5a672a450b321e2128f8c8ccdd7fc44ee6b5cdc51b6dfa05d2a9e08a615e9ed"
+                | "8f9eb68d0c6dd5cf710e360408e6f93afc67110b1c0b6c95cc995310e7848dd1"
+                | "75bd00da58a1615c716f66c150115f5bef919ae1c4222f1f306b66c4f2530b45"
+                | "dd24ff46af3ae6eef3da7ef126337c2efd3d378b6a1556b888a7c27a3ff30a67")
+}
+
+// The vehicle shader's older reflection scans whole columns of the target
+// table. Re-translate it to use the bounded packed parent records instead.
+fn stale_vehicle_reflection(shader: &HostShader, container: &[u8]) -> bool {
+    let access = &shader.indexed_forms;
+    shader.stage == HwStage::Ps && access.packed_material.is_empty()
+        && access.buffer_indices.iter().any(|(index, _)| {
+            index.table_slot == 0 && index.table_dword == 368 && index.word_step == 64
+        })
         && blake3::hash(container).to_hex().as_str()
-            == "f51f10b884794568896ff9539d97225743a269e9e6194606d05f3a18ce507181"
+            == "19acd330dacc8f325d8385f839ef8697ba8c8d8da5d7a69b6ced20bdc71d3837"
 }
 
 pub(crate) fn warm_replacement(container: &[u8]) -> Result<Option<(WarmReplacement, HostShader)>, String> {
@@ -224,7 +300,7 @@ pub(crate) fn warm_replacement(container: &[u8]) -> Result<Option<(WarmReplaceme
     let _ = crate::host::host();
     let converter = Translate {
         source: SOURCE, ran: AtomicBool::new(false),
-        translate: |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string()),
+        translate,
     };
     let input = [&build()[..], container].concat();
     let key = CacheKey::new(&converter, &input);
@@ -286,7 +362,7 @@ fn cached_by(
         source,
         ran: AtomicBool::new(false),
     };
-    let mut old: Option<HostShader> = None;
+    let key = CacheKey::new(&converter, &input);
     for _ in 0..3 {
         let path = cache
             .get_or_convert(&converter, &input)
@@ -304,23 +380,43 @@ fn cached_by(
             }
             if !ran && made_by != source.as_bytes() {
                 STALE.fetch_add(1, Ordering::Relaxed);
-                if (refresh || stale_material_reflection(&shader, container)) && old.is_none() {
-                    // Translated again in its place; what came out before
-                    // is what the new one is compared with.
+                if refresh || stale_material_reflection(&shader)
+                    || stale_skinning_reflection(&shader, container)
+                    || stale_vehicle_reflection(&shader, container)
+                    || stale_compute_translation(&shader, container)
+                {
                     tracing::debug!(path = %path.display(), "shader cache entry of an earlier translator; translating again");
-                    old = Some(shader);
-                    let _ = std::fs::remove_file(&path);
-                    continue;
+                    let replacement = (converter.translate)(container).and_then(|candidate| {
+                        if candidate.supports_wave_range(victory_shader::emit::host_wave_range()) {
+                            Ok(candidate)
+                        } else {
+                            Err("translated compute shader requires an unsupported wave width".to_owned())
+                        }
+                    });
+                    let replacement = match replacement {
+                        Ok(candidate) => candidate,
+                        Err(error) if refresh => return Err(error),
+                        Err(error) => {
+                            tracing::warn!(%error, path = %path.display(), "automatic shader refresh failed; keeping previous translation");
+                            HITS.fetch_add(1, Ordering::Relaxed);
+                            return Ok(shader);
+                        }
+                    };
+                    if let Err(error) = cache.replace(&key, &encode(&replacement, source)) {
+                        // A write failure leaves the old entry intact. This caller
+                        // can still use the compatible translation in memory.
+                        tracing::warn!(%error, path = %path.display(), "could not publish refreshed shader");
+                    }
+                    REFRESHED.fetch_add(1, Ordering::Relaxed);
+                    if shader != replacement {
+                        CHANGED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    MISSES.fetch_add(1, Ordering::Relaxed);
+                    return Ok(replacement);
                 }
                 static SAID: AtomicBool = AtomicBool::new(false);
                 if !SAID.swap(true, Ordering::Relaxed) {
                     tracing::info!("shader translations of an earlier build of the translator (same version) are served; `victory shaders` translates them again");
-                }
-            }
-            if let Some(old) = old.take() {
-                REFRESHED.fetch_add(1, Ordering::Relaxed);
-                if old != shader {
-                    CHANGED.fetch_add(1, Ordering::Relaxed);
                 }
             }
             let (counter, what) = if ran {
@@ -343,8 +439,12 @@ fn cached_by(
 // device PSO keys. Existing translations that need new reflection refresh
 // individually in their original cache entries.
 // K marks translations made with liveness across cooperative wave sweeps.
-// The metadata layout is identical to J. Ordinary older entries stay usable.
+// K also accepts an indexed buffer-write tag in the existing selector list.
+// Ordinary older entries stay usable.
 const MAGIC: &[u8; 4] = b"VSHK";
+// Only shaders with packed parent selectors need the additional section.
+const PACKED_MAGIC: &[u8; 4] = b"VSHL";
+const INDEXED_BUFFER_WRITE: u32 = 4;
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -383,7 +483,8 @@ fn root_type(code: u32) -> RootType {
 /// Little-endian words and length-prefixed lists, after the build of the
 /// translator that made the entry (`source`, length-prefixed).
 fn encode(s: &HostShader, source: &str) -> Vec<u8> {
-    let mut out = MAGIC.to_vec();
+    let packed = &s.indexed_forms.packed_material;
+    let mut out = if packed.is_empty() { MAGIC } else { PACKED_MAGIC }.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
     word(&mut out, source.len() as u32);
     out.extend(source.as_bytes());
@@ -502,8 +603,10 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
     }
     let sampled=s.indexed_forms.buffer_indices.iter().map(|(i,k)|(i,u32::from(*k)));
     let storage=s.indexed_forms.uav_indices.iter().map(|(i,k,w)|(i,u32::from(*k) | 256 | (u32::from(*w)<<9)));
-    word(&mut out,(sampled.len()+storage.len()) as u32);
-    for (index, kind) in sampled.chain(storage) {
+    let buffer_writes = s.indexed_forms.buffer_uav_indices.iter()
+        .map(|(index, form)| (index, u32::from(*form) | (INDEXED_BUFFER_WRITE << 8)));
+    word(&mut out,(sampled.len()+storage.len()+buffer_writes.len()) as u32);
+    for (index, kind) in sampled.chain(storage).chain(buffer_writes) {
         let (slot, dword, shift) = index.word.constant
             .map_or((u32::MAX, 0, 0), |(s, d, k)| (u32::from(s), d, u32::from(k)));
         for v in [u32::from(index.table_slot), index.table_dword, index.word.bytes,
@@ -523,6 +626,21 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
             }
         }
         word(&mut out, index.value_mask);
+    }
+    if !packed.is_empty() {
+        word(&mut out, packed.len() as u32);
+        for &(column, kind) in packed {
+            for (slot, dword) in [column.parent, column.records] {
+                word(&mut out, u32::from(slot));
+                word(&mut out, dword);
+            }
+            for value in [column.parent_count, column.parent_stride, column.packed_field,
+                u32::from(column.shift), column.index_mask, column.record_stride,
+                column.handle_field, column.bytes, u32::from(kind)]
+            {
+                word(&mut out, value);
+            }
+        }
     }
     word(&mut out, s.halfword_aligned_roots.len() as u32);
     for &(slot, dword) in &s.halfword_aligned_roots {
@@ -551,7 +669,8 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
     }
     let mut r = Reader(bytes);
     let magic = r.take(4)?;
-    let typed_access = magic == MAGIC || magic == b"VSHJ";
+    let packed_access = magic == PACKED_MAGIC;
+    let typed_access = packed_access || magic == MAGIC || magic == b"VSHJ";
     let linked_access = typed_access || matches!(magic,b"VSHG"|b"VSHH"|b"VSHI");
     let record_access = linked_access || magic == b"VSHF";
     let masked_access = record_access || matches!(magic, b"VSHC" | b"VSHD" | b"VSHE");
@@ -688,6 +807,7 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
     let count = r.word()? as usize;
     let mut buffer_indices = Vec::with_capacity(count.min(256));
     let mut uav_indices = Vec::new();
+    let mut buffer_uav_indices = Vec::new();
     for _ in 0..count {
         let table_slot = u8::try_from(r.word()?).ok()?;
         let table_dword = r.word()?;
@@ -704,7 +824,12 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
         let typed_kind=r.word()?;
         let kind=(typed_kind & 255) as u8;
         let access=typed_kind >> 8;
-        if !(1..=9).contains(&kind) || !matches!(access,0|1|3) || (access!=0 && !typed_access) {return None;}
+        let buffer_write = access == INDEXED_BUFFER_WRITE;
+        if buffer_write {
+            if !(magic == MAGIC || packed_access) || kind != (4 | victory_shader::emit::BUFFER_WRITE_ACCESS) { return None; }
+        } else if !(1..=9).contains(&kind) || !matches!(access,0|1|3) || (access!=0 && !typed_access) {
+            return None;
+        }
         let constant = if slot == u32::MAX { None } else { Some((u8::try_from(slot).ok()?, dword, shift)) };
         let word = victory_shader::resource::HeapOffset { bytes: word_bytes, constant };
         let guard_slot = if legacy_access { u32::MAX } else { r.word()? };
@@ -724,7 +849,10 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
         };
         let value_mask = if masked_access { r.word()? } else { u32::MAX };
         let index=victory_shader::resource::BufferIndex {table_slot,table_dword,word,word_step,bytes,guard,records,value_mask};
-        if access==0 {buffer_indices.push((index,kind));} else {
+        if buffer_write {
+            if word_step != 0 || guard.is_some() || records.is_none() { return None; }
+            buffer_uav_indices.push((index,kind));
+        } else if access==0 {buffer_indices.push((index,kind));} else {
             if word_step!=0 || guard.is_some() || records.is_some(){return None;}
             uav_indices.push((index,kind,access==3));
         }
@@ -740,7 +868,38 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
     {
         return None;
     }
-    let indexed_forms = victory_shader::emit::IndexedAccess { opaque, texture_kinds, offsets, buffer_indices, uav_indices, chains, scalar_records, scalar_programs, pointer_fields,input_limits,output_limits };
+    let mut packed_material = Vec::new();
+    if packed_access {
+        for _ in 0..r.word()? {
+            let parent = (u8::try_from(r.word()?).ok()?, r.word()?);
+            let records = (u8::try_from(r.word()?).ok()?, r.word()?);
+            let column = victory_shader::resource::PackedMaterialColumn {
+                parent,
+                records,
+                parent_count: r.word()?,
+                parent_stride: r.word()?,
+                packed_field: r.word()?,
+                shift: u8::try_from(r.word()?).ok()?,
+                index_mask: r.word()?,
+                record_stride: r.word()?,
+                handle_field: r.word()?,
+                bytes: r.word()?,
+            };
+            if column.parent_count == 0 || column.parent_count.checked_mul(column.parent_stride)? > 4096
+                || !column.parent_stride.is_multiple_of(4) || !column.packed_field.is_multiple_of(4)
+                || column.packed_field.checked_add(4)? > column.parent_stride
+                || !matches!(column.shift, 0 | 16) || column.index_mask != 0xffff
+                || !column.record_stride.is_multiple_of(4) || !column.handle_field.is_multiple_of(4)
+                || column.handle_field.checked_add(4)? > column.record_stride
+                || column.index_mask.checked_mul(column.record_stride)?.checked_add(column.handle_field).is_none()
+            {
+                return None;
+            }
+            let kind = u8::try_from(r.word()?).ok().filter(|kind| (1..=9).contains(kind))?;
+            packed_material.push((column, kind));
+        }
+    }
+    let indexed_forms = victory_shader::emit::IndexedAccess { opaque, texture_kinds, offsets, buffer_indices, uav_indices, buffer_uav_indices, packed_material, chains, scalar_records, scalar_programs, pointer_fields,input_limits,output_limits };
     let count = r.word()? as usize;
     if r.0.len() != count.checked_mul(8)? {
         return None;
@@ -799,6 +958,8 @@ mod tests {
                     table_slot:1,table_dword:80,word:victory_shader::resource::HeapOffset {bytes:16,constant:None},
                     word_step:0,bytes:0,guard:None,records:None,value_mask:u32::MAX,
                 },2,true)],
+                buffer_uav_indices: Vec::new(),
+                packed_material: Vec::new(),
                 pointer_fields:vec![(victory_shader::resource::PointerField {pointer:(1,56),records:(0,160),pointer_offset:28,field:4},2)],
                 scalar_programs: vec![(vec![victory_shader::resource::ScalarWordOp::Constant(20),
                     victory_shader::resource::ScalarWordOp::Read { table:(1,8),address:0 }],2)],
@@ -861,6 +1022,44 @@ mod tests {
         assert!(cached(&cache, &build, b"other", fail, false).is_err());
     }
 
+    #[test]
+    fn stale_material_family_refreshes_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7u8; 32];
+        let mut previous = shader();
+        previous.stage = HwStage::Ps;
+        let mut column = previous.indexed_forms.buffer_indices[0].0;
+        column.table_dword = 216;
+        column.word.constant = None;
+        column.word_step = 512;
+        column.value_mask = 0x00ff_ffff;
+        previous.indexed_forms = victory_shader::emit::IndexedAccess {
+            opaque: 8,
+            texture_kinds: [1 << 2, 0],
+            ..Default::default()
+        };
+        for (field, kind) in [(48, 2), (76, 2), (48, 5), (76, 5)] {
+            column.word.bytes = field;
+            previous.indexed_forms.buffer_indices.push((column, kind));
+        }
+        let mut unrelated = previous.clone();
+        unrelated.indexed_forms.buffer_indices[0].0.value_mask = u32::MAX;
+        let mut refreshed = previous.clone();
+        refreshed.indexed_forms.opaque = 0;
+        refreshed.indexed_forms.texture_kinds = [0; 2];
+
+        for (container, old) in [(b"material".as_slice(), &previous), (b"other".as_slice(), &unrelated)] {
+            cached_by(&cache, &build, "old source", container, |_| Ok(old.clone()), false).unwrap();
+        }
+        let paths = walk(dir.path());
+        let convert = |_: &[u8]| Ok(refreshed.clone());
+        assert_eq!(cached_by(&cache, &build, "new source", b"material", convert, false), Ok(refreshed));
+        assert_eq!(cached_by(&cache, &build, "new source", b"other", |_| panic!("unrelated shader refreshed"), false), Ok(unrelated));
+        assert_eq!(walk(dir.path()).len(), paths.len());
+        assert!(paths.iter().all(|path| path.is_file()));
+    }
+
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
         for e in std::fs::read_dir(dir).unwrap().flatten() {
@@ -892,6 +1091,25 @@ mod tests {
         let mut previous_layout = bytes.clone();
         previous_layout[..4].copy_from_slice(b"VSHJ");
         assert_eq!(decode(&previous_layout), Some((host.clone(), b"made by".to_vec())));
+        scan.table_dword = 112;
+        scan.word.bytes = 60;
+        scan.value_mask = 0x00ff_ffff;
+        host.indexed_forms.buffer_uav_indices.push((scan, 4 | victory_shader::emit::BUFFER_WRITE_ACCESS));
+        let bytes = encode(&host, "made by");
+        previous_layout = bytes.clone();
+        previous_layout[..4].copy_from_slice(b"VSHJ");
+        assert!(decode(&previous_layout).is_none());
+        let mut packed = host.clone();
+        packed.indexed_forms.packed_material.push((victory_shader::resource::PackedMaterialColumn {
+            parent: (1, 24), records: (0, 368), parent_count: 256, parent_stride: 16,
+            packed_field: 8, shift: 16, index_mask: 0xffff, record_stride: 64,
+            handle_field: 36, bytes: 0,
+        }, 2));
+        let packed_bytes = encode(&packed, "made by");
+        assert!(packed_bytes.starts_with(PACKED_MAGIC));
+        assert_eq!(decode(&packed_bytes), Some((packed.clone(), b"made by".to_vec())));
+        packed.indexed_forms.packed_material[0].0.parent_count += 1;
+        assert!(decode(&encode(&packed, "made by")).is_none());
         let mut legacy = bytes.clone();
         legacy[..4].copy_from_slice(b"VSH8");
         assert!(decode(&legacy).is_none());
