@@ -12,4 +12,4 @@ Remove the opt-in half-full submission on this title path. The default already w
 
 With an owned old page in the table at enqueue and a replacement published before Submit, only the replacement receives the payload. The old bytes survive and status index zero completes after publication.
 
-[Deferred optimization](deferred/finding-dstorage-release-workers-during-page-retries.md)
+[Deferred optimization](deferred/dstorage-suspend-jobs-during-post-submit-page-retries.md)

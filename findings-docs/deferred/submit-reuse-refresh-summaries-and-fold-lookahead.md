@@ -16,4 +16,4 @@ Fold the sequential front scan in place, preserving first-touch order and part b
 
 The sequential planners remove their event vectors and second traversal even for recordings submitted once. On the parallel front path, sharing saves a full step scan for each repeat of the same recording. Each occurrence still joins its shadow entries and visits its textures. Distinct recordings give no sharing benefit and the summaries can be released before GPU execution.
 
-[Related correctness finding](../finding-submit-fold-refresh-plan-in-one-pass.md)
+[Related correctness finding](../submit-order-refreshes-around-bvh-landing-writes.md)

@@ -14,4 +14,4 @@ For initialized 2D textures with verified producer coverage, intersect changed a
 
 For B staged bytes and M footprints, a qualifying change currently processes B and issues M copies. With K affected footprints occupying b bytes of conservative storage, the target is O(b) conversion and K GPU copies plus dirty-page lookup. A change within a single large mip can still require that whole mip. Small textures, shared tails and fully dirty textures gain little. A per-staging footprint index and pending bitset cost memory proportional to layout complexity.
 
-[Related correctness finding](../finding-texture-upload-only-dirty-subresources.md)
+[Related correctness finding](../texture-upload-completed-bink-frame-planes.md)

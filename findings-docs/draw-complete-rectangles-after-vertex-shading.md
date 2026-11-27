@@ -16,4 +16,4 @@ Restrict `draw.rs::rectangles` to direct, nonindexed draws with independent inst
 
 With a nonzero first vertex, supported direct, indexed and indirect rectangles on the geometry-stage path cover both triangles using the original three vertex IDs. An overlapping earlier GPU write supplies the bytes used by the CPU fallback.
 
-[Deferred optimization](deferred/finding-draw-avoid-overwritten-rectangle-streams.md)
+[Deferred optimization](deferred/draw-skip-replaced-streams-on-cpu-rectangle-fallback.md)

@@ -14,4 +14,4 @@ Serialize publication with the voice worker and restore the snapshot before deco
 
 Decode identical input continuously and split at the title's context handoff. The PCM spanning the split must match sample for sample, with no extra flush tail. A newly zeroed or unrelated context starts with fresh state.
 
-[Deferred optimization](deferred/finding-xma-reuse-frame-scratch.md)
+[Deferred optimization](deferred/xma-reuse-packed-frame-scratch-and-emit-pcm-to-voice.md)

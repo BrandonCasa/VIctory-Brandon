@@ -16,4 +16,4 @@ Keep the ready path synchronous. When a post-submit page-list poll or scatter re
 
 For W workers and S simultaneous sleepers, available execution capacity changes from max(0,W−S) to W while eligible requests exist, subject to staging and memory limits. Polls/retries may still occur. Pending states need scheduling metadata and ownership of any buffered payload.
 
-[Related correctness finding](../finding-dstorage-release-workers-during-page-retries.md)
+[Related correctness finding](../dstorage-honor-submit-boundary-for-live-page-lists.md)

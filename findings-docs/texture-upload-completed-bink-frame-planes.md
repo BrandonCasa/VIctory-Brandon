@@ -12,4 +12,4 @@ Base the upload on the completed decode for the registered frame slot and plane.
 
 After slot rotation and an alias write following Unmap, the consumed plane contains the new decoded frame even if its staging-VA journal is clean. Replacing the destination forces the plane to be populated again.
 
-[Deferred optimization](deferred/finding-texture-upload-only-dirty-subresources.md)
+[Deferred optimization](deferred/texture-detile-and-upload-only-changed-footprints.md)

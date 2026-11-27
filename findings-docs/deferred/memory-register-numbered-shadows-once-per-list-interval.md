@@ -16,4 +16,4 @@ Register the directory and the append-only numbered vector under one deferred-li
 
 For A `bring_up` calls in a stable interval with C already-numbered shadows, lock acquisitions and range probes can fall from O(AC) to O(A + C); only newly registered shadows need probes after the first call. Store constant-size progress per participating list and reset it at the existing invalidation boundaries. Required refresh bytes remain unchanged.
 
-[Related correctness finding](../finding-memory-defer-new-numbered-shadows-in-bulk.md)
+[Related correctness finding](../memory-publish-bvh-landing-writes-in-command-order.md)

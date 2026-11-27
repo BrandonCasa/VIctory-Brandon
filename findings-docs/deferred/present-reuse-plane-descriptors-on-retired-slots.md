@@ -16,4 +16,4 @@ Carry HostTexture::serial and the view format through both present paths. In a f
 
 For F composed frames, two SRV creations per frame become one per changed plane/slot binding; RTV creations approach the number of buffers per swap-chain generation. Two small keys per presenter slot and private RTV storage are required. Alternating sources on all slots can still require 2F SRVs.
 
-[Related correctness finding](../finding-present-cache-compositor-descriptors.md)
+[Related correctness finding](../pipeline-retain-commands-until-first-use-pso-is-ready.md)

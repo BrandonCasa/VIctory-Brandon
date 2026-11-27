@@ -14,4 +14,4 @@ Precompute eligible per-vertex slot masks and the ordered (offset, format) list 
 
 Today `rectangles` filters E input elements for each of 32 slots and builds a vector for each replaced stream on every fallback draw. Grouping once moves this layout work to the pipeline and allows each deferred read to share its slot's elements. For R replaced streams, the draw also avoids R ordinary shadow lookups and refresh registrations. Avoided transfer bytes depend on dirty ranges and other list uses. Scratch and expansion still scale with the vertices drawn.
 
-[Related correctness finding](../finding-draw-avoid-overwritten-rectangle-streams.md)
+[Related correctness finding](../draw-complete-rectangles-after-vertex-shading.md)

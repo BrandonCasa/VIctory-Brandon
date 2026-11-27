@@ -16,4 +16,4 @@ For an already correct rendered present, leave the back buffer in render-target 
 
 On the composed frame with neither capture nor HUD, two output transitions become one; capture alone requires render target → copy source → present. A frame actually receiving a HUD copy still needs copy destination. Source restoration and the fullscreen composite draw cost the same.
 
-[Related correctness finding](../finding-present-composed-back-buffer-state.md)
+[Related correctness finding](../present-render-and-capture-transformed-single-plane-output.md)

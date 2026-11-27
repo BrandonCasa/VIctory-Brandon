@@ -14,4 +14,4 @@ Precompute compact ordinals for each distinct (slot, dword) in the stage metadat
 
 Each eligible stage bind fills one address entry per distinct (slot, dword) using precomputed ordinals. The correctness fix already reduces three resolutions to one per pair. The incremental saving here is direct indexing with no per-bind hash table. Prepared addresses and both bound words stay identical.
 
-[Related correctness finding](../finding-draw-resolve-view-address-once-per-bind.md)
+[Related correctness finding](../draw-snapshot-descriptor-addresses-per-stage-bind.md)

@@ -14,4 +14,4 @@ Give each worker a lazy compressed file-input buffer. Keep its initialized high-
 
 For F qualifying file requests, up to F transient allocations become buffer growth and oversized exceptions. Combined-codec intermediate allocations remain on callers that use that API path. Read and decode traffic is unchanged; repeated full-buffer initialization is avoidable on reuse. Memory retention is the main tradeoff because worker count follows available parallelism.
 
-[Related correctness finding](../finding-dstorage-reuse-compressed-input-workspace.md)
+[Related correctness finding](../dstorage-decode-zlib-archive-swizzle-modes.md)

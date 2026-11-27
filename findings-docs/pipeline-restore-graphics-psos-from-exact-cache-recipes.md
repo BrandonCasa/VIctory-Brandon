@@ -20,7 +20,7 @@ Every seed returns null. The same geometry can still draw through the ordinary f
 
 ## Before and after
 
-Cold records can draw through the title's exact stream. Learned records return the equivalent PSO earlier, during cache population. A depth-only or blend-only variant retains its own state. [Ordered first use](finding-pipeline-retain-first-use-commands.md) keeps a valid late compile in the frame.
+Cold records can draw through the title's exact stream. Learned records return the equivalent PSO earlier, during cache population. A depth-only or blend-only variant retains its own state. [Ordered first use](present-retain-plane-crops-color-and-blend-order.md) keeps a valid late compile in the frame.
 
 ## Expected impact and confidence
 

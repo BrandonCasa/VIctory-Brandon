@@ -14,4 +14,4 @@ Terminate in GDK order. Close work admission, dispatch that queue’s pending wo
 
 When termination overlaps expiry or direct submission, every accepted task of the terminating queue runs exactly once, with the cancellation flag set for pending work. Other queues continue using the shared port.
 
-[Deferred optimization](deferred/finding-xasync-share-delayed-task-timer.md)
+[Deferred optimization](deferred/xasync-share-one-timer-for-delayed-callbacks.md)

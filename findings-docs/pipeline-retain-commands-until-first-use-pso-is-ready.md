@@ -12,4 +12,4 @@ Decode the 72-byte records at the retail entry (`+0x100`) and the short prefix a
 
 Presenting the same resources with different crops displays the pixels requested by each call, even if the queue consumes both after the caller reuses its stack. Different-sized planes align in their requested destination.
 
-[Deferred optimization](deferred/finding-present-cache-compositor-descriptors.md)
+[Deferred optimization](deferred/present-reuse-plane-descriptors-on-retired-slots.md)

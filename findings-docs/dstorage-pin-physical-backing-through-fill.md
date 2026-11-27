@@ -14,4 +14,4 @@ Reserve each resolved slice under the page-table lock before allowing a direct f
 
 A reassignment racing a fill cannot redirect bytes to another allocation. A short inflate writes and notifies only its accepted prefix even when an unused suffix page is unknown.
 
-[Deferred optimization](deferred/finding-dstorage-resolve-physical-page-runs-once.md)
+[Deferred optimization](deferred/dstorage-share-resolved-page-runs-across-fill-paths.md)

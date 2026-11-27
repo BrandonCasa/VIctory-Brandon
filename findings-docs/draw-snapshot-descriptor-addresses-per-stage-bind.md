@@ -12,4 +12,4 @@ Snapshot the complete descriptor address once per (root slot, descriptor dword) 
 
 For two offsets in the same slot, each prepared address equals the 64-bit address reconstructed from its bound words. Replacing one descriptor changes the next bind and leaves the other offset intact.
 
-[Deferred optimization](deferred/finding-draw-resolve-view-address-once-per-bind.md)
+[Deferred optimization](deferred/draw-index-stage-bind-address-snapshots-by-ordinal.md)

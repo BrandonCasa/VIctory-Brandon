@@ -16,4 +16,4 @@ Intersect long views once per retained physical run and use the short-alias buck
 
 For P pages across R runs and L long mappings, long-view probes fall from P × L to R × L. Retaining the completed write’s runs avoids P more physical-page lookups and per-page section reference clones. Short aliases still require page-bucket probes, and overlap can still require sorting page-sized pieces. The mapping writer needs no new long-view index.
 
-[Related correctness finding](../finding-xmem-notify-long-aliases-by-run.md)
+[Related correctness finding](../xmem-notify-aliases-of-written-physical-byte-ranges.md)

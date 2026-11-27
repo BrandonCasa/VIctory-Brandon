@@ -14,4 +14,4 @@ Use a shared monotonic timer ordered by deadline and submission ID. Keep the cal
 
 Timer threads fall from O(N) to one, plus workers actually delivering callbacks. Timer metadata stays O(N); a deadline heap costs O(log N) per insertion/removal. Remove canceled entries or release retained payloads promptly to avoid transferring the existing retention problem into the timer queue.
 
-[Related correctness finding](../finding-xasync-share-delayed-task-timer.md)
+[Related correctness finding](../xasync-preserve-callback-ownership-during-termination.md)

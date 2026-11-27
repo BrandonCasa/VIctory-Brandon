@@ -21,4 +21,4 @@ For these requests, inflate the payload and apply the selected DirectStorage mac
 
 All four valid modes complete with the requested byte length. For each corresponding GDK sample texture, applying the sample's final shader to the HLE output must reproduce the original tiled BC blocks byte for byte.
 
-[Deferred optimization](deferred/finding-dstorage-reuse-compressed-input-workspace.md)
+[Deferred optimization](deferred/dstorage-reuse-worker-compressed-input-buffers.md)

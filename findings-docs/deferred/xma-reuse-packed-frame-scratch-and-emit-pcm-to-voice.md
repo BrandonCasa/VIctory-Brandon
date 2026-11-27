@@ -14,4 +14,4 @@ Reuse a packed-frame buffer on the single decoder worker. Clear its logical leng
 
 For F frames, the packed-byte scratch grows to the largest packetized frame encountered. The F temporary PCM buffers and the copy of each accepted sample into the voice queue disappear. The queue still grows to hold unread output, and each retained sample is still converted and stored once. Decode and overlap processing remain necessary even when a frame is trimmed.
 
-[Related correctness finding](../finding-xma-reuse-frame-scratch.md)
+[Related correctness finding](../xma-preserve-decoder-overlap-across-context-handoffs.md)

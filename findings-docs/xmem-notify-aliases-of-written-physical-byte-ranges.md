@@ -12,4 +12,4 @@ Pass the writer's retained section, slice offsets and written extent from Direct
 
 Two writes to disjoint portions of one page notify only their corresponding intervals on aliases of the bytes actually written. Rebinding an alias before notification cannot redirect the notification to unrelated backing.
 
-[Deferred optimization](deferred/finding-xmem-notify-long-aliases-by-run.md)
+[Deferred optimization](deferred/xmem-intersect-long-aliases-once-per-physical-run.md)

@@ -14,4 +14,4 @@ Cache contiguous section runs for the submitted snapshot, keeping one run inline
 
 For P physical pages in R runs, a stable submitted list needs one O(P) resolution. Direct mapping, buffered scatter and post-write alias discovery can share O(R) descriptors. Current virtual aliases are looked up after the write. Unknown pages and failed host mappings can still incur retries before publication.
 
-[Related correctness finding](../finding-dstorage-resolve-physical-page-runs-once.md)
+[Related correctness finding](../dstorage-pin-physical-backing-through-fill.md)
