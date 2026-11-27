@@ -1,0 +1,7 @@
+interface:
+  display_name: "Check Frame Rate Coupling"
+  short_description: "Find behavior tied to presentation cadence"
+  default_prompt: "Use $check-frame-rate-coupling to check why a timer speeds up with rendering."
+
+policy:
+  allow_implicit_invocation: true

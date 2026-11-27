@@ -1,0 +1,7 @@
+interface:
+  display_name: "Resolve Title Contract"
+  short_description: "Resolve ambiguous original-game behavior"
+  default_prompt: "Use $resolve-title-contract to resolve the ownership assumption in this porting change."
+
+policy:
+  allow_implicit_invocation: true

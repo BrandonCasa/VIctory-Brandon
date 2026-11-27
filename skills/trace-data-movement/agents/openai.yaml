@@ -1,0 +1,7 @@
+interface:
+  display_name: "Trace Data Movement"
+  short_description: "Locate repeated copies and GPU transfers"
+  default_prompt: "Use $trace-data-movement to check whether this resource is uploaded repeatedly."
+
+policy:
+  allow_implicit_invocation: true
