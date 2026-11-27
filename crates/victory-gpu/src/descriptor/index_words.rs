@@ -173,6 +173,7 @@ pub(crate) struct SampleWords {
 pub(crate) type DeviceRanges = std::collections::BTreeMap<(u64, usize, usize), Arc<crate::shadow::Shadow>>;
 pub(crate) type DeviceBytes = std::collections::BTreeMap<(u64, usize, usize), Vec<u8>>;
 pub(crate) const SELECTOR_READ_BUDGET: usize = 64 * 1024;
+pub(crate) const WIDE_SELECTOR_READ_BUDGET: usize = 512 * 1024;
 
 impl RecordWindow {
     // Tiny sparse gathers cost at most 64 copy commands. For larger compact
@@ -332,7 +333,11 @@ impl IndexWords {
             let remaining = size - first;
             let bytes = records.map_or_else(|| if step == 0 { if remaining >= 4 { 4 } else { 0 } } else { remaining },
                 |r| u64::from(r.words) * 4);
-            card_candidate = bytes <= 256 || records.map_or(bytes <= SELECTOR_READ_BUDGET as u64, RecordWindow::copy_interval);
+            // A reflected offset without a known stride may use any byte in
+            // the view. Keep its full GPU span available to the ordered
+            // selector readback even when it is wider than a compact table.
+            let budget = if step == 1 { WIDE_SELECTOR_READ_BUDGET } else { SELECTOR_READ_BUDGET };
+            card_candidate = bytes <= 256 || records.map_or(bytes <= budget as u64, RecordWindow::copy_interval);
             if device_input {
                 note(Outcome::GpuOnlySource, step, logical, base + first, bytes, Some(ownership));
                 if !card_candidate { return None; }

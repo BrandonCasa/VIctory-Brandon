@@ -927,6 +927,18 @@ impl RtvRecord {
         (self.resource as usize, words)
     }
 
+    #[cfg(windows)]
+    pub(crate) fn from_key((resource, words): (usize, [u32; 7]), depth: bool) -> Self {
+        let mut desc = [0; 6];
+        desc.copy_from_slice(&words[1..]);
+        Self {
+            tag: if depth { DSV_TAG } else { RTV_TAG },
+            described: words[0],
+            resource: resource as This,
+            desc,
+        }
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(

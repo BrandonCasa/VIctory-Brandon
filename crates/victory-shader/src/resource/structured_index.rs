@@ -31,9 +31,9 @@ mod tests {
             0x3424_0c85, // v_lshlrev_b32 v18, 5, v6
             0xbf81_0000,
         ];
-        let prove = |words: &[u32]| -> Option<Vec<u32>> {
+        let prove = |words: &[u32], wave64| -> Option<Vec<u32>> {
             let code: Vec<_> = words.iter().flat_map(|x| x.to_le_bytes()).collect();
-            let p = crate::ir::build(&code, true, 32).unwrap();
+            let p = crate::ir::build(&code, wave64, 32).unwrap();
             let lanes = crate::structure::structure(&p).unwrap();
             let layout = [RootParam {
                 root: RootType::Table,
@@ -61,7 +61,8 @@ mod tests {
                 .flat_map(|b| &b.insts)
                 .find(|i| i.name() == "v_lshlrev_b32")
                 .unwrap();
-            let active = lanes.mask_bits(shift.read(Reg::S(EXEC))?, shift.read(Reg::S(EXEC + 1)))?;
+            let high = if wave64 { Some(shift.read(Reg::S(EXEC + 1))?) } else { None };
+            let active = lanes.mask_bits(shift.read(Reg::S(EXEC))?, high)?;
             let mut out = Vec::new();
             t.selector_branches(
                 shift.write(Reg::V(18))?,
@@ -83,14 +84,51 @@ mod tests {
             fields.sort_unstable();
             Some(fields)
         };
-        assert_eq!(prove(&words), Some(vec![12, 52]));
+        assert_eq!(prove(&words, true), Some(vec![12, 52]));
         let mut bad = words;
         bad[11] = 0x3424_0c84; // A different shift does not scale slots by 32.
-        assert_eq!(prove(&bad), None);
+        assert_eq!(prove(&bad, true), None);
         let mut bad = words;
         bad[8] = 0x7e0c_0303; // v_mov_b32 v6, v3 on a reachable masked arm.
         bad[9] = 0xbf80_0000;
-        assert_eq!(prove(&bad), None);
+        assert_eq!(prove(&bad, true), None);
+
+        let mut wave32 = words;
+        wave32[6] = 0xbe9a_037e; // Save EXEC_LO.
+        wave32[10] = 0xbefe_031a; // Restore EXEC_LO.
+        assert_eq!(prove(&wave32, false), Some(vec![12, 52]));
+        wave32[8] = 0x7e0c_0280; // A reachable masked arm writes the default slot.
+        wave32[9] = 0xbf80_0000;
+        assert_eq!(prove(&wave32, false), Some(vec![52]));
+        wave32[8] = 0x7e0c_0281; // Another literal is outside the column proof.
+        assert_eq!(prove(&wave32, false), None);
+    }
+
+    #[test]
+    fn image_waterfall_proof_does_not_cover_a_scalar_descriptor_read() {
+        let words = super::super::tests::WATERFALL_INDEXED_WAVE32;
+        let accepts = |words: &[u32]| {
+            let code: Vec<_> = words.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            let lanes = crate::structure::structure(&p).unwrap();
+            let layout = [(RootType::ResourceHeap, 0), (RootType::Table, 1)].map(|(root, slot)| RootParam {
+                root,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: slot.into(),
+                slot,
+            });
+            let resources = track(&p, &layout, HwStage::Cs, Some(&lanes)).unwrap();
+            let [load] = resources.waterfall.loads.as_slice() else { panic!("expected one waterfall"); };
+            Tracer::new(&p, &layout, HwStage::Cs, Some(&lanes)).unwrap().image_only_in_waterfall(*load, &resources)
+        };
+        assert!(accepts(words));
+        let mut mixed = words.to_vec();
+        let retry = mixed.iter().position(|&w| w == 0xbe95_4715).unwrap();
+        mixed[retry + 1] = 0xbf89_fff5; // The back edge still reaches the same instruction.
+        mixed.insert(retry, 0xbe9c_0310); // s_mov_b32 s28, s16 reads a descriptor word.
+        assert!(!accepts(&mixed));
     }
 
     #[test]
@@ -150,15 +188,15 @@ mod tests {
 
 impl Tracer<'_> {
     /// In a waterfall the first-lane read visits the active lanes of its
-    /// preheader. Follow both halves of that exact Wave64 mask. Phi edges
-    /// and masked writes can yield more than one structured-buffer field.
-    pub(super) fn wave64_structured_indices(
+    /// preheader. Follow its exact EXEC mask. Phi edges and masked writes
+    /// can yield several structured-buffer fields or the default slot.
+    pub(super) fn structured_indices(
         &self,
         load: Site,
         resources: &Resources,
         used: &[UsedResource],
     ) -> Option<Vec<BufferIndex>> {
-        if !self.p.wave64 || used.is_empty() {
+        if used.is_empty() {
             return None;
         }
         let lanes = self.lanes?;
@@ -173,8 +211,9 @@ impl Tracer<'_> {
             let (b, i) = self.phis[reader.read(Reg::S(reg))?.0 as usize]?;
             (b == load.0).then(|| block.phis[i].args[pre])
         };
-        let pair = [entry(EXEC)?, entry(EXEC + 1)?];
-        let active = lanes.mask_bits(pair[0], Some(pair[1]))?;
+        let low = entry(EXEC)?;
+        let high = if self.p.wave64 { Some(entry(EXEC + 1)?) } else { None };
+        let active = lanes.mask_bits(low, high)?;
         if !resources.waterfall.loads.contains(&load) {
             // The shader also reads image descriptor words as scalar numbers
             // (width and height). The retry instruction observes the selected
@@ -186,7 +225,7 @@ impl Tracer<'_> {
                 || block.insts[load.1..retry]
                     .iter()
                     .any(|i| i.write(Reg::S(EXEC)).is_some() || i.write(Reg::S(EXEC + 1)).is_some())
-                || !self.nonempty_entry(block.preds[pre], pair)
+                || !self.nonempty_entry(block.preds[pre], [low, high?])
             {
                 return None;
             }
@@ -210,7 +249,36 @@ impl Tracer<'_> {
             &mut out,
             &mut fuel,
         )?;
-        (!out.is_empty()).then_some(out)
+        if out.is_empty() || !self.p.wave64 && !self.image_only_in_waterfall(load, resources) {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// The image proof only bounds lanes active at waterfall entry. A
+    /// scalar descriptor use can run even when no lane is active.
+    fn image_only_in_waterfall(&self, load: Site, resources: &Resources) -> bool {
+        let outputs = &self.inst(load).writes;
+        let descriptor_word = |v| outputs.iter().any(|&(_, word)| word == v);
+        for (b, block) in self.p.blocks.iter().enumerate() {
+            if block.phis.iter().any(|phi| phi.args.iter().copied().any(descriptor_word)) {
+                return false;
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                if !inst.reads.iter().any(|&(_, v)| descriptor_word(v)) {
+                    continue;
+                }
+                if b != load.0 || !matches!(inst.fields, Fields::Image { .. })
+                    || !resources.descriptors.iter().any(|d| {
+                        d.site == (b, i) && d.role == Role::Resource
+                            && matches!(d.source, Source::Loaded { load: read, first: 0 } if read == load)
+                    })
+                {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     fn nonempty_entry(&self, mut block: usize, pair: [Value; 2]) -> bool {
@@ -297,7 +365,9 @@ impl Tracer<'_> {
             return None;
         };
         let mut here = known.clone();
-        let mask = lanes.mask_bits(inst.read(Reg::S(EXEC))?, Some(inst.read(Reg::S(EXEC + 1))?))?;
+        let low = inst.read(Reg::S(EXEC))?;
+        let high = if self.p.wave64 { Some(inst.read(Reg::S(EXEC + 1))?) } else { None };
+        let mask = lanes.mask_bits(low, high)?;
         let mut skipped = known.clone();
         skipped.push((mask, false));
         if self.meet(lanes, &skipped) {
@@ -314,6 +384,15 @@ impl Tracer<'_> {
         }
         here.push((mask, true));
         if !self.meet(lanes, &here) {
+            return Some(());
+        }
+        if !self.p.wave64 && inst.name() == "v_mov_b32"
+            && let [src] = plain(inst)?.src.as_slice()
+            && self.term(inst, src)? == Term::Const(0)
+        {
+            // A reflected column scan includes its bias plus zero explicitly,
+            // for both this default slot and an out-of-bounds buffer read.
+            // If no column is reached, the caller keeps the access opaque.
             return Some(());
         }
         if needs_shift {

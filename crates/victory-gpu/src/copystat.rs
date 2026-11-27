@@ -611,7 +611,7 @@ fn memory_map() -> u64 {
 }
 
 /// Whether to print the optional one-line category summary. Off by default.
-fn memory_categories() -> bool {
+pub(crate) fn memory_categories() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_MEMORY_CATEGORIES"))
 }
@@ -633,6 +633,7 @@ fn start_memory_sampler() {
             let usage = |i: usize| card.as_ref().and_then(|g| g[i].as_ref()).map_or(0, |g| g.CurrentUsage);
             let extra_copies = crate::shadow::EXTRA_COPY_BYTES.each_ref().map(|n| n.load(Relaxed));
             let pool_mb = crate::pool::memory();
+            let [window_heaps, window_placements, committed_windows] = crate::pool::window_memory();
             let fields = [
                 ("working set", working), ("private total", private),
                 ("free physical", free), ("commit headroom", headroom),
@@ -646,6 +647,7 @@ fn start_memory_sampler() {
                 ("sparse texture mapped tiles", crate::tiles::given_total()),
                 ("sparse texture tile heaps", crate::tiles::STATS[3].load(Relaxed)),
                 ("live texture staging", crate::texture::live_staging_bytes()),
+                ("texture read scratch capacity", crate::texture::READ_SCRATCH_CAPACITY.load(Relaxed)),
                 ("exact texture snapshots", crate::texture::PREVIOUS_BYTES.load(Relaxed)),
                 ("snapshots without physical views", crate::texture::SNAPSHOT_OWNERS[0].load(Relaxed)),
                 ("movie snapshots", crate::texture::SNAPSHOT_OWNERS[1].load(Relaxed)),
@@ -656,6 +658,9 @@ fn start_memory_sampler() {
                 ("unreadable bytes omitted from snapshots", crate::texture::SPARSE_OMITTED_BYTES.load(Relaxed)),
                 ("all guest buffer copies", crate::shadow::LIVE[1].load(Relaxed)),
                 ("loose address windows", extra_copies[0]),
+                ("loose window heaps", window_heaps),
+                ("loose window placements within heaps", window_placements),
+                ("committed loose windows", committed_windows),
                 ("copied descriptor views", extra_copies[1]),
                 ("by-address arenas", extra_copies[2]),
                 ("active texture readbacks", crate::texback::LIVE_READBACK_BYTES.load(Relaxed)),

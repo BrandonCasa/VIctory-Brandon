@@ -417,11 +417,11 @@ pub(crate) struct State {
     topology: u32,
     /// What the title set that goes straight onto the host list, kept for
     /// the host list that continues this one after a cut ([`State::replay`]):
-    /// whether a topology was set, the render target and depth handles, the
+    /// whether a topology was set, the render target and depth records, the
     /// viewports, the scissors, the blend factor and the stencil reference.
     topology_set: bool,
-    target_handles: Vec<u64>,
-    depth_handle: u64,
+    target_records: Vec<(usize, [u32; 7])>,
+    depth_record: Option<(usize, [u32; 7])>,
     targets_set: bool,
     /// The render target views and the depth view the host list has, once
     /// it has any ([`State::set_targets`]): per view the host texture (0:
@@ -1338,17 +1338,9 @@ impl State {
     /// again, each time a host view per target and a call of the driver
     /// (25,662 times in a frame of another fork). `VICTORY_BIND_CACHE=0`
     /// sets them every time.
-    pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
-        let Some(host) = crate::host::host() else {
-            return;
-        };
-        self.target_handles.clear();
-        self.target_handles.extend_from_slice(handles);
-        self.depth_handle = depth;
-        self.targets_set = true;
-        self.targets.clear();
-        let mut views = Vec::with_capacity(handles.len());
-        let mut keys = Vec::with_capacity(handles.len());
+    pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64, mut retain: impl FnMut(This)) {
+        let mut records = std::mem::take(&mut self.target_records);
+        records.clear();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -1357,6 +1349,25 @@ impl State {
                 );
                 continue;
             };
+            retain(record.resource);
+            records.push(record.key());
+        }
+        self.depth_record = crate::descriptor::dsv_record(depth).map(|record| {
+            retain(record.resource);
+            record.key()
+        });
+        self.targets_set = true;
+        self.bind_targets(list, &records);
+        self.target_records = records;
+    }
+
+    fn bind_targets(&mut self, list: &HostList, records: &[(usize, [u32; 7])]) {
+        let Some(host) = crate::host::host() else { return; };
+        self.targets.clear();
+        let mut views = Vec::with_capacity(records.len());
+        let mut keys = Vec::with_capacity(records.len());
+        for &key in records {
+            let record = crate::descriptor::RtvRecord::from_key(key, false);
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 // A typed null view (or a target without a host copy) still
                 // takes its slot: left out, the next live target would move
@@ -1369,7 +1380,7 @@ impl State {
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
                     views.push((None, Some(desc)));
-                    keys.push((0, record.key()));
+                    keys.push((0, key));
                 }
                 continue;
             };
@@ -1377,11 +1388,12 @@ impl State {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             views.push((Some(texture), record.desc()));
-            keys.push((texture.as_raw() as usize, record.key()));
+            keys.push((texture.as_raw() as usize, key));
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
+        let dsv = self.depth_record.and_then(|key| {
+            let record = crate::descriptor::RtvRecord::from_key(key, true);
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             self.depth_state = depth_state(texture, record.depth_desc().as_ref());
@@ -1479,9 +1491,7 @@ impl State {
     /// draw anyway. The dynamic descriptor slots and the tables made in
     /// them stay: the parts before the cut have not run yet, and they are
     /// given back when the title's list is reset.
-    /// shortcut: the render target views are made again from the handles'
-    /// descriptors as they are now, not as they were when the title set
-    /// the targets (a descriptor rewritten in between names another view).
+    /// Target records keep the views as they were when the title set them.
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.bound_vertex.fill(None);
         self.bound_index = None;
@@ -1494,8 +1504,9 @@ impl State {
         }
         self.host_targets = None;
         if self.targets_set {
-            let handles = std::mem::take(&mut self.target_handles);
-            self.set_targets(list, &handles, self.depth_handle);
+            let records = std::mem::take(&mut self.target_records);
+            self.bind_targets(list, &records);
+            self.target_records = records;
         }
         if !self.viewports.is_empty() {
             crate::draw::viewports(list, &self.viewports);
@@ -2183,9 +2194,6 @@ impl State {
             list.refused_command(self.pipeline, "concurrent buffer write overlaps a copied SRV presentation");
             return false;
         }
-        // Depth textures it writes through unordered access: their colour
-        // twins hold what they lack from here on.
-        list.twins_written();
         if !device_materials.is_empty() {
             let outputs = self.targets.iter().copied().chain(std::iter::once(self.depth)).filter(|&r| !compute && r != 0);
             if !list.group_device_materials(outputs, compute_tail) {

@@ -494,6 +494,8 @@ impl WindowHeap {
             let heap = heap?;
             crate::host::resident(device, &heap).ok()?;
             crate::host::mapped(device).ok()?;
+            #[cfg(feature = "diagnostics")]
+            WindowAllocation::Heap.track(&heap, || BYTES);
             self.current = Some((heap, 0));
         }
         let (heap, used) = self.current.as_mut()?;
@@ -505,19 +507,73 @@ impl WindowHeap {
             device.CreatePlacedResource(&*heap, start, desc, D3D12_RESOURCE_STATE_COMMON, None, &mut resource).ok()?;
             let resource = resource?;
             resource.SetPrivateDataInterface(&OWNER, &*heap).ok()?;
+            #[cfg(feature = "diagnostics")]
+            WindowAllocation::Placed.track(&resource, || info.SizeInBytes);
             *used = start + info.SizeInBytes;
             Some(resource)
         }
     }
 }
 
-/// An object the host texture holds and releases when it goes: its piece
-/// is free then.
+#[cfg(feature = "diagnostics")]
+pub(crate) enum WindowAllocation {
+    Heap,
+    Placed,
+    Committed,
+}
+
+#[cfg(feature = "diagnostics")]
+static WINDOW_BYTES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Live bytes in native window heaps, in their placed allocations, and in
+/// standalone committed windows. Placed bytes are part of the heap bytes.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_memory() -> [u64; 3] {
+    WINDOW_BYTES.each_ref().map(|bytes| bytes.load(Ordering::Relaxed))
+}
+
+#[cfg(feature = "diagnostics")]
+impl WindowAllocation {
+    pub(crate) fn track(self, object: &ID3D12Object, allocation_size: impl FnOnce() -> u64) {
+        if !crate::copystat::memory_categories() {
+            return;
+        }
+        let bytes = allocation_size();
+        if bytes == u64::MAX {
+            return;
+        }
+        const KEY: GUID = GUID::from_u128(0x1912b57e_b1bc_4e2c_93f0_4573403d0f28);
+        let counter = &WINDOW_BYTES[self as usize];
+        counter.fetch_add(bytes, Ordering::Relaxed);
+        let observer = Reclaim::observer(Release::Window { counter, bytes });
+        // SAFETY: the object holds the observer, which has no reference back to it.
+        // If attachment fails, dropping the observer undoes the accounting.
+        if let Err(error) = unsafe { object.SetPrivateDataInterface(&KEY, &observer) } {
+            tracing::debug!(%error, "could not track a loose window allocation");
+        }
+    }
+}
+
+enum Release {
+    Texture(Piece),
+    #[cfg(feature = "diagnostics")]
+    Window { counter: &'static AtomicU64, bytes: u64 },
+}
+
+/// A COM object released with the native object holding it.
 #[repr(C)]
 struct Reclaim {
     methods: &'static [*const (); 3],
     references: AtomicU32,
-    piece: Piece,
+    action: Release,
+}
+
+impl Reclaim {
+    fn observer(action: Release) -> IUnknown {
+        let raw = Box::into_raw(Box::new(Self { methods: &RECLAIM.0, references: AtomicU32::new(1), action }));
+        // SAFETY: this allocation implements IUnknown and has one owned reference.
+        unsafe { IUnknown::from_raw(raw.cast()) }
+    }
 }
 
 struct Methods([*const (); 3]);
@@ -554,8 +610,16 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
-            HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
-            lock(&TEXTURES).give(gone.piece, now());
+            match gone.action {
+                Release::Texture(piece) => {
+                    HELD.fetch_sub(piece.len, Ordering::Relaxed);
+                    lock(&TEXTURES).give(piece, now());
+                }
+                #[cfg(feature = "diagnostics")]
+                Release::Window { counter, bytes } => {
+                    counter.fetch_sub(bytes, Ordering::Relaxed);
+                }
+            }
         }
         left
     }
@@ -720,16 +784,12 @@ pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
 /// Makes `texture` give `piece` back when the last reference to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
-    // SAFETY: a COM object of ours with one reference, which this takes and
-    // drops at the end; the texture takes its own.
-    unsafe {
-        let object = IUnknown::from_raw(made.cast());
-        if texture.SetPrivateDataInterface(&KEY, &object).is_err() {
-            // Never given back: the piece stays taken, nothing is reused
-            // under a texture that may be alive.
-            std::mem::forget(object);
-        }
+    let object = Reclaim::observer(Release::Texture(piece));
+    // SAFETY: the texture takes its own reference to the observer.
+    if unsafe { texture.SetPrivateDataInterface(&KEY, &object) }.is_err() {
+        // Never given back: the piece stays taken, nothing is reused
+        // under a texture that may be alive.
+        std::mem::forget(object);
     }
 }
 

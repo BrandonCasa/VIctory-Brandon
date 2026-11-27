@@ -1,7 +1,9 @@
-//! Compact device-local descriptor indices observed between the occurrence's
+//! Device-local descriptor indices observed between the occurrence's
 //! ordinary buffer uploads and its first native consumer.
 use super::*;
-use crate::descriptor::index_words::{DependentWords, DeviceBytes, DeviceRanges, SELECTOR_READ_BUDGET};
+use crate::descriptor::index_words::{
+    DependentWords, DeviceBytes, DeviceRanges, SELECTOR_READ_BUDGET, WIDE_SELECTOR_READ_BUDGET,
+};
 
 #[cfg(feature = "diagnostics")]
 pub(super) static PROBE_FENCES: [std::sync::atomic::AtomicU64; 2] =
@@ -163,9 +165,14 @@ pub(super) fn read(host: &Host, list: &HostList, plan: &Plan) -> Option<DeviceBy
         // accepted bytes belong to this same ordered occurrence.
         if round == 3 || ranges.is_empty() || plan.chains.is_empty() {
             let mut room = SELECTOR_READ_BUDGET;
+            let mut wide_room = WIDE_SELECTOR_READ_BUDGET;
             for (key,shadow) in bulk.take().unwrap_or_default() {
-                if key.2 <= room {
-                    room -= key.2;
+                // Wide contiguous sources need an exact snapshot of the
+                // entire view. Give them a separate per-occurrence allowance
+                // so they cannot displace the existing compact reads.
+                let left = if key.2 > SELECTOR_READ_BUDGET { &mut wide_room } else { &mut room };
+                if key.2 <= *left {
+                    *left -= key.2;
                     ranges.insert(key,shadow);
                 }
             }
@@ -266,13 +273,16 @@ fn read_ranges(host: &Host, ranges: &DeviceRanges) -> Option<DeviceBytes> {
     }
     #[cfg(feature = "diagnostics")]
     {
-        static READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let uses = READS.fetch_add(1, Ordering::Relaxed) + 1;
+        static READS: [std::sync::atomic::AtomicU64; 2] =
+            [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+        let wide = total > SELECTOR_READ_BUDGET;
+        let uses = READS[usize::from(wide)].fetch_add(1, Ordering::Relaxed) + 1;
         if uses.is_power_of_two() {
             tracing::info!(
                 uses,
                 bindings = ranges.len(),
                 bytes = total,
+                wide,
                 "sampled device-local material indices after buffer uploads"
             );
         }
@@ -318,5 +328,48 @@ mod tests {
         .unwrap();
         assert_eq!(snapshot[&first], 11u32.to_le_bytes());
         assert_eq!(snapshot[&second], 7u32.to_le_bytes());
+    }
+
+    #[test]
+    fn wide_selector_reads_keep_the_tail_and_the_compact_allowance() {
+        let Some(host) = host() else {
+            return;
+        };
+        const WIDE: usize = WIDE_SELECTOR_READ_BUDGET;
+        const COMPACT: usize = 1024;
+        const TOTAL: usize = 2 * WIDE + COMPACT;
+        let title = vec![0u32; TOTAL / 4];
+        let at = title.as_ptr() as usize;
+        let Some(shadow) = crate::shadow::by_address(at as u64, TOTAL as u64) else {
+            return;
+        };
+        let (seed, data) = host.upload_buffer(TOTAL as u64).unwrap();
+        // SAFETY: the mapped upload buffer holds all three ranges. The
+        // compact source and the last word of the first wide source differ.
+        unsafe {
+            std::ptr::write_bytes(data, 0, TOTAL);
+            std::ptr::copy_nonoverlapping(12u32.to_le_bytes().as_ptr(), data, 4);
+            std::ptr::copy_nonoverlapping(17u32.to_le_bytes().as_ptr(), data.add(COMPACT + WIDE - 4), 4);
+        }
+        host.copy_preserved_buffers(&[(shadow.buffer.clone(), 0, seed, 0, TOTAL as u64)])
+            .unwrap();
+        let list = host.new_list().unwrap();
+        let compact = (shadow.id(), at, COMPACT);
+        let wide = (shadow.id(), at + COMPACT, WIDE);
+        let excess = (shadow.id(), at + COMPACT + WIDE, WIDE);
+        let snapshot = read(
+            host,
+            &list,
+            &Plan {
+                ordinary: DeviceRanges::from([(compact, shadow.clone()), (wide, shadow.clone()), (excess, shadow)]),
+                chains: vec![],
+                writes: vec![],
+                refresh_sources: Default::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(&snapshot[&compact][..4], &12u32.to_le_bytes());
+        assert_eq!(&snapshot[&wide][WIDE - 4..], &17u32.to_le_bytes());
+        assert!(!snapshot.contains_key(&excess));
     }
 }

@@ -123,12 +123,8 @@ impl Front {
     }
 
     fn retain(&self, object: This) {
-        if !self.closed
-            && !object.is_null()
-            && let Some(recording) = &self.recording
-            && held(&recording.objects.0).insert(object as usize)
-        {
-            crate::object::add_ref(object);
+        if !self.closed && let Some(recording) = &self.recording {
+            recording.objects.retain(object);
         }
     }
 
@@ -220,6 +216,14 @@ fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// yet, and the list of ours it goes to.
 #[derive(Default)]
 pub(super) struct Objects(Mutex<std::collections::HashSet<usize>>);
+
+impl Objects {
+    pub(super) fn retain(&self, object: This) {
+        if !object.is_null() && held(&self.0).insert(object as usize) {
+            crate::object::add_ref(object);
+        }
+    }
+}
 
 impl Drop for Objects {
     fn drop(&mut self) {
@@ -553,6 +557,8 @@ fn finish_texture_piece(list: This) {
         super::cut(list, None, CutReason::MaterialSelector);
     } else if super::host_list(list).is_some_and(|host| host.take_texture_boundary()) {
         super::cut(list, None, CutReason::TextureWrite);
+    } else {
+        super::finish_depth_plane_piece(list);
     }
 }
 
@@ -570,13 +576,16 @@ fn continues_texture_copy(host: &crate::host::HostList, op: u64, w: &[u64]) -> b
         && host.readback_only_to(dst.resource)
 }
 
-/// These commands update draw state or order already-recorded operations.
-/// Their next native consumer checks its actual pipeline and output resources.
-fn ends_material_group(op: u64, drawing: bool, draw_shares: impl FnOnce() -> bool) -> bool {
-    if op <= Plain::SET_PIPELINE as u64 || op == Plain::SYNC as u64
+/// Some commands only update state, order prior operations, or end the piece.
+/// Other commands need a new piece after an ordered publication.
+fn needs_published_piece(op: u64) -> bool {
+    !(op <= Plain::SET_PIPELINE as u64 || op == Plain::SYNC as u64
         || (VIEWPORTS..=TARGETS).contains(&op) || matches!(op, UPLOAD | BARRIER_GROUPS | CLOSE | RESET | BUILDER_RANGES)
-        || op == Plain::WAIT_VALUE as u64 || op == Plain::WAIT_VALUE64 as u64 { return false; }
-    !drawing || !draw_shares()
+        || op == Plain::WAIT_VALUE as u64 || op == Plain::WAIT_VALUE64 as u64)
+}
+
+fn ends_material_group(op: u64, drawing: bool, draw_shares: impl FnOnce() -> bool) -> bool {
+    needs_published_piece(op) && (!drawing || !draw_shares())
 }
 
 /// A compute shader with explicitly bounded outputs can defer its material
@@ -1019,6 +1028,12 @@ fn translate(
             })
             {
                 super::cut(list, None, CutReason::MaterialSelector);
+            }
+            // Waits and existing cuts close the producer themselves. State
+            // setters can be replayed if a native command follows. CLOSE
+            // alone needs no new command list after the depth conversion.
+            if needs_published_piece(op) {
+                super::finish_depth_plane_piece(list);
             }
             let dispatch = op == Plain::DISPATCH as u64 || op == Plain::DISPATCH_X as u64
                 || op == Plain::EXECUTE_INDIRECT as u64 && crate::signature::layout(w[0] as This)

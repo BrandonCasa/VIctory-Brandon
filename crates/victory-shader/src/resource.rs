@@ -536,7 +536,7 @@ pub(crate) fn track_with_used(
         if let Some(index) = t.waterfall_buffer_index(load, &out)
             .or_else(|| t.structured_buffer_index(load, &out, used)) {
             out.buffer_indices.push((load, index));
-        } else if let Some(indices) = t.wave64_structured_indices(load, &out, used) {
+        } else if let Some(indices) = t.structured_indices(load, &out, used) {
             out.buffer_indices.extend(indices.into_iter().map(|index| (load, index)));
         }
     }
@@ -545,7 +545,7 @@ pub(crate) fn track_with_used(
     for &(load, addr) in &out.scalar {
         if !out.waterfall.loads.contains(&load) && t.p.wave64
             && t.layout.get(addr.param).is_some_and(|p| p.root == RootType::ResourceHeap)
-            && let Some(indices) = t.wave64_structured_indices(load, &out, used) {
+            && let Some(indices) = t.structured_indices(load, &out, used) {
             out.buffer_indices.extend(indices.into_iter().map(|index| (load, index)));
         }
     }

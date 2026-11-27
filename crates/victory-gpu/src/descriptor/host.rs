@@ -3121,13 +3121,18 @@ impl HostHeap {
                             && late_guest_sample_conflict(logical, object, &copy).is_some()
                         { Some("separate writer overlaps sampled placement") }
                         else if !recording && let Some(twin) = crate::resource::twin(this) {
+                            // The console D16S8 stencil SRV is format 120 on
+                            // plane one of a Texture2D. Its copy is separate
+                            // from the pass that publishes the depth plane.
+                            let stencil = matches!(&resolved, View::Shader(_, Some(d))
+                                if d[0] == 120 && d[1] == 4 && d[6] == 1);
                             let access = crate::host::SampleAccess {
                                 heap: self as *const Self as usize,
                                 kind: texture_kind(&view).map_or(0, |(_, kind)| kind),
                                 logical,
                                 stages,
                             };
-                            if late.as_deref_mut().is_some_and(|samples| list.prepare_late_depth_sample(&copy, twin, samples, access)) { None }
+                            if late.as_deref_mut().is_some_and(|samples| list.prepare_late_depth_sample(&copy, twin, samples, access, stencil)) { None }
                             else { Some("sampled depth image has conflicting recorded use") }
                         }
                         else if let Some(conflict) = (recording && cpu_owned).then(|| late_guest_sample_conflict(logical, object, &copy)).flatten() { Some(conflict) }

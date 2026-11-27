@@ -34,6 +34,9 @@ pub(super) struct Uses {
     source_ids: HashMap<Arc<[SampleWords]>, usize>,
     readers: HashMap<Reader, Vec<Range<u32>>>,
     transitions: HashMap<u64, Vec<(u32, u8)>>,
+    // An ordered copy makes the native stencil current until the next twin write.
+    stencil: HashMap<u64, Vec<(u32, bool)>>,
+    twin_writes_pending: bool,
     // Native mips used by all OM binds and clears in the closed list.
     // None means an unknown view or a whole-image transition.
     color_mips: HashMap<usize, Option<Vec<u32>>>,
@@ -103,6 +106,14 @@ impl Uses {
         self.pending.clear();
     }
 
+    pub(super) fn pending_twin_write(&mut self) {
+        self.twin_writes_pending = true;
+    }
+
+    pub(super) fn take_twin_writes(&mut self) -> bool {
+        std::mem::take(&mut self.twin_writes_pending)
+    }
+
     pub(super) fn sources(&self) -> &[Arc<[SampleWords]>] { &self.sources }
 
     pub(super) fn readers_for(&self, heap: usize, uav: bool) -> Vec<(u32, Option<usize>)> {
@@ -161,6 +172,15 @@ impl Uses {
         }
     }
 
+    pub(super) fn stencil_published(&mut self, serial: u64, published: bool) {
+        let changes = self.stencil.entry(serial).or_default();
+        if let Some(last) = changes.last_mut().filter(|entry| entry.0 == self.command) {
+            last.1 = published;
+        } else {
+            changes.push((self.command, published));
+        }
+    }
+
     #[cfg(feature = "diagnostics")]
     pub(super) fn pipeline(&self, ordinal: u32) -> Option<usize> {
         let next = self.pipelines.partition_point(|&(at, _)| at <= ordinal);
@@ -175,8 +195,24 @@ impl Uses {
     /// The ordinal, required and actual shader-read states for the first
     /// potential reader lacking its stage's bit. The native list prelude
     /// establishes its first tracked state before command zero.
-    pub(super) fn conflict(&self, serial: u64, initial: u32, heap: usize, kind: u32, uav: bool, mut may_select: impl FnMut(usize) -> bool) -> Option<(u32, u8, u8, Option<usize>)> {
+    pub(super) fn conflict(&self, serial: u64, initial: u32, heap: usize, kind: u32, uav: bool, may_select: impl FnMut(usize) -> bool) -> Option<(u32, u8, u8, Option<usize>)> {
         let changes = self.transitions.get(&serial).map_or(&[][..], Vec::as_slice);
+        self.first_conflict(changes, (initial & SHADER_STATES) as u8, heap, kind, uav,
+            |state, required| state & required != required, may_select)
+    }
+
+    /// Until the recording publishes the stencil, the prelude would have to
+    /// prove the prior generation. This path requires an in-list publication.
+    pub(super) fn stencil_conflict(&self, serial: u64, heap: usize, kind: u32, may_select: impl FnMut(usize) -> bool) -> Option<u32> {
+        let changes = self.stencil.get(&serial).map_or(&[][..], Vec::as_slice);
+        self.first_conflict(changes, false, heap, kind, false, |published, _| !published, may_select)
+            .map(|(command, _, _, _)| command)
+    }
+
+    fn first_conflict<T: Copy>(
+        &self, changes: &[(u32, T)], initial: T, heap: usize, kind: u32, uav: bool,
+        incompatible: impl Fn(T, u8) -> bool, mut may_select: impl FnMut(usize) -> bool,
+    ) -> Option<(u32, u8, T, Option<usize>)> {
         'reader: for (&(owner, kinds, required, scope), runs) in &self.readers {
             if owner != heap || (required == UAV) != uav || (kinds != 0 && kind != 0 && kinds & kind == 0) {
                 continue;
@@ -184,11 +220,11 @@ impl Uses {
             for run in runs {
                 let start = changes.partition_point(|&(at, _)| at <= run.start);
                 let state = if start == 0 {
-                    (initial & SHADER_STATES) as u8
+                    initial
                 } else {
                     changes[start - 1].1
                 };
-                if state & required != required {
+                if incompatible(state, required) {
                     if scope.is_some_and(|id| !may_select(id)) { continue 'reader; }
                     return Some((run.start, required, state, scope));
                 }
@@ -196,7 +232,7 @@ impl Uses {
                     if at >= run.end {
                         break;
                     }
-                    if state & required != required {
+                    if incompatible(state, required) {
                         if scope.is_some_and(|id| !may_select(id)) { continue 'reader; }
                         return Some((at, required, state, scope));
                     }
@@ -227,6 +263,31 @@ mod tests {
         uses.observes(7, 4, 0x40, None);
         uses.issued(4);
         assert_eq!(uses.conflict(19, 0x8, 7, 4, false, |_| true), Some((3, 0x40, UAV, None)));
+    }
+
+    #[test]
+    fn stencil_reads_require_publication_after_the_latest_twin_write() {
+        const STENCIL: u64 = 19;
+        const TEXTURE_2D: u32 = 4;
+        let mut uses = Uses::default();
+        let read = |uses: &mut Uses, heap| {
+            uses.observes(heap, TEXTURE_2D, 0x40, None);
+            uses.issued(1);
+        };
+        read(&mut uses, 7); // prior generation is not proven by this list
+        uses.issued(2); // first writer issued
+        uses.stencil_published(STENCIL, false);
+        read(&mut uses, 8); // shader state alone does not publish content
+        uses.stencil_published(STENCIL, true);
+        read(&mut uses, 9);
+        uses.issued(2); // another writer invalidates that copy
+        uses.stencil_published(STENCIL, false);
+        read(&mut uses, 10);
+        uses.stencil_published(STENCIL, true); // closing copy is too late for heap 10
+
+        for (heap, conflict) in [(7, Some(0)), (8, Some(2)), (9, None), (10, Some(5))] {
+            assert_eq!(uses.stencil_conflict(STENCIL, heap, TEXTURE_2D, |_| true), conflict);
+        }
     }
 }
 

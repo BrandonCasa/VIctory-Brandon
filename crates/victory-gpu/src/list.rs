@@ -306,12 +306,12 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
 #[derive(Clone, Copy)]
 enum CutReason {
     MemoryWait, TextureWrite, DescriptorCopyBefore, DescriptorCopyAfter, DescriptorWrite,
-    BuilderScope, BuilderDispatch, ValueWrite, RawMemory, MaterialSelector,
+    BuilderScope, BuilderDispatch, ValueWrite, RawMemory, MaterialSelector, DepthPlane,
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) static SPLITS: [std::sync::atomic::AtomicU64; 10] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+pub(crate) static SPLITS: [std::sync::atomic::AtomicU64; 11] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 /// First ordered texture write of each native piece, from a copy or a shader.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) static TEXTURE_BOUNDARIES: [std::sync::atomic::AtomicU64; 2] =
@@ -356,7 +356,12 @@ fn cut(this: This, wait: Option<ValueWait>, _reason: CutReason) {
         return;
     };
     #[cfg(feature = "diagnostics")]
-    SPLITS[_reason as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    {
+        let count = SPLITS[_reason as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if matches!(_reason, CutReason::DepthPlane) && count.is_power_of_two() {
+            tracing::info!(count, "recorded depth-plane publication before the next native command");
+        }
+    }
     static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
         tracing::info!(parts = list.earlier.len() + 2, "a list is cut at a wait for a memory value");
@@ -372,6 +377,22 @@ fn cut(this: This, wait: Option<ValueWait>, _reason: CutReason) {
             .unwrap_or_else(|e| e.into_inner())
             .replay(host);
     }
+}
+
+/// The preceding piece wrote a depth twin. Its normal close records the
+/// conversion before the next title command continues on a new piece.
+#[cfg(windows)]
+fn finish_depth_plane_piece(this: This) {
+    if host_list(this).is_some_and(|host| host.take_depth_plane_boundary()) {
+        cut(this, None, CutReason::DepthPlane);
+    }
+}
+
+#[cfg(windows)]
+fn with_shader_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    finish_depth_plane_piece(this);
+    builder_boundary(this);
+    with_state(this, f);
 }
 
 /// Whether list `this` recorded a wait for a memory value (with waits cut
@@ -751,6 +772,10 @@ const UAV_BARRIER: Barrier = Barrier {
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
+    if count > 0 && !barriers.is_null() {
+        finish_depth_plane_piece(this);
+    }
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
@@ -920,6 +945,7 @@ pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic:
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
+        finish_depth_plane_piece(this);
         let Some(list) = host_list(this) else {
             return;
         };
@@ -1035,13 +1061,11 @@ extern "system" fn copy_texture_region(
         use windows::core::Interface;
         const FOOTPRINT: u32 = 1;
         // SAFETY: the title passes both locations (null is tolerated).
-        let (Some(list), Some(&dst), Some(&src)) =
-            (host_list(this), unsafe { dst.as_ref() }, unsafe {
-                src.as_ref()
-            })
-        else {
+        let (Some(&dst), Some(&src)) = (unsafe { dst.as_ref() }, unsafe { src.as_ref() }) else {
             return;
         };
+        finish_depth_plane_piece(this);
+        let Some(list) = host_list(this) else { return; };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             // Texture to buffer: a read back. The list copies the texels
             // into a host buffer of ours; once it has run they go to the
@@ -1306,6 +1330,8 @@ extern "system" fn resolve(
     format: u32,
 ) {
     #[cfg(windows)]
+    finish_depth_plane_piece(this);
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
@@ -1442,6 +1468,7 @@ extern "system" fn clear_dsv(
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
+        finish_depth_plane_piece(this);
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
         else {
             return;
@@ -1529,8 +1556,7 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     count_dispatch();
     #[cfg(windows)]
     {
-        builder_boundary(this);
-        with_state(this, |list, s| s.dispatch(list, x, y, z, flags));
+        with_shader_state(this, |list, s| s.dispatch(list, x, y, z, flags));
     }
     #[cfg(not(windows))]
     let _ = (this, x, y, z, flags);
@@ -1829,7 +1855,18 @@ mod state {
         };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
+        // SAFETY: the recording thread owns this guest list. A thin worker's
+        // generation already holds the resources named by its copied records.
+        let direct_objects = unsafe { this.cast_mut().cast::<super::List>().as_mut() }
+            .filter(|list| !list.worker && list.host.is_some())
+            .map(|list| list.objects.get_or_insert_with(Default::default).clone());
+        with_state(this, |list, s| {
+            s.set_targets(list, &handles, depth, |resource| {
+                if let Some(objects) = &direct_objects {
+                    objects.retain(resource);
+                }
+            });
+        });
     }
     pub(super) extern "system" fn draw(
         this: This,
@@ -1839,26 +1876,23 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        super::builder_boundary(this);
-        with_state(this, |list, s| {
+        super::with_shader_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        super::builder_boundary(this);
-        with_state(this, |list, s| s.dispatch(list, x, y, z, 0));
+        super::with_shader_state(this, |list, s| s.dispatch(list, x, y, z, 0));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
-        super::builder_boundary(this);
         if y * z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        super::with_shader_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
     /// shortcut: dispatches whose group count is in GPU memory (indirect)
@@ -1871,13 +1905,12 @@ mod state {
         _payload: u64,
     ) {
         super::count_draw();
-        super::builder_boundary(this);
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        super::with_shader_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     pub(super) extern "system" fn draw_indexed(
         this: This,
@@ -1888,8 +1921,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        super::builder_boundary(this);
-        with_state(this, |list, s| {
+        super::with_shader_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
     }
@@ -1969,8 +2001,7 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        builder_boundary(this);
-        with_state(this, |list, s| {
+        with_shader_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {

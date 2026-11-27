@@ -675,20 +675,42 @@ fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     out
 }
 
+struct ReadScratch(Vec<u8>);
+
+/// Total allocated capacity across live texture readers, including idle workers.
+#[cfg(feature = "diagnostics")]
+pub(crate) static READ_SCRATCH_CAPACITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for ReadScratch {
+    fn drop(&mut self) {
+        if self.0.capacity() != 0 && crate::copystat::memory_categories() {
+            READ_SCRATCH_CAPACITY.fetch_sub(self.0.capacity() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 thread_local! {
     /// Room to read a texture's memory into: one buffer per submitting
     /// thread. Each texture kept its own, a second copy in memory of every
     /// write-watched or partly mapped texture ever sampled, for the run.
-    static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static READ: std::cell::RefCell<ReadScratch> = const { std::cell::RefCell::new(ReadScratch(Vec::new())) };
 }
 
 /// Calls `f` with `size` bytes of this thread's read buffer (their
 /// contents are whatever the last texture left).
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     READ.with(|read| {
-        let mut read = read.borrow_mut();
+        let mut scratch = read.borrow_mut();
+        let read = &mut scratch.0;
         if read.len() < size {
+            #[cfg(feature = "diagnostics")]
+            let before = read.capacity();
             read.resize(size, 0);
+            #[cfg(feature = "diagnostics")]
+            if read.capacity() != before && crate::copystat::memory_categories() {
+                READ_SCRATCH_CAPACITY.fetch_add((read.capacity() - before) as u64, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         f(&mut read[..size])
     })

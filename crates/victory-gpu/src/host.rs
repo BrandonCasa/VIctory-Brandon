@@ -1427,6 +1427,7 @@ pub(crate) struct HostList {
     last_execution: std::sync::atomic::AtomicU64,
     texture_boundary: AtomicBool,
     selector_boundary: AtomicBool,
+    depth_plane_boundary: AtomicBool,
     stream_draw: AtomicBool,
     sample_uses: Mutex<sample_states::Uses>,
     allocator: std::sync::Arc<ID3D12CommandAllocator>,
@@ -1577,21 +1578,36 @@ float plane(float4 p : SV_Position) : SV_Depth {
 }
 "#;
 
-/// Views of twins the pass reads, in a heap of ours used as a ring.
-/// shortcut: a view must last until its list has run; with one or two
-/// passes a frame the ring is far from coming round.
+/// Number of depth-plane views to allocate together for reuse by recordings.
 const PLANE_VIEWS: u32 = 256;
 
-/// What the pass draws with: the heap of its views of twins, and per kind
-/// of twin (16-bit steps or floats) and depth format the root signature
-/// and pipeline, made when first needed (`None`: the host refused).
+/// The pass's descriptor heaps and pipelines, created as recordings need them.
+#[derive(Default)]
 struct PlanePass {
-    views: ID3D12DescriptorHeap,
-    cpu: usize,
-    gpu: u64,
-    step: u32,
-    next: AtomicU32,
+    heaps: Mutex<Vec<PlaneViewHeap>>,
     made: Mutex<Vec<(bool, i32, Option<PlanePipeline>)>>,
+}
+
+struct PlaneViewHeap {
+    heap: ID3D12DescriptorHeap,
+    used: Vec<bool>,
+}
+
+/// The shader can read these descriptors on every replay of the recording.
+/// Return their slots only when the recording releases its deferred state.
+struct PlaneViews {
+    pass: &'static PlanePass,
+    heap: ID3D12DescriptorHeap,
+    heap_index: usize,
+    first: usize,
+    count: usize,
+}
+
+impl Drop for PlaneViews {
+    fn drop(&mut self) {
+        let mut heaps = self.pass.heaps.lock().unwrap_or_else(|e| e.into_inner());
+        heaps[self.heap_index].used[self.first..self.first + self.count].fill(false);
+    }
 }
 
 /// The pass's root signature and pipeline for one kind of twin and one
@@ -1603,33 +1619,9 @@ unsafe impl Send for PlanePass {}
 // SAFETY: as above.
 unsafe impl Sync for PlanePass {}
 
-fn plane_pass() -> Option<&'static PlanePass> {
-    static PASS: OnceLock<Option<PlanePass>> = OnceLock::new();
-    PASS.get_or_init(|| {
-        let host = host()?;
-        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        // SAFETY: plain heap creation and queries.
-        unsafe {
-            let views: ID3D12DescriptorHeap = host
-                .device
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: kind,
-                    NumDescriptors: PLANE_VIEWS,
-                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                    NodeMask: 0,
-                })
-                .ok()?;
-            Some(PlanePass {
-                cpu: views.GetCPUDescriptorHandleForHeapStart().ptr,
-                gpu: views.GetGPUDescriptorHandleForHeapStart().ptr,
-                step: host.device.GetDescriptorHandleIncrementSize(kind),
-                views,
-                next: AtomicU32::new(0),
-                made: Mutex::default(),
-            })
-        }
-    })
-    .as_ref()
+fn plane_pass() -> &'static PlanePass {
+    static PASS: OnceLock<PlanePass> = OnceLock::new();
+    PASS.get_or_init(PlanePass::default)
 }
 
 /// Compiles function `entry` of `source` for `target` with the system's
@@ -1681,6 +1673,49 @@ pub(crate) fn compile(
 }
 
 impl PlanePass {
+    fn views(&'static self, device: &ID3D12Device, count: u32) -> Option<PlaneViews> {
+        if count == 0 {
+            return None;
+        }
+        let mut heaps = self.heaps.lock().unwrap_or_else(|e| e.into_inner());
+        let capacity = PLANE_VIEWS.max(count);
+        let count = count as usize;
+        let lease = |heap: &mut PlaneViewHeap, heap_index, first| {
+            heap.used[first..first + count].fill(true);
+            PlaneViews {
+                pass: self,
+                heap: heap.heap.clone(),
+                heap_index,
+                first,
+                count,
+            }
+        };
+        for (index, heap) in heaps.iter_mut().enumerate() {
+            if let Some(first) = heap.used.windows(count).position(|run| run.iter().all(|&used| !used)) {
+                return Some(lease(heap, index, first));
+            }
+        }
+        // SAFETY: plain heap creation on the device that records the pass.
+        let made = unsafe {
+            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: capacity,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+        };
+        let heap = made
+            .inspect_err(|e| {
+                tracing::error!(error = %e, capacity, "cannot allocate depth-plane SRV descriptors");
+            })
+            .ok()?;
+        let index = heaps.len();
+        let mut entry = PlaneViewHeap { heap, used: vec![false; capacity as usize] };
+        let views = lease(&mut entry, index, 0);
+        heaps.push(entry);
+        Some(views)
+    }
+
     /// The root signature and pipeline for a twin of 16-bit steps (`steps`)
     /// or of floats and the depth format `format`.
     fn pipeline(&self, steps: bool, format: DXGI_FORMAT) -> Option<PlanePipeline> {
@@ -1695,7 +1730,7 @@ impl PlanePass {
                     error = %e,
                     steps,
                     format = format.0,
-                    "no pipeline to draw a depth plane from its twin: such planes stay as they are"
+                    "cannot create the pipeline for drawing a depth plane from its twin"
                 );
                 None
             }
@@ -1750,6 +1785,22 @@ impl PlanePass {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn depth_plane_descriptors_remain_leased_until_released() {
+    let Some(host) = host() else { return; };
+    static PASS: OnceLock<PlanePass> = OnceLock::new();
+    let pass = PASS.get_or_init(PlanePass::default);
+    let first = pass.views(&host.device, PLANE_VIEWS).unwrap();
+    let next = pass.views(&host.device, 1).unwrap();
+    assert_ne!(first.heap_index, next.heap_index);
+
+    let released = first.heap_index;
+    drop(first);
+    let reused = pass.views(&host.device, PLANE_VIEWS).unwrap();
+    assert_eq!(released, reused.heap_index);
+}
+
 /// Records into `list` the pass that draws `plane`, the twin of the depth
 /// plane of `depth`, into that plane: `depth` in the depth-write state,
 /// `plane` readable by pixel shaders. The pass sets the list's descriptor
@@ -1760,10 +1811,9 @@ fn record_plane_pass(
     list: &ID3D12GraphicsCommandList,
     depth: &ID3D12Resource,
     plane: &ID3D12Resource,
-) {
-    let (Some(host), Some(pass)) = (host(), plane_pass()) else {
-        return;
-    };
+) -> Option<PlaneViews> {
+    let host = host()?;
+    let pass = plane_pass();
     // SAFETY: live resources.
     let (of, twin) = unsafe { (depth.GetDesc(), plane.GetDesc()) };
     // An R16 typeless twin (53) holds steps, read as R16_UINT (57); an R32
@@ -1775,12 +1825,19 @@ fn record_plane_pass(
         19 => 20,
         typed => typed,
     });
-    let Some((root, pipeline)) = pass.pipeline(steps, format) else {
-        return;
+    let (root, pipeline) = pass.pipeline(steps, format)?;
+    let slices = u32::from(of.DepthOrArraySize);
+    let mips = u32::from(of.MipLevels);
+    let views = pass.views(&host.device, slices * mips)?;
+    // SAFETY: the lease keeps the heap live. Every draw below has its own SRV.
+    let (cpu_start, gpu_start, step) = unsafe {
+        let heap = &views.heap;
+        let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        (heap.GetCPUDescriptorHandleForHeapStart(), heap.GetGPUDescriptorHandleForHeapStart(), step)
     };
-    for slice in 0..u32::from(of.DepthOrArraySize) {
-        for mip in 0..u32::from(of.MipLevels) {
-            let slot = pass.next.fetch_add(1, Ordering::Relaxed) % PLANE_VIEWS;
+    for slice in 0..slices {
+        for mip in 0..mips {
+            let slot = views.first + (slice * mips + mip) as usize;
             let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT(if steps { 57 } else { 41 }),
                 ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
@@ -1810,17 +1867,16 @@ fn record_plane_pass(
             let target = host.dsv(depth, Some(&target));
             let (width, height) = ((of.Width >> mip).max(1) as u32, (of.Height >> mip).max(1));
             let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
-                ptr: pass.cpu + (slot * pass.step) as usize,
+                ptr: cpu_start.ptr + slot * step as usize,
             };
             let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
-                ptr: pass.gpu + u64::from(slot * pass.step),
+                ptr: gpu_start.ptr + slot as u64 * u64::from(step),
             };
-            // SAFETY: an open list; a slot of our heap; live resources and
-            // objects (the pass's own live as long as the process).
+            // SAFETY: an open list, a leased descriptor, and live resources.
             unsafe {
                 host.device
                     .CreateShaderResourceView(plane, Some(&view), cpu);
-                list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+                list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
                 list.SetGraphicsRootSignature(&root);
                 list.SetPipelineState(&pipeline);
                 list.SetGraphicsRootDescriptorTable(0, gpu);
@@ -1847,6 +1903,7 @@ fn record_plane_pass(
             crate::resource::PLANES[0].fetch_add(1, Ordering::Relaxed);
         }
     }
+    Some(views)
 }
 
 /// Records into `list` the copy of a depth texture into its colour twin
@@ -2575,6 +2632,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The private SRVs read by this recording's depth-plane passes.
+    depth_plane_views: Vec<PlaneViews>,
     /// The pipelines [`HostList::bind_pipeline`] kept, by address.
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -4796,6 +4855,7 @@ impl Host {
                 last_execution: Default::default(),
                 texture_boundary: AtomicBool::new(false),
                 selector_boundary: AtomicBool::new(false),
+                depth_plane_boundary: AtomicBool::new(false),
                 stream_draw: AtomicBool::new(false),
                 sample_uses: Mutex::default(),
                 allocator,
@@ -7421,6 +7481,7 @@ impl HostList {
         }
         self.texture_boundary.store(false, Ordering::Relaxed);
         self.selector_boundary.store(false, Ordering::Relaxed);
+        self.depth_plane_boundary.store(false, Ordering::Relaxed);
         self.stream_draw.store(false, Ordering::Relaxed);
         self.changed_something();
         #[cfg(feature = "diagnostics")]
@@ -7661,9 +7722,8 @@ impl HostList {
         };
         u.behind[side] = Some(false);
         match (write, colour) {
-            // Shaders write the twin when the draw or dispatch runs: what
-            // the same one reads of the depth texture is prepared before
-            // (`twins_written`).
+            // The native draw or dispatch commits the write after its own
+            // input bindings have been prepared (`issued_shader`).
             (true, true) => u.writing = true,
             (true, false) => u.behind[1] = Some(true),
             (false, _) => {}
@@ -7681,6 +7741,9 @@ impl HostList {
             crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
         }
         drop(twins);
+        if write && colour {
+            self.sample_uses.lock().unwrap_or_else(|e| e.into_inner()).pending_twin_write();
+        }
         if copy {
             self.twin_copy(&depth, &twin, colour);
         } else if colour {
@@ -7709,7 +7772,11 @@ impl HostList {
         let Some(plane) = &twin.plane else { return };
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
-        record_plane_pass(&self.list, &depth.texture, &plane.texture);
+        if let Some(views) = record_plane_pass(&self.list, &depth.texture, &plane.texture) {
+            self.deferred().depth_plane_views.push(views);
+        } else {
+            self.refused_command(0, "cannot publish the depth plane from its twin");
+        }
         self.settle(plane, UNORDERED_ACCESS);
     }
 
@@ -7733,6 +7800,9 @@ impl HostList {
         self.settle(from, COPY_SOURCE);
         self.settle(to, COPY_DEST);
         record_twin_copy(&self.list, &depth.texture, twin, colour);
+        if !colour && twin.through.is_some() {
+            self.sample_uses.lock().unwrap_or_else(|e| e.into_inner()).stencil_published(depth.serial, true);
+        }
         self.settle(&twin.colour, UNORDERED_ACCESS);
     }
 
@@ -7870,6 +7940,10 @@ impl HostList {
         self.selector_boundary.load(Ordering::Relaxed) && self.selector_boundary.swap(false, Ordering::Relaxed)
     }
 
+    pub(crate) fn take_depth_plane_boundary(&self) -> bool {
+        self.depth_plane_boundary.load(Ordering::Relaxed) && self.depth_plane_boundary.swap(false, Ordering::Relaxed)
+    }
+
     pub(crate) fn readback_only_to(&self, resource: crate::object::This) -> bool {
         let d = self.deferred();
         matches!(d.back_wanted.as_slice(), [target] if target.owner() == resource as usize)
@@ -7900,13 +7974,26 @@ impl HostList {
         }
     }
 
-    /// The draw or dispatch just prepared is recorded: the twins it writes
-    /// now hold what their depth textures lack.
+    /// Commit writes from a fixture issuing native commands directly.
+    #[cfg(test)]
     pub(crate) fn twins_written(&self) {
+        let mut uses = self.sample_uses.lock().unwrap_or_else(|e| e.into_inner());
+        self.commit_twin_writes(&mut uses);
+    }
+
+    /// The issued command's twin writes take effect before the next command.
+    fn commit_twin_writes(&self, uses: &mut sample_states::Uses) {
+        if !uses.take_twin_writes() { return; }
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         for u in twins.values_mut().filter(|u| u.writing) {
             u.writing = false;
             u.behind[0] = Some(true);
+            if u.twin.through.is_some() { uses.stencil_published(u.depth.serial, false); }
+            if u.twin.plane.is_some() {
+                // Closing the piece publishes the depth produced through
+                // unordered access before the next title command consumes it.
+                self.depth_plane_boundary.store(true, Ordering::Relaxed);
+            }
             self.changed_something();
         }
     }
@@ -8824,9 +8911,22 @@ impl HostList {
         heap.pin_titles(id, slots);
     }
 
-    pub(crate) fn begin_shader(&self) { self.sample_uses.lock().unwrap_or_else(|e| e.into_inner()).begin(); }
+    pub(crate) fn begin_shader(&self) {
+        let mut uses = self.sample_uses.lock().unwrap_or_else(|e| e.into_inner());
+        uses.begin();
+        if uses.take_twin_writes() {
+            // The preceding bind did not issue a native command.
+            for twin in self.twins.lock().unwrap_or_else(|e| e.into_inner()).values_mut() {
+                twin.writing = false;
+            }
+        }
+    }
 
-    pub(crate) fn issued_shader(&self, pipeline: usize) { self.sample_uses.lock().unwrap_or_else(|e| e.into_inner()).issued(pipeline); }
+    pub(crate) fn issued_shader(&self, pipeline: usize) {
+        let mut uses = self.sample_uses.lock().unwrap_or_else(|e| e.into_inner());
+        uses.issued(pipeline);
+        self.commit_twin_writes(&mut uses);
+    }
 
     #[cfg(test)]
     pub(crate) fn observes_sample(&self, heap: usize, kinds: u32, stage: u8) {
@@ -8963,7 +9063,7 @@ impl HostList {
 
     pub(crate) fn prepare_late_depth_sample(
         &self, copy: &std::sync::Arc<crate::resource::HostTexture>, twin: std::sync::Arc<crate::resource::Twin>,
-        sampled: &mut LateSamples, access: SampleAccess<'_>,
+        sampled: &mut LateSamples, access: SampleAccess<'_>, stencil: bool,
     ) -> bool {
         let d = self.deferred();
         let depth_used = d.non_sampled.contains(&copy.serial);
@@ -8973,16 +9073,27 @@ impl HostList {
             // The closing copy and, when present, the plane pass already
             // publish the native depth image. Every possible reader still
             // needs a recorded shader-readable state at its own command.
-            let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
-            let synchronized = twins.get(&(std::sync::Arc::as_ptr(&twin) as usize))
-                .is_some_and(|u| u.needs[1] && !u.depth_accessed && u.copied_back);
-            drop(twins);
+            let synchronized = if stencil && twin.through.is_some() {
+                let uses = self.sample_uses.lock().unwrap_or_else(|e| e.into_inner());
+                let conflict = uses.stencil_conflict(copy.serial, access.heap, access.kind, |scope|
+                    access.stages.is_none_or(|stages| stages.may_select(scope, access.logical)));
+                #[cfg(feature = "diagnostics")]
+                if let Some(command) = conflict {
+                    tracing::info!(serial=copy.serial, slot=access.logical, command, pipeline=?uses.pipeline(command),
+                        "late stencil SRV needs an earlier ordered copy");
+                }
+                conflict.is_none()
+            } else {
+                let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+                twins.get(&(std::sync::Arc::as_ptr(&twin) as usize))
+                    .is_some_and(|u| u.needs[1] && !u.depth_accessed && u.copied_back)
+            };
             if synchronized && self.sampled_state_ready(copy, Some(access)) {
                 #[cfg(feature = "diagnostics")]
                 {
-                    static FIRST: std::sync::Once = std::sync::Once::new();
-                    FIRST.call_once(|| tracing::info!(serial=copy.serial,
-                        "late indexed depth SRV uses the recorded twin copyback"));
+                    static FIRST: [std::sync::Once; 2] = [const { std::sync::Once::new() }; 2];
+                    FIRST[usize::from(stencil)].call_once(|| tracing::info!(serial=copy.serial, stencil,
+                        "late indexed depth SRV uses the recorded twin publication"));
                 }
                 return true;
             }
@@ -12010,8 +12121,15 @@ impl Host {
                     None,
                     &mut buffer,
                 )?;
-                resident(&self.device, buffer.as_ref().ok_or_else(windows::core::Error::empty)?)?;
+                let resource = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                resident(&self.device, resource)?;
                 mapped(&self.device)?;
+                #[cfg(feature = "diagnostics")]
+                if window {
+                    crate::pool::WindowAllocation::Committed.track(resource, || {
+                        self.device.GetResourceAllocationInfo(0, &[desc]).SizeInBytes
+                    });
+                }
             }
             buffer.as_ref().ok_or_else(windows::core::Error::empty)?.Map(0, None, Some(&mut data))
         })();

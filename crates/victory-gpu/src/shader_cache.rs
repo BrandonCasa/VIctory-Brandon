@@ -209,6 +209,16 @@ fn legacy_scheduler(bytes: &[u8]) -> bool {
     })
 }
 
+// Refresh the observed material shader that predated Wave32 structured
+// waterfall reflection. Its cached DXIL and native pipeline key can be reused.
+fn stale_material_reflection(shader: &HostShader, container: &[u8]) -> bool {
+    shader.stage == HwStage::Ps && shader.indexed_forms.opaque & 8 != 0
+        && shader.indexed_forms.texture_kinds[0] & (1 << 2) != 0
+        && container.len() == 29448
+        && blake3::hash(container).to_hex().as_str()
+            == "f51f10b884794568896ff9539d97225743a269e9e6194606d05f3a18ce507181"
+}
+
 pub(crate) fn warm_replacement(container: &[u8]) -> Result<Option<(WarmReplacement, HostShader)>, String> {
     let Some(cache) = CACHE.get() else { return Ok(None) };
     let _ = crate::host::host();
@@ -294,7 +304,7 @@ fn cached_by(
             }
             if !ran && made_by != source.as_bytes() {
                 STALE.fetch_add(1, Ordering::Relaxed);
-                if refresh && old.is_none() {
+                if (refresh || stale_material_reflection(&shader, container)) && old.is_none() {
                     // Translated again in its place; what came out before
                     // is what the new one is compared with.
                     tracing::debug!(path = %path.display(), "shader cache entry of an earlier translator; translating again");
