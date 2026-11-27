@@ -401,10 +401,10 @@ unsafe fn change(at: usize, size: usize, locked: bool, f: impl Fn(u64) -> u64) -
     // SAFETY (all): by the caller, and aligned.
     Some(unsafe {
         match size {
-            1 => u64::from(AtomicU8::from_ptr(at as *mut _).fetch_update(SeqCst, SeqCst, |v| Some(f(v.into()) as u8)).ok()?),
-            2 => u64::from(AtomicU16::from_ptr(at as *mut _).fetch_update(SeqCst, SeqCst, |v| Some(f(v.into()) as u16)).ok()?),
-            4 => u64::from(AtomicU32::from_ptr(at as *mut _).fetch_update(SeqCst, SeqCst, |v| Some(f(v.into()) as u32)).ok()?),
-            _ => AtomicU64::from_ptr(at as *mut _).fetch_update(SeqCst, SeqCst, |v| Some(f(v))).ok()?,
+            1 => u64::from(AtomicU8::from_ptr(at as *mut _).try_update(SeqCst, SeqCst, |v| Some(f(v.into()) as u8)).ok()?),
+            2 => u64::from(AtomicU16::from_ptr(at as *mut _).try_update(SeqCst, SeqCst, |v| Some(f(v.into()) as u16)).ok()?),
+            4 => u64::from(AtomicU32::from_ptr(at as *mut _).try_update(SeqCst, SeqCst, |v| Some(f(v.into()) as u32)).ok()?),
+            _ => AtomicU64::from_ptr(at as *mut _).try_update(SeqCst, SeqCst, |v| Some(f(v))).ok()?,
         }
     })
 }

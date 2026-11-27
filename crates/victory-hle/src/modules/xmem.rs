@@ -1974,7 +1974,7 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
     let standard = victory_gpu::console::current().title_memory().1;
     let moved = kind == TITLE_TO_SYSTEM
         && TRANSFERRED
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
                 t.checked_add(size).filter(|&t| t <= standard)
             })
             .is_ok();
