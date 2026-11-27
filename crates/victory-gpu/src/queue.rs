@@ -443,7 +443,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             for r in recordings.iter() {
                 r.wait();
             }
-            native = recordings.iter().map(|r| r.back()).collect::<Vec<_>>();
+            native = recordings.iter().map(|r| r.back()).filter(|l| !l.is_null()).collect::<Vec<_>>();
             &native[..]
         };
         if !this.is_null() {

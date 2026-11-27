@@ -1553,6 +1553,14 @@ fn indexed_form(view: &View) -> u8 {
     }
 }
 
+fn explicit_null_texture(view: &View) -> bool {
+    match view {
+        View::Shader(0, Some(d)) => matches!(d[1], 2..=10),
+        View::Unordered(0, 0, Some(d)) => matches!(d[1], 2..=5 | 8),
+        _ => false,
+    }
+}
+
 fn required_view(view: &View) -> bool {
     match view {
         View::Placed(_, r, _) if r[0] != 1 => true,
@@ -2558,6 +2566,16 @@ impl HostHeap {
                     View::Unordered(object, _, _) => (victory_shader::ResourceType::Uav, *object),
                     _ => return false,
                 };
+                let key = record_key(handle);
+                if object == 0 && explicit_null_texture(&resolved) {
+                    // A title-created typed null has a descriptor generation but no allocation or barriers.
+                    if key == 0 || self.made.get(logical) != Some(key)
+                        || !list.indexed_texture_matches((self as *const Self as usize, logical), (key, 0, None), recording)
+                    {
+                        return false;
+                    }
+                    continue;
+                }
                 let Some(copy) = crate::resource::host_copy(object as crate::object::This) else {
                     return false;
                 };
@@ -2575,7 +2593,6 @@ impl HostHeap {
                 }
                 // Native barriers and GPU alias copies belong immediately before this draw.
                 // The submit-time journal must still name that very record and host allocation.
-                let key = record_key(handle);
                 if self.made.get(logical) != Some(key) {
                     return false;
                 }
@@ -5483,6 +5500,16 @@ fn make_twinned(
     let host = host()?;
     let device = &host.device;
     match view {
+        View::Shader(0, Some(words)) if explicit_null_texture(view) => {
+            let desc = srv_desc(words);
+            unsafe { device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at) };
+            Some(None)
+        }
+        View::Unordered(0, 0, Some(words)) if explicit_null_texture(view) => {
+            let desc = uav_desc(words);
+            unsafe { device.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&desc), at) };
+            Some(None)
+        }
         &View::Constant(address, size) => {
             let shadow = constant_home(address, size)?;
             let gpu = shadow.gpu(address);

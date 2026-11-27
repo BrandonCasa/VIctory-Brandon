@@ -474,7 +474,7 @@ impl Work for Job {
         let Job::Lists(queue, kind, recordings) = self else {
             return vec![self];
         };
-        let lists: Vec<This> = recordings.iter().map(|r| r.back()).collect();
+        let lists: Vec<This> = recordings.iter().map(|r| r.back()).filter(|l| !l.is_null()).collect();
         let jobs = jobs_of(queue, kind, &lists);
         // It stood for one submission not begun.
         let runs = jobs.iter().filter(|j| j.runs()).count() as u64;

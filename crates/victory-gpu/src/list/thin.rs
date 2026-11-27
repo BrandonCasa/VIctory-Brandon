@@ -109,7 +109,7 @@ impl Front {
         }
         self.words.push(op | (args.len() as u64) << 16);
         self.words.extend_from_slice(args);
-        if !wanted() || self.words.len() >= CHUNK {
+        if (!wanted() && op != RESET) || self.words.len() >= CHUNK {
             self.hand_over();
         }
     }
@@ -171,6 +171,18 @@ impl Front {
 
     fn close(&mut self) {
         if self.closed {
+            return;
+        }
+        // A reset still in the front has never been handed to a worker or an
+        // external recorder. The title precreates hundreds of such empty lists.
+        if let [op, pipeline] = self.words.as_slice()
+            && *op == (RESET | (1 << 16))
+            && let Some(recording) = &self.recording
+        {
+            crate::pipeline::bound(*pipeline as This);
+            self.words.clear();
+            self.closed = true;
+            recording.done.store(true, Release);
             return;
         }
         self.put(CLOSE, &[]);
@@ -1031,6 +1043,17 @@ const MINE: [(usize, *const ()); 50] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_recording_completes_without_a_native_allocator() {
+        let mut f = Front::default();
+        f.begin(0, std::ptr::null());
+        f.close();
+        let r = f.recording.as_ref().unwrap();
+        assert!(r.done());
+        assert!(r.back().is_null());
+        assert!(f.words.is_empty());
+    }
 
     /// Every method of the tables that records is written down too: what is
     /// left in both tables alike records nothing.

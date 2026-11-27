@@ -123,10 +123,10 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         return turned_down();
     }
     super::PICKING.set(Some(there));
-    let staging = super::staging(resource, &copy, first);
+    let staging = super::staging(resource, &copy, first, true);
     super::PICKING.set(None);
     let Some(staging) = staging.filter(|s| {
-        !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed)
+        matches!(s.storage, super::StageStorage::Upload { .. }) && !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed)
     }) else {
         let _way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
         copy.ahead.store(LISTED, std::sync::atomic::Ordering::Release);
@@ -273,6 +273,9 @@ impl Job {
     /// `list` is an open copy list, and the job lives until it has run.
     unsafe fn record(&self, list: &ID3D12GraphicsCommandList) {
         let (s, texture) = (&self.staging, &self.copy.texture);
+        let super::StageStorage::Upload { buffer, base, .. } = &s.storage else {
+            unreachable!("ahead jobs require a mapped upload buffer")
+        };
         for (i, footprint) in s.footprints.iter().enumerate() {
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
@@ -285,10 +288,10 @@ impl Job {
             };
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: as above.
-                pResource: unsafe { std::mem::transmute_copy(&s.buffer) },
+                pResource: unsafe { std::mem::transmute_copy(buffer) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: s.base + footprint.Offset, ..*footprint },
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: base + footprint.Offset, ..*footprint },
                 },
             };
             // SAFETY: the caller's.

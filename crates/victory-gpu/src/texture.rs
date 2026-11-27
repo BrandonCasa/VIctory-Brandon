@@ -35,13 +35,9 @@ macro_rules! once {
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
-    /// A buffer of its own, or the block [`Staging::piece`] is part of.
-    buffer: ID3D12Resource,
-    /// Where in `buffer` it begins (the footprints count from there).
-    base: u64,
-    /// Back in the pool with the last list that names it.
-    _piece: Option<crate::pool::StagingPiece>,
-    data: *mut u8,
+    // Ahead jobs submit this buffer directly. Ordinary submissions retain immutable
+    // upload versions, so keep their detiled source in CPU-cacheable memory.
+    storage: StageStorage,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
@@ -89,6 +85,16 @@ pub(crate) struct Staging {
     waiting: std::sync::atomic::AtomicU64,
 }
 
+enum StageStorage {
+    Cpu(Mutex<Vec<u8>>),
+    Upload {
+        buffer: ID3D12Resource,
+        base: u64,
+        data: *mut u8,
+        _piece: Option<crate::pool::StagingPiece>,
+    },
+}
+
 #[derive(Clone, Default)]
 struct StagedPart {
     content: Option<(Digest, bool)>,
@@ -99,6 +105,7 @@ struct UploadVersion {
     staging: std::sync::Weak<Staging>,
     sent: std::sync::atomic::AtomicBool,
     buffer: ID3D12Resource,
+    _piece: Option<crate::pool::StagingPiece>,
     parts: Vec<(usize, u64)>,
 }
 
@@ -129,6 +136,7 @@ struct Last {
     previous: Vec<u8>,
     backing: Vec<(usize, usize, usize, u64, u64)>,
     mapping_epoch: Option<u64>,
+    mapping_busy: bool,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
@@ -759,7 +767,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         return;
     };
     ahead::listed(&copy);
-    let Some(staging) = staging(resource, &copy, first) else {
+    let Some(staging) = staging(resource, &copy, first, false) else {
         return;
     };
     // Each allocation and mip range has its own retained staging object.
@@ -923,6 +931,11 @@ impl PreludeUpload {
 
     pub(crate) fn covers(&self, needed: ViewRange) -> bool {
         let stages = &self.staging;
+        // The lookahead refresh may yield to the streaming thread. A required
+        // draw must capture the bytes once the pending remap has completed.
+        if stages.last.lock().unwrap_or_else(|e| e.into_inner()).mapping_busy {
+            stages.refresh_timed(true);
+        }
         let mut parts = stages.parts.lock().unwrap_or_else(|e| e.into_inner());
         let mips = stages.mips;
         let layers = stages.footprints.len() as u32 / (mips - stages.first);
@@ -997,21 +1010,35 @@ impl PreludeUpload {
             return None;
         }
         let host = crate::host::host()?;
-        let Some((buffer, data)) = host.upload_buffer(size) else {
-            crate::host::refuse_frame(format_args!("could not retain {size} texture upload bytes"));
-            return None;
+        let (piece, buffer, base, data) = match crate::pool::staging(host, size, crate::pool::StagingUse::Submission) {
+            Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
+            None => match host.upload_buffer(size) {
+                Some((buffer, data)) => (None, buffer, 0, data),
+                None => {
+                    crate::host::refuse_frame(format_args!("could not retain {size} texture upload bytes"));
+                    return None;
+                }
+            },
+        };
+        let cpu;
+        let source = match &self.staging.storage {
+            StageStorage::Cpu(bytes) => {
+                cpu = bytes.lock().unwrap_or_else(|e| e.into_inner());
+                cpu.as_ptr()
+            }
+            StageStorage::Upload { data, .. } => data.cast_const(),
         };
         let mut claimed = Vec::with_capacity(ranges.len());
         for (i, offset, src, len) in ranges {
             // The part lock excludes detiling until this occurrence has an immutable CPU snapshot.
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    self.staging.data.add(src as usize),
+                    source.add(src as usize),
                     data.add(offset as usize),
                     len as usize,
                 )
             };
-            claimed.push((i, offset));
+            claimed.push((i, base + offset));
             parts[i].dirty = false;
         }
         let first_upload = claim_upload(&self.staging.uploaded, &self.staging.dirty)?;
@@ -1020,6 +1047,7 @@ impl PreludeUpload {
             staging: Arc::downgrade(&self.staging),
             sent: Default::default(),
             buffer,
+            _piece: piece,
             parts: claimed,
         }));
         drop(parts);
@@ -1412,16 +1440,17 @@ impl Staging {
     /// Returns the bytes of title memory read.
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
-        let read = self.refresh_timed();
+        let read = self.refresh_timed(false);
         REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         read
     }
 
-    fn refresh_timed(&self) -> usize {
+    fn refresh_timed(&self, required: bool) -> usize {
         let size = self.read;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
+        last.mapping_busy = false;
         if let Some((plane, offset)) = crate::bink::plane(start, size) {
             return with_read(size, |read| {
                 let covered = (plane.len() - offset).min(size);
@@ -1443,8 +1472,9 @@ impl Staging {
         }
         // The identity comparison and the captured bytes must describe one
         // mapping. A pending remap invalidates the old ready parts for this read.
-        let _mapping = if no_wait() {
+        let _mapping = if no_wait() && !required {
             let Some(guard) = crate::watch::title_memory_reading_now() else {
+                last.mapping_busy = true;
                 last.asked = 0;
                 last.hash = None;
                 self.parts.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1539,7 +1569,7 @@ impl Staging {
         // Where the private journal cannot vouch for the bytes, capture
         // once. Comparison, detiling, and the queued copy all use that version.
         with_read(size, |read| {
-            if !committed(self.memory, size) || !crate::host::read_into(self.memory, read) {
+            if !crate::host::read_into(self.memory, read) {
                 last.asked = 0;
                 last.hash = None;
                 last.partial = Some(crate::frame::current());
@@ -1668,6 +1698,14 @@ impl Staging {
         }
         let mut parts = self.parts.lock().unwrap_or_else(|e| e.into_inner());
         parts.resize_with(self.footprints.len(), StagedPart::default);
+        let mut cpu;
+        let data = match &self.storage {
+            StageStorage::Cpu(bytes) => {
+                cpu = bytes.lock().unwrap_or_else(|e| e.into_inner());
+                cpu.as_mut_ptr()
+            }
+            StageStorage::Upload { data, .. } => *data,
+        };
         let mut conversion = self.layout.conversion();
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = self.part(i);
@@ -1721,7 +1759,7 @@ impl Staging {
                 .min(self.bytes.saturating_sub(footprint.Offset) as usize);
             // SAFETY: the subresource's part of the mapped staging buffer.
             let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+                std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len)
             };
             if mip < 32 && held & (1 << mip) == 0 {
                 // Not the title's: zeros, not what lies in that memory.
@@ -2050,7 +2088,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 }
 
 /// The staging state of a title texture, made on first use.
-fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
+fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32, ahead: bool) -> Option<Arc<Staging>> {
     let texture = &copy.texture;
     // Asked before the table is locked: the sweep lets go of a staging
     // buffer with its texture's host side locked, in that order.
@@ -2104,36 +2142,41 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
             Some(&mut total),
         );
     }
-    let (piece, buffer, base, data) = match crate::pool::staging(host, total) {
-        Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
-        None => {
-            // (`VICTORY_RESIDENCY=1`: no buffer of its own for a texture
-            // picked by index while commit is short; it stays due.)
-            let speculative = PICKING.get().is_some() && !BAKING.get();
-            if crate::residency::upload_refused()
-                || (speculative && !crate::residency::allow_staging_growth(false))
-            {
-                crate::residency::note_staging_deferred();
-                return None;
+    let speculative = PICKING.get().is_some() && !BAKING.get();
+    let storage = if ahead {
+        let (piece, buffer, base, data) = match crate::pool::staging(host, total, crate::pool::StagingUse::Detile) {
+            Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
+            None => {
+                if crate::residency::upload_refused()
+                    || (speculative && !crate::residency::allow_staging_growth(false))
+                {
+                    crate::residency::note_staging_deferred();
+                    return None;
+                }
+                let (buffer, data) = host.upload_buffer(total)?;
+                (None, buffer, 0, data)
             }
-            let (buffer, data) = host.upload_buffer(total)?;
-            crate::host::name(&buffer, || {
-                format!(
-                    "staging of {resource:?} {}x{}x{} f{}",
-                    d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-                )
-            });
-            (None, buffer, 0, data)
+        };
+        StageStorage::Upload { buffer, base, data, _piece: piece }
+    } else {
+        if speculative && !crate::residency::allow_staging_growth(false) {
+            crate::residency::note_staging_deferred();
+            return None;
         }
+        let size = usize::try_from(total).ok()?;
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(size).is_err() {
+            crate::residency::note_staging_deferred();
+            return None;
+        }
+        bytes.resize(size, 0);
+        StageStorage::Cpu(Mutex::new(bytes))
     };
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
-        buffer,
-        base,
-        _piece: piece,
-        data,
+        storage,
         footprints,
         rows,
         layout,
@@ -2287,10 +2330,10 @@ mod prelude_upload_tests {
         // Second list in the same submission skips redundant copy.
         assert_eq!(claim_upload(&uploaded, &dirty), None);
 
-        // Frame 2: texture unchanged — refresh() does not detile, prelude skips.
+        // Frame 2: the texture is unchanged, so refresh and the prelude have no work.
         assert_eq!(claim_upload(&uploaded, &dirty), None);
 
-        // Frame 3: texture changed — refresh()/detile() runs BEFORE claim_upload,
+        // Frame 3: refresh detiles the changed texture before claim_upload,
         // so upload is claimed on the exact same frame (0 frames late).
         dirty.store(true, Release);
         assert_eq!(claim_upload(&uploaded, &dirty), Some(false));

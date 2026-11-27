@@ -23,8 +23,6 @@ pub(crate) struct Pending {
     pub(super) shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
-    /// Taken by a worker from [`Queue::slow`].
-    was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     recordings: Mutex<Vec<std::sync::Weak<crate::list::thin::Recording>>>,
     /// What identifies it across runs (shader containers and state), and
@@ -54,7 +52,6 @@ impl Pending {
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
-            was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
             recordings: Mutex::default(),
             key: key.finalize().to_hex()[..32].to_owned(),
@@ -320,10 +317,7 @@ fn lost(slot: usize) {
         }
     }
     p.publish(None);
-    if p.was_slow.swap(false, Ordering::Relaxed) {
-        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        queue.slow_released();
-    }
+    release_prefetch(&p);
     {
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -437,6 +431,8 @@ const NOT_QUEUED: u8 = 0;
 const EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
 const MAKING: u8 = 3;
+const MAKING_EARLY: u8 = 4;
+const MAKING_SLOW: u8 = 5;
 
 /// How many workers may make pipelines at once that are known to take long
 /// and that no draw has asked for: a quarter of them. On a fresh cache (a
@@ -466,6 +462,7 @@ struct Queue {
     /// being made ([`slow_limit`]).
     slow: VecDeque<Arc<Pending>>,
     slow_now: usize,
+    early_now: usize,
     requested: VecDeque<Arc<Pending>>,
     sleeping: [usize; 2],
     signalled: [usize; 2],
@@ -478,6 +475,7 @@ impl Queue {
             early: VecDeque::new(),
             slow: VecDeque::new(),
             slow_now: 0,
+            early_now: 0,
             requested: VecDeque::new(),
             sleeping: [0; 2],
             signalled: [0; 2],
@@ -516,37 +514,56 @@ impl Queue {
         }
     }
 
-    fn slow_released(&mut self) {
-        self.slow_now -= 1;
-        if !self.slow.is_empty() {
-            self.wake(false);
-        }
-    }
-
-    fn pop(&mut self, screens_only: bool, slow_limit: usize) -> Option<Arc<Pending>> {
+    fn pop(&mut self, screens_only: bool, slow_limit: usize, early_limit: usize) -> Option<Arc<Pending>> {
         // An early entry can have been promoted and claimed already.
         let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
             std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         };
-        let mut p = self.screen.pop_front();
-        if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
-            if p.is_none() && self.slow_now < slow_limit {
-                p = unclaimed(&mut self.slow);
-                if let Some(p) = &p {
-                    p.was_slow.store(true, Ordering::Relaxed);
-                    self.slow_now += 1;
-                }
-            }
+        let requested = self.screen.pop_front().or_else(|| {
+            if screens_only { None } else { self.requested.pop_front() }
+        });
+        if let Some(p) = requested {
+            p.queue_state.store(MAKING, Ordering::Relaxed);
+            return Some(p);
         }
-        let p = p?;
-        p.queue_state.store(MAKING, Ordering::Relaxed);
+        if screens_only || self.early_now >= early_limit {
+            return None;
+        }
+        let (p, state) = if let Some(p) = unclaimed(&mut self.early) {
+            (p, MAKING_EARLY)
+        } else {
+            if self.slow_now >= slow_limit { return None; }
+            let p = unclaimed(&mut self.slow)?;
+            self.slow_now += 1;
+            (p, MAKING_SLOW)
+        };
+        self.early_now += 1;
+        p.queue_state.store(state, Ordering::Relaxed);
         Some(p)
     }
 }
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: [Condvar; 2] = [const { Condvar::new() }; 2];
+
+// Driver compilation also uses internal threads. Keep speculative work within a
+// fraction of the CPU budget; a draw can always promote a queued pipeline.
+fn early_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| (n.get() / 8).clamp(1, 4)))
+}
+
+fn release_prefetch(p: &Pending) {
+    let state = p.queue_state.swap(MAKING, Ordering::Relaxed);
+    if state == MAKING_EARLY || state == MAKING_SLOW {
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.early_now -= 1;
+        if state == MAKING_SLOW { queue.slow_now -= 1; }
+        if !queue.early.is_empty() || !queue.slow.is_empty() {
+            queue.wake(false);
+        }
+    }
+}
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
@@ -568,8 +585,7 @@ fn start(p: &Arc<Pending>, priority: u8) {
         let screen = priority == REQUESTED && p.screen && screens_first();
         if screen
             || !queue.requested.is_empty()
-            || !queue.early.is_empty()
-            || queue.slow_now < slow_limit()
+            || queue.early_now < early_limit() && (!queue.early.is_empty() || queue.slow_now < slow_limit())
         {
             queue.wake(screen);
         }
@@ -582,7 +598,7 @@ const SCREEN_WORKERS: usize = 2;
 fn next(screens_only: bool) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop(screens_only, slow_limit()) {
+        if let Some(p) = queue.pop(screens_only, slow_limit(), early_limit()) {
             return p;
         }
         let group = usize::from(screens_only);
@@ -657,10 +673,7 @@ fn spawn_worker(screens_only: bool) -> bool {
                     let _compile = Compile::begin(slot, &p, screens_only);
                     p.make();
                 }
-                if p.was_slow.load(Ordering::Relaxed) {
-                    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                    queue.slow_released();
-                }
+                release_prefetch(&p);
                 if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                     drained();
                 } else {
@@ -748,6 +761,20 @@ mod tests {
     }
 
     #[test]
+    fn a_draw_can_claim_a_worker_when_prefetch_is_at_capacity() {
+        let mut queue = Queue::new();
+        let first = Arc::new(Pending::new(Vec::new(), None));
+        let next = Arc::new(Pending::new(Vec::new(), None));
+        queue.push_as(&first, EARLY, false).unwrap();
+        queue.push_as(&next, EARLY, false).unwrap();
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, 1).unwrap(), &first));
+        assert!(queue.pop(false, 1, 1).is_none());
+        assert_eq!(queue.push_as(&next, REQUESTED, false), Some(false));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, 1).unwrap(), &next));
+        assert_eq!(queue.early_now, 1);
+    }
+
+    #[test]
     fn draws_promote_early_pipelines_without_claiming_them_twice() {
         let earlier = Arc::new(Pending::new(Vec::new(), None));
         let promoted = Arc::new(Pending::new(Vec::new(), None));
@@ -760,11 +787,11 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &promoted));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, 2).unwrap(), &requested));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, 2).unwrap(), &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &earlier));
-        assert!(queue.pop(false, 1).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, 2).unwrap(), &earlier));
+        assert!(queue.pop(false, 1, 2).is_none());
     }
 
     #[test]
@@ -778,16 +805,17 @@ mod tests {
         assert_eq!(queue.push_as(&quick, EARLY, false), Some(true));
         // The quick one first, then one long one at a time; one a draw asks
         // for waits for nobody.
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &quick));
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &long));
-        assert!(queue.pop(false, 1).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, 2).unwrap(), &quick));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, 2).unwrap(), &long));
+        assert!(queue.pop(false, 1, 2).is_none());
         assert_eq!(queue.push_as(&asked, REQUESTED, true), Some(false));
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &asked));
-        assert!(!asked.was_slow.load(Ordering::Relaxed));
-        assert!(queue.pop(false, 1).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, 2).unwrap(), &asked));
+        assert_eq!(asked.queue_state.load(Ordering::Relaxed), MAKING);
+        assert!(queue.pop(false, 1, 2).is_none());
         queue.slow_now -= 1;
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &longer));
-        assert!(queue.pop(false, 1).is_none());
+        queue.early_now -= 1;
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, 2).unwrap(), &longer));
+        assert!(queue.pop(false, 1, 2).is_none());
     }
 
     /// Passes over the screen go before all others, and workers of their own
@@ -803,8 +831,8 @@ mod tests {
         let mut queue = Queue::new();
         assert_eq!(queue.push(&world, REQUESTED), Some(true));
         assert_eq!(queue.push(&screen, REQUESTED), Some(true));
-        assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
-        assert!(queue.pop(true, 1).is_none());
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+        assert!(Arc::ptr_eq(&queue.pop(true, 1, 2).unwrap(), &screen));
+        assert!(queue.pop(true, 1, 2).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false, 1, 2).unwrap(), &world));
     }
 }

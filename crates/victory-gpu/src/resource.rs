@@ -1253,7 +1253,7 @@ struct Hosted {
 pub(crate) fn held_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_HELD_LEVELS").is_some_and(|v| v == "1") && !crate::tiles::wanted()
+        std::env::var_os("VICTORY_HELD_LEVELS").is_none_or(|v| v != "0") && !crate::tiles::wanted()
     })
 }
 
@@ -1743,6 +1743,13 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             HELD[3].fetch_add(footprint(&r.desc).map_or(0, |f| f.size), Relaxed);
         }
         host.filled = fills(&r.desc);
+        #[cfg(feature = "diagnostics")]
+        if !host.filled && std::env::var_os("VICTORY_TARGET_STACK").is_some() {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if matches!(N.fetch_add(1, Relaxed), 150 | 400 | 850) {
+                tracing::info!(stack = %std::backtrace::Backtrace::force_capture(), "native target creation stack");
+            }
+        }
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
             KINDS[1].fetch_add(host.bytes, Relaxed);

@@ -402,17 +402,27 @@ pub(crate) fn memory() -> [u64; 2] {
 }
 
 /// Part of a block of mapped upload memory, back in the pool when dropped.
-pub(crate) struct StagingPiece(Piece);
+pub(crate) struct StagingPiece(Piece, StagingUse);
+
+#[derive(Clone, Copy)]
+pub(crate) enum StagingUse {
+    Detile,
+    // Fully overwritten by the CPU, owned through the submission fence.
+    Submission,
+}
 
 impl Drop for StagingPiece {
     fn drop(&mut self) {
-        lock(&STAGING).give(self.0, now());
+        let mut pool = lock(&STAGING);
+        match self.1 {
+            StagingUse::Detile => pool.give(self.0, now()),
+            StagingUse::Submission => pool.resting.push_front((0, self.0)),
+        }
     }
 }
 
-/// `bytes` of upload memory, all zeros: the buffer it lies in, where in
-/// that buffer, and its mapping. `None`: not pooled.
-pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPiece, ID3D12Resource, u64, *mut u8)> {
+/// Upload space, its buffer offset, and its mapping. Detile space starts zeroed.
+pub(crate) fn staging(host: &crate::host::Host, bytes: u64, usage: StagingUse) -> Option<(StagingPiece, ID3D12Resource, u64, *mut u8)> {
     if !on() {
         return None;
     }
@@ -429,10 +439,10 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
     })?;
-    let owned = StagingPiece(piece);
+    let owned = StagingPiece(piece, usage);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
-    if again {
+    if again && matches!(usage, StagingUse::Detile) {
         // What is not detiled into it (an unmapped texture) uploads zeros,
         // as from a buffer of its own.
         // SAFETY: the piece is ours alone.

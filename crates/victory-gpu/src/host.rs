@@ -6167,7 +6167,8 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+        let compare = card.as_ref().and_then(|plan| plan.check.as_ref());
+        if let Some(check) = compare.cloned() {
             #[cfg(feature = "diagnostics")]
             marks.push((lists.len(), crate::copystat::Timed::Compare));
             lists.push(Some(check));
@@ -6190,6 +6191,18 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
+        // Buffers decay to COMMON between ExecuteCommandLists calls. The compare reads
+        // buffers a guest list may have left in COPY_DEST or UAV state.
+        let execute = |group: &[Option<ID3D12CommandList>]| {
+            let split = compare.and_then(|check| group.iter().position(|list| list.as_ref() == Some(check)))
+                .unwrap_or(group.len());
+            for lists in [&group[..split], &group[split..]] {
+                if !lists.is_empty() {
+                    // SAFETY: all lists in this submission are closed and retained through its fence.
+                    unsafe { self.queue.ExecuteCommandLists(lists) };
+                }
+            }
+        };
         let pin_heaps = |pins: &mut Vec<std::sync::RwLockWriteGuard<'_, u64>>, value: u64| {
             for run in runs { run.last_execution.store(value, Ordering::Release); }
             for last in pins { **last = value; }
@@ -6208,7 +6221,7 @@ impl Host {
                 pin_heaps(&mut pins, *submitted);
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
+                    execute(&lists[from..to]);
                     from = to;
                 }
                 for upload in &preludes.uploads {
@@ -6285,7 +6298,7 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 pin_heaps(&mut pins, *submitted);
-                self.queue.ExecuteCommandLists(group);
+                execute(group);
                 if _i + 1 == groups.len() {
                     for upload in &preludes.uploads {
                         upload.sent();
