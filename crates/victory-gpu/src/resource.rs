@@ -1340,7 +1340,6 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
 #[cfg(windows)]
 fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     const TEXTURE_2D: u32 = 3;
-    let first = first.max(over_cap(desc));
     if first == 0
         || !fills(desc)
         || desc.dimension != TEXTURE_2D
@@ -1493,8 +1492,11 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
 /// title places in that memory in another format shows ([`alias_of`]). A
 /// texture leaves the table before it is freed.
 #[cfg(windows)]
-static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
+static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, (usize, u64)>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+#[cfg(windows)]
+static LARGEST_TARGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
@@ -1537,7 +1539,7 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
             && (whole || (d.mip_levels == 1 && d.depth_or_array_size == 1))
             && d.sample_count <= 1
     };
-    if !r.host.placed.load(Relaxed) || !fills(&r.desc) || !one(&r.desc) {
+    if !r.host.placed.load(Relaxed) || !one(&r.desc) {
         return None;
     }
     // Under the table's lock: a texture leaves it before it is freed.
@@ -1548,43 +1550,35 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         crate::inplace::aliases(va as usize, bytes)
             .into_iter()
             .find_map(|alias| targets.get(&(alias as u64)).copied())
-    })? as This;
-    let o = resource(other);
-    const DEPTH: u32 = 0x2;
-    let same = one(&o.desc)
-        && o.desc.dimension == r.desc.dimension
-        && o.desc.width == r.desc.width
-        && o.desc.height == r.desc.height
-        && o.desc.mip_levels == r.desc.mip_levels
-        && o.desc.depth_or_array_size == r.desc.depth_or_array_size
-        && o.desc.flags & DEPTH == 0
-        && target_format(o.desc.format) == o.desc.format
-        && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
-    if !same && r.desc.sample_count <= 1 {
-        // What shaders wrote there is on the card in the other texture; this
-        // one is filled from title memory, which they never reached. Each
-        // kind of pair is said once.
-        static SAID: std::sync::Mutex<std::collections::BTreeSet<[u32; 6]>> =
-            std::sync::Mutex::new(std::collections::BTreeSet::new());
-        let pair = [
-            r.desc.width as u32,
-            r.desc.height,
-            r.desc.format,
-            o.desc.width as u32,
-            o.desc.height,
-            o.desc.format,
-        ];
-        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-        if said.len() < 64 && said.insert(pair) {
-            tracing::warn!(
-                view = ?this,
-                texture = ?other,
-                "a placed texture lies where a texture the host writes does, and is not like it (width, height, format of each): {pair:?}, levels {} and {}, layers {} and {}",
-                r.desc.mip_levels, o.desc.mip_levels, r.desc.depth_or_array_size, o.desc.depth_or_array_size
-            );
+    })?.0 as This;
+    (other != this).then_some(other)
+}
+
+/// A producer mapped over only part of a placed view still owns those
+/// bytes. Reading a CPU snapshot cannot supply that producer's last stores.
+#[cfg(windows)]
+pub(crate) fn placed_span(this: This) -> Option<(usize, usize, usize)> {
+    let r = resource(this);
+    if !r.host.placed.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+    let len = usize::try_from(footprint(&r.desc)?.size).ok()?;
+    Some((this as usize, r.data() as usize, len))
+}
+
+#[cfg(windows)]
+pub(crate) fn gpu_target_overlaps((reader, at, len): (usize, usize, usize)) -> Vec<(usize, usize, usize)> {
+    let ranges = crate::inplace::aliases_of_bytes(at, len);
+    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut overlap = Vec::new();
+    for (lo, hi) in ranges {
+        let first = (lo as u64).saturating_sub(LARGEST_TARGET.load(std::sync::atomic::Ordering::Relaxed));
+        for (&base, &(owner, bytes)) in targets.range(first..hi as u64) {
+            let end = base.saturating_add(bytes) as usize;
+            if owner != reader && end > lo {
+                overlap.push((owner, lo.max(base as usize), hi.min(end)));
+            }
         }
     }
-    same.then_some(other)
+    overlap
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -1609,7 +1603,7 @@ fn fills(desc: &ResourceDesc) -> bool {
 /// Whether the title fills texture `this` itself ([`fills`]).
 #[cfg(windows)]
 pub(crate) fn title_fills(this: This) -> bool {
-    !this.is_null() && fills(&resource(this).desc)
+    !this.is_null() && (fills(&resource(this).desc) || resource(this).host.placed.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Whether `this` is a texture whose host copy is not made yet (and may
@@ -1671,7 +1665,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
-            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
+            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true, true) } else { None };
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
@@ -1713,7 +1707,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 {
                     d.flags |= 4;
                 }
-                host_texture(&d, r.host.state, clear)
+                host_texture_as(&d, r.host.state, clear, false, r.host.placed.load(Relaxed))
             }
         };
         let Some(texture) = texture else {
@@ -2557,22 +2551,12 @@ fn supports_placed_uav(format: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn host_texture(
-    desc: &ResourceDesc,
-    state: u32,
-    clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    host_texture_as(desc, state, clear, false)
-}
-
-/// [`host_texture`]; `reserved`: without memory of its own, to be given
-/// tiles level by level (`crate::tiles`).
-#[cfg(windows)]
 fn host_texture_as(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
     reserved: bool,
+    placed_views: bool,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
@@ -2610,6 +2594,11 @@ fn host_texture_as(
     // The host has no sRGB unordered access: such textures are typeless,
     // their unordered access views plain UNORM.
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
+        d.format = family(d.format);
+    }
+    // A descriptor-created placement can expose multiple typed views of its
+    // bytes. Retain the family so each view keeps its requested conversion.
+    if placed_views {
         d.format = family(d.format);
     }
     // The clear value names the format too: format, then color or depth
@@ -2822,13 +2811,14 @@ fn hand_out_resource(
     heap: HeapProperties,
     heap_flags: u32,
     backing: Backing,
+    descriptor_only: bool,
     state: u32,
     clear: *const c_void,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     #[cfg(not(windows))]
-    let _ = (state, clear);
+    let _ = (state, clear, descriptor_only);
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -2845,7 +2835,7 @@ fn hand_out_resource(
             used: std::sync::atomic::AtomicU64::new(0),
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
-            placed: std::sync::atomic::AtomicBool::new(false),
+            placed: std::sync::atomic::AtomicBool::new(descriptor_only),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
             grown: std::sync::atomic::AtomicBool::new(false),
         },
@@ -2855,12 +2845,16 @@ fn hand_out_resource(
     if desc.dimension != BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         textures().insert(at);
-        crate::texback::replaced(resource.data() as usize);
-        if !fills(&desc) {
+        if !descriptor_only {
+            crate::texback::replaced(resource.data() as usize);
+        }
+        if !fills(&desc) && !descriptor_only {
+            let size = footprint(&desc).map_or(0, |f| f.size);
+            LARGEST_TARGET.fetch_max(size, std::sync::atomic::Ordering::Relaxed);
             TARGETS_AT
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(resource.data() as u64, at);
+                .insert(resource.data() as u64, (at, size));
         }
         if !lazy() {
             let _ = hosted(at as This, true);
@@ -2887,7 +2881,7 @@ impl Drop for Resource {
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
-                if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
+                if targets.get(&at).is_some_and(|&(owner, _)| owner == address) {
                     targets.remove(&at);
                 }
             }
@@ -2967,6 +2961,7 @@ pub(crate) extern "system" fn create_committed(
         heap,
         heap_flags,
         Backing::Committed(memory),
+        false,
         state,
         clear,
         iid,
@@ -3066,6 +3061,10 @@ pub(crate) extern "system" fn create_at_address(
         layout,
         "resource at an address"
     );
+    resource_at_address(address, desc, clear, iid, out, false)
+}
+
+fn resource_at_address(address: u64, desc: ResourceDesc, clear: *const c_void, iid: *const Iid, out: *mut This, descriptor_only: bool) -> HRESULT {
     const COMMON: u32 = 0;
     const DEFAULT: HeapProperties = HeapProperties {
         kind: 1,
@@ -3079,6 +3078,7 @@ pub(crate) extern "system" fn create_at_address(
         DEFAULT,
         0,
         Backing::Address(address as *mut u8),
+        descriptor_only,
         COMMON,
         clear,
         iid,
@@ -3242,24 +3242,15 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     let mut out = std::ptr::null();
-    let made = create_at_address(
-        std::ptr::null(),
-        address,
-        &d,
-        0,
-        std::ptr::null(),
-        &RESOURCE_IIDS[0],
-        &mut out,
-    );
+    if address == 0 {
+        return None;
+    }
+    let made = resource_at_address(address, d, std::ptr::null(), &RESOURCE_IIDS[0], &mut out, true);
     if made != S_OK {
         return None;
     }
     map.insert((address, *desc), out as usize);
     crate::texture::placed_in_host_written(address, desc);
-    resource(out)
-        .host
-        .placed
-        .store(true, std::sync::atomic::Ordering::Relaxed);
     Some(out)
 }
 
@@ -3304,6 +3295,7 @@ pub(crate) extern "system" fn create_placed(
         h.desc.properties,
         h.desc.flags,
         backing,
+        false,
         state,
         clear,
         iid,

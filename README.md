@@ -76,8 +76,8 @@ describe which lighting paths run and the remaining rendering issues.
 What is known to be wrong:
 
 - Trees, signs and far objects flicker in the distance in some places.
-- Lighting is too bright or too dark after walking indoors, until the title has
-  run for a while; rooms with little direct light are too dark without `-RayTracing`.
+- Earlier builds showed lighting changes after walking indoors. The title's
+  ray-traced lighting is now the default and awaits playback verification.
 - Textures of what just came into view appear late while the title streams.
 - The first run of a new build stutters while the driver makes pipelines
   (`victory warm` makes them ahead).
@@ -103,7 +103,7 @@ built with that feature, request DRED with
 `-Build release -More @{VICTORY_D3D12_DRED='light'}`.
 
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+something is wrong. `-RayTracing` explicitly selects the default title lighting.
 
 For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
 `VICTORY_FIDELITYFX_DIR` to the folder containing AMD's signed

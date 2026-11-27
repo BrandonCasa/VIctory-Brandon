@@ -94,7 +94,7 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_BUILDER=1` | the builder's stages run |
 | `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
 | `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
-| `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
+| `VICTORY_BVH_BOUNDS=1` | reproduce the historical 64 MiB builder clamp |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |

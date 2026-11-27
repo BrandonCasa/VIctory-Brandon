@@ -87,7 +87,7 @@ impl Task {
 }
 
 #[derive(Clone, Copy)]
-enum Call {
+enum QueueCallback {
     Guest(Task),
     Terminated(usize, TerminatedCallback),
 }
@@ -95,7 +95,7 @@ enum Call {
 struct Ticket {
     owner: Arc<Queue>,
     port: u32,
-    call: Call,
+    call: QueueCallback,
 }
 
 impl Ticket {
@@ -106,8 +106,8 @@ impl Ticket {
 
     fn finish(self, canceled: bool) {
         match self.call {
-            Call::Guest(task) => task.run(canceled),
-            Call::Terminated(context, callback) => callback(context as *mut c_void),
+            QueueCallback::Guest(task) => task.run(canceled),
+            QueueCallback::Terminated(context, callback) => callback(context as *mut c_void),
         }
         let mut state = lock(&self.owner.state);
         state.outstanding[self.port as usize] -= 1;
@@ -311,7 +311,7 @@ impl Queue {
             lock(&TIMER.due).insert((at, id), self.clone());
             TIMER.changed.notify_one();
         } else {
-            let immediate = self.publish(port, Call::Guest(task));
+            let immediate = self.publish(port, QueueCallback::Guest(task));
             let canceled = state.closed[0];
             drop(state);
             if let Some(task) = immediate {
@@ -322,7 +322,7 @@ impl Queue {
         S_OK
     }
 
-    fn publish(self: &Arc<Self>, port: u32, call: Call) -> Option<Ticket> {
+    fn publish(self: &Arc<Self>, port: u32, call: QueueCallback) -> Option<Ticket> {
         self.ports[port as usize].publish(Ticket {
             owner: self.clone(),
             port,
@@ -335,7 +335,7 @@ impl Queue {
         let Some((_, port, task)) = state.delayed.remove(&id) else {
             return;
         };
-        let immediate = self.publish(port, Call::Guest(task));
+        let immediate = self.publish(port, QueueCallback::Guest(task));
         let owner = self.clone();
         // Manual and serialized publication has already occurred in deadline
         // order. A blocking immediate callback or monitor cannot hold the timer.
@@ -358,7 +358,7 @@ impl Queue {
         let mut immediate = Vec::new();
         for (id, (at, _, task)) in &delayed {
             lock(&TIMER.due).remove(&(*at, *id));
-            if let Some(task) = self.publish(port, Call::Guest(*task)) {
+            if let Some(task) = self.publish(port, QueueCallback::Guest(*task)) {
                 immediate.push(task);
             }
         }
@@ -391,7 +391,7 @@ impl Queue {
         if let Some(callback) = callback {
             let mut state = lock(&self.state);
             state.outstanding[1] += 1;
-            let immediate = self.publish(COMPLETION, Call::Terminated(context, callback));
+            let immediate = self.publish(COMPLETION, QueueCallback::Terminated(context, callback));
             drop(state);
             if let Some(task) = immediate {
                 task.finish(false);

@@ -1078,7 +1078,7 @@ fn create() -> windows::core::Result<Host> {
             .is_ok()
         {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
-            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+            victory_shader::emit::set_host_wave_range(o1.WaveLaneCountMin, o1.WaveLaneCountMax);
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
@@ -2458,7 +2458,13 @@ enum Step {
 #[derive(Default)]
 struct Deferred {
     descriptor_heaps: Vec<std::sync::Arc<crate::descriptor::host::HostHeap>>,
-    indexed_heaps: Vec<(usize, std::sync::Arc<crate::descriptor::host::HostHeap>, u8)>,
+    title_leases: Vec<(std::sync::Arc<crate::descriptor::host::HostHeap>, u64)>,
+    indexed_heaps: Vec<(usize, std::sync::Arc<crate::descriptor::host::HostHeap>, crate::descriptor::host::IndexedSlots)>,
+    buffer_aliases: Vec<(std::sync::Arc<crate::descriptor::host::HostHeap>, crate::descriptor::host::BufferAliases)>,
+    landed_aliases: std::collections::HashSet<(usize, usize, usize)>,
+    descriptor_writes: bool,
+    gpu_texture_writers: std::collections::HashSet<usize>,
+    indexed_textures: std::collections::HashMap<(usize, u32), (u64, u64, Option<u64>)>,
     indexed_reads: std::collections::HashSet<(u64, u64, u64)>,
     refused: bool,
     /// Destination, source, bytes.
@@ -2542,6 +2548,9 @@ impl Deferred {
 
 impl Drop for Deferred {
     fn drop(&mut self) {
+        for (heap, id) in &self.title_leases {
+            heap.unpin_titles(*id);
+        }
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
@@ -2895,7 +2904,7 @@ enum Late {
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
     Write(usize, crate::queue::Written, usize),
     /// A fence (its address) signalled behind the flights before it.
-    Signal(usize, u64),
+    Signal(crate::fence::Point),
 }
 
 struct Line {
@@ -3418,15 +3427,6 @@ pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&H
     blocked_by(&joined, next, false).is_none()
 }
 
-/// Whether a bottom-of-pipe write of `list` meets `wait`.
-pub(crate) fn will_meet(list: &HostList, wait: &crate::list::ValueWait) -> bool {
-    let (address, bytes) = wait.place();
-    // The last write there says.
-    let deferred = list.deferred();
-    let last = deferred.writes.iter().rev().find(|(at, _, n)| *at < address + bytes && address < *at + *n);
-    matches!(last, Some((at, crate::queue::Written::Value(v), n)) if *at == address && *n >= bytes && wait.holds_for(*v))
-}
-
 /// Lists and the order they run in.
 type Run<T> = (Vec<T>, Vec<usize>);
 
@@ -3460,7 +3460,7 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     if line.line.is_empty() && !line.settling {
         return false;
     }
-    line.line.push_back(Late::Signal(fence, value));
+    line.line.push_back(Late::Signal(crate::fence::Point::new(fence as crate::object::This, value)));
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
     drop(line);
     // A signal alone (behind a settle under way) has no flight to wake
@@ -3470,54 +3470,24 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     true
 }
 
-/// A queue stands at `wait`, which memory does not meet now ([`late`]):
-/// whether it is met once the flights in the air have run. A flight's
-/// bottom-of-pipe write of a value that meets it says yes without a wait
-/// for the card: the part behind the wait goes to the card behind that
-/// flight, which is the order the wait asks for. If the flights may write
-/// the value in a way not known here (shaders, a timestamp, another
-/// width), they are settled and memory is asked again.
+/// A memory wait observes published writes. A matching value from an older
+/// flight cannot release a consumer while a newer write to the same bytes is
+/// still in flight. The landing thread wakes the queue after retirement.
 pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
-    if let Some(met) = late_met_known(wait) {
-        return met;
-    }
-    settle_now(WHY_VALUE);
-    wait.met()
-}
-
-/// [`late_met`] without a wait for the card; `None`: it has to be waited for.
-pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> Option<bool> {
     let (address, bytes) = wait.place();
-    {
-        let line = line();
-        if line.line.is_empty() && line.in_hand.is_empty() {
-            return Some(false);
-        }
-        let mut unsure = touches(&line.written, address, address + bytes);
-        // (With the relay: first the writes of flights being landed.)
-        let writes = line.in_hand.iter().map(|(at, what, n)| (at, what, n)).chain(line.line.iter().filter_map(|item| match item {
-            Late::Write(at, what, n) => Some((at, what, n)),
-            _ => None,
-        }));
-        for (at, what, n) in writes {
-            if *at >= address + bytes || address >= *at + *n {
-                continue;
-            }
-            match what {
-                crate::queue::Written::Value(v) if *at == address && *n >= bytes => {
-                    if wait.holds_for(*v) {
-                        LATE_STATS[13].fetch_add(1, Ordering::Relaxed);
-                        return Some(true);
-                    }
-                }
-                _ => unsure = true,
-            }
-        }
-        if !unsure {
-            return Some(false);
-        }
+    let Some(end) = address.checked_add(bytes) else { return false };
+    let line = line();
+    if line.settling && !relay() || touches(&line.written, address, end) {
+        return false;
     }
-    None
+    let overlaps = |at: usize, len: usize| at < end && address < at.saturating_add(len);
+    if line.in_hand.iter().any(|&(at, _, len)| overlaps(at, len))
+        || line.line.iter().any(|item| matches!(item, Late::Write(at, _, len) if overlaps(*at, *len)))
+    {
+        return false;
+    }
+    drop(line);
+    wait.met()
 }
 
 /// Settles the flights in the air, if any ([`Host::settle`]), for reason
@@ -3588,7 +3558,7 @@ fn late_helper() {
             let mut helping = crate::timeline::span("helper: landed lists reset and given back");
             land();
             helping.next("helper: looking at what queues hold");
-            crate::queue::release_held(false);
+            crate::queue::release_held();
             continue;
         };
         // The card first, without the submission lock: the submitting
@@ -3611,7 +3581,7 @@ fn late_helper() {
             host.settle(&mut submitted, WHY_CARD_DONE);
         }
         land();
-        crate::queue::release_held(false);
+        crate::queue::release_held();
     }
 }
 
@@ -5316,8 +5286,8 @@ impl Host {
                     what.write(at as *mut u8, bytes);
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
-                Late::Signal(fence, value) => {
-                    crate::fence::set(fence as crate::object::This, value);
+                Late::Signal(point) => {
+                    point.publish();
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
             };
@@ -5804,7 +5774,7 @@ impl Host {
                         landed.push((flight.lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                    Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                    Late::Signal(point) => point.publish(),
                 }
             }
             if last > 0 {
@@ -5923,21 +5893,8 @@ impl Host {
             0 => crate::descriptor::begin_sync_heaps(),
             mark => crate::descriptor::begin_sync_heaps_after(mark),
         };
-        if indexed {
-            // An opaque reader can name a record materialized by an earlier
-            // landing. Publish that landing before observing title memory.
-            if flying() {
-                self.settle(&mut submitted, WHY_READ);
-            }
-            let began = std::time::Instant::now();
-            drop(begin_heaps());
-            crate::port_journal::heaps_waited(began.elapsed().as_nanos() as u64, heaps_on);
-            if runs.iter().any(|l| !l.prepare_indexed_views()) {
-                refuse_frame(format_args!(
-                    "an execution-visible indexed descriptor is unavailable or needs an ordered GPU copy absent from this recording"
-                ));
-                return None;
-            }
+        if indexed && flying() {
+            self.settle(&mut submitted, WHY_READ);
         }
         let was_working = working(true);
         submitting(1, runs.len());
@@ -5975,7 +5932,7 @@ impl Host {
         // command lists that index those slots are submitted.
         // Renderer port #7 (from renderer patch #4): the round asked for when
         // the title submitted it, if that is known (`crate::port_journal`).
-        let heaps_synced = (!indexed).then(begin_heaps);
+        let heaps_synced = begin_heaps();
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {
@@ -6010,6 +5967,50 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
+        // Materialize earlier guest descriptor writes, then pin the complete
+        // observation before preparing copies, texture states, or BVH addresses.
+        let began = std::time::Instant::now();
+        drop(heaps_synced);
+        crate::port_journal::heaps_waited(began.elapsed().as_nanos() as u64, heaps_on);
+        crate::descriptor::make_waiting();
+        let mut heaps = Vec::new();
+        for run in runs {
+            let deferred = run.deferred();
+            heaps.extend(deferred.indexed_heaps.iter().map(|(_, heap, _)| heap.clone()));
+            heaps.extend(deferred.buffer_aliases.iter().map(|(heap, _)| heap.clone()));
+            if victory_shader::emit::mapped_views() {
+                heaps.extend(deferred.descriptor_heaps.iter().cloned());
+            }
+        }
+        heaps.sort_unstable_by_key(|h| std::sync::Arc::as_ptr(h) as usize);
+        heaps.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
+        let mut attempts = 0;
+        let mut pins = loop {
+            let mut versions = Vec::new();
+            if let Err(reason) = runs.iter().try_for_each(|list| list.prepare_indexed_views(&mut versions)) {
+                refuse_frame(format_args!("{reason}"));
+                crate::memory::abort_builds();
+                working(was_working);
+                submitting(0, 0);
+                return None;
+            }
+            let pins: Vec<_> = heaps.iter()
+                .map(|heap| heap.last_reader.write().unwrap_or_else(|e| e.into_inner())).collect();
+            if versions.iter().all(|(heap, version)| heap.publication_version() == *version) {
+                break pins;
+            }
+            // A later list can materialize a slot in the same heap and advance
+            // an earlier list's version. Recheck the full batch before refusing.
+            drop(pins);
+            attempts += 1;
+            if attempts >= 2 {
+                refuse_frame(format_args!("indexed heap publication changed during submission preparation"));
+                crate::memory::abort_builds();
+                working(was_working);
+                submitting(0, 0);
+                return None;
+            }
+        };
         stage.next("submit: gathering what to ask about");
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
@@ -6173,17 +6174,6 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         split.part(4);
-        stage.next("submit: waiting for the heaps' records");
-        let heaps_began = std::time::Instant::now();
-        if let Some(pending) = heaps_synced {
-            drop(pending);
-            crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
-        }
-        // The slots that waited for a texture's host copy, before the
-        // lists that may read them run.
-        crate::descriptor::make_waiting();
-        #[cfg(feature = "diagnostics")]
-        split.part(15);
         let prepared = std::time::Instant::now();
         stage.next("submit: sending");
         // When it runs on the card, for the timeline.
@@ -6200,26 +6190,9 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
-        let mut heaps = Vec::new();
-        if victory_shader::emit::mapped_views() {
-            for run in runs {
-                heaps.extend(run.deferred().descriptor_heaps.iter().cloned());
-            }
-            heaps.sort_unstable_by_key(|h| std::sync::Arc::as_ptr(h) as usize);
-            heaps.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
-        }
-        let pin_heaps = |value: u64| {
-            for run in runs {
-                run.last_execution.store(value, Ordering::Release);
-            }
-            heaps
-                .iter()
-                .map(|heap| {
-                    let mut last = heap.last_reader.write().unwrap_or_else(|e| e.into_inner());
-                    *last = value;
-                    last
-                })
-                .collect::<Vec<_>>()
+        let pin_heaps = |pins: &mut Vec<std::sync::RwLockWriteGuard<'_, u64>>, value: u64| {
+            for run in runs { run.last_execution.store(value, Ordering::Release); }
+            for last in pins { **last = value; }
         };
         if late {
             *submitted += 1;
@@ -6232,7 +6205,7 @@ impl Host {
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
-                let _pins = pin_heaps(*submitted);
+                pin_heaps(&mut pins, *submitted);
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
                     self.queue.ExecuteCommandLists(&lists[from..to]);
@@ -6243,6 +6216,7 @@ impl Host {
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            drop(pins);
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
@@ -6310,7 +6284,7 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                let pins = pin_heaps(*submitted);
+                pin_heaps(&mut pins, *submitted);
                 self.queue.ExecuteCommandLists(group);
                 if _i + 1 == groups.len() {
                     for upload in &preludes.uploads {
@@ -6326,7 +6300,6 @@ impl Host {
                             *submitted
                         ))
                     });
-                drop(pins);
                 #[cfg(feature = "diagnostics")]
                 crate::timeline::sent(sending, *submitted, stamp);
                 self.fence
@@ -6382,6 +6355,7 @@ impl Host {
             }
             let _ = (_i, started);
         }
+        drop(pins);
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
@@ -6456,6 +6430,7 @@ impl Host {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
+            if list.deferred().descriptor_writes { crate::port_journal::prep_wrote(); }
         }
         self.log_messages();
         submitting(0, 0);
@@ -6957,6 +6932,10 @@ impl HostList {
         resource: crate::object::This,
         wanted: u32,
     ) -> Option<(&'static ID3D12Resource, u32)> {
+        // Render, UAV, depth write, copy destination or resolve destination.
+        if wanted & (0x4 | 0x8 | 0x10 | 0x400 | 0x1000) != 0 {
+            self.deferred().gpu_texture_writers.insert(resource as usize);
+        }
         let copy = crate::resource::host_copy(resource)?;
         // SAFETY: as in `crate::resource::host_resource`; the list's states
         // hold the copy from here on.
@@ -7037,6 +7016,7 @@ impl HostList {
         let Some(depth) = crate::resource::host_copy(resource) else {
             return false;
         };
+        if write { self.deferred().gpu_texture_writers.insert(resource as usize); }
         let side = usize::from(colour);
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let u = twins
@@ -7170,20 +7150,32 @@ impl HostList {
     /// A draw or dispatch being prepared writes title texture `resource`
     /// through unordered access: if it is of a kind copied back
     /// ([`crate::texback`]), the list copies it when it closes.
-    pub(crate) fn texture_written(&self, resource: crate::object::This) {
-        if !crate::texback::wanted(resource) {
+    pub(crate) fn texture_written(&self, resource: crate::object::This, view: Option<&crate::descriptor::View>, placed: bool) {
+        let ordered = placed || crate::resource::title_fills(resource);
+        if !ordered && !crate::texback::wanted(resource) {
             return;
         }
+        let range = view.and_then(crate::texture::ViewRange::for_view);
         let mut deferred = self.deferred();
-        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
-            && let Some(target) = crate::texback::Target::new(resource)
-        {
-            if crate::resource::title_fills(resource) {
-                self.texture_boundary.store(true, Ordering::Relaxed);
-                deferred.landing = true;
-            }
+        if let Some(target) = deferred.back_wanted.iter_mut().find(|target| target.owner() == resource as usize) {
+            target.include(range);
+        } else if let Some(target) = crate::texback::Target::new(resource, range) {
             deferred.back_wanted.push(target);
+        } else if ordered {
+            drop(deferred);
+            self.refused_command(0, "placed texture writer has no byte-exact guest readback layout");
+            return;
         }
+        if ordered {
+            self.texture_boundary.store(true, Ordering::Relaxed);
+            deferred.landing = true;
+        }
+    }
+
+    pub(crate) fn descriptor_write_boundary(&self) {
+        let mut d = self.deferred();
+        d.descriptor_writes = true;
+        d.landing = true;
     }
 
     pub(crate) fn take_texture_boundary(&self) -> bool {
@@ -7990,39 +7982,97 @@ impl HostList {
         self.deferred().indexed_reads.contains(&(id, address, len))
     }
 
-    pub(crate) fn observe_view_heap(&self, title: &crate::descriptor::Heap, forms: u8) {
-        if forms == 0 {
+    pub(crate) fn indexed_texture_matches(&self, slot: (usize, u32), version: (u64, u64, Option<u64>), recording: bool) -> bool {
+        let mut d = self.deferred();
+        if recording {
+            *d.indexed_textures.entry(slot).or_insert(version) == version
+        } else {
+            d.indexed_textures.get(&slot) == Some(&version)
+        }
+    }
+
+    pub(crate) fn pin_title_slots(&self, heap: &std::sync::Arc<crate::descriptor::host::HostHeap>, slots: &crate::descriptor::host::IndexedSlots) {
+        if !heap.sparse() { return; }
+        let mut d = self.deferred();
+        let id = if let Some((_, id)) = d.title_leases.iter().find(|(h, _)| std::sync::Arc::ptr_eq(h, heap)) {
+            *id
+        } else {
+            let id = next_epoch();
+            d.title_leases.push((heap.clone(), id));
+            id
+        };
+        heap.pin_titles(id, slots);
+    }
+
+    pub(crate) fn observe_view_heap(&self, title: &crate::descriptor::Heap, slots: &crate::descriptor::host::IndexedSlots) {
+        if slots.empty() {
             return;
         }
         let Some(heap) = title.host_owner() else {
             return;
         };
+        self.pin_title_slots(heap, slots);
         let mut d = self.deferred();
         if let Some((_, _, used)) = d
             .indexed_heaps
             .iter_mut()
             .find(|(_, h, _)| std::sync::Arc::ptr_eq(h, heap))
         {
-            *used |= forms;
+            used.merge(slots);
         } else {
             d.indexed_heaps
-                .push((std::ptr::from_ref(title) as usize, heap.clone(), forms));
+                .push((std::ptr::from_ref(title) as usize, heap.clone(), slots.clone()));
         }
     }
 
-    fn prepare_indexed_views(&self) -> bool {
+    pub(crate) fn check_buffer_aliases(
+        &self,
+        heap: &std::sync::Arc<crate::descriptor::host::HostHeap>,
+        operation: crate::descriptor::host::BufferAliases,
+    ) -> bool {
+        if !heap.simultaneous_buffers(&operation) { return false; }
+        let mut deferred = self.deferred();
+        if !deferred.buffer_aliases.last().is_some_and(|(h, op)| {
+            std::sync::Arc::ptr_eq(h, heap) && op == &operation
+        }) {
+            deferred.buffer_aliases.push((heap.clone(), operation));
+        }
+        true
+    }
+
+    fn prepare_indexed_views(&self, versions: &mut Vec<(std::sync::Arc<crate::descriptor::host::HostHeap>, u64)>) -> Result<(), &'static str> {
         let observed = self.deferred().indexed_heaps.clone();
-        observed.into_iter().all(|(title, host, forms)| {
-            crate::descriptor::with_heap(title, |heap| {
-                // Released guest objects leave the original retained native
-                // heap intact. A new guest heap at that address is unrelated.
-                heap.host_owner().is_none_or(|current| {
-                    !std::sync::Arc::ptr_eq(current, &host)
-                        || host.indexed_resident(heap, forms, self, false)
-                })
-            })
-            .unwrap_or(true)
-        })
+        let ready = observed.into_iter().all(|(title, host, forms)| {
+            // Mirroring a previously unmaterialized descriptor changes the version
+            // on the first pass. Validate its now-published record on the second.
+            for _ in 0..2 {
+                let before = host.stable_version();
+                let ready = crate::descriptor::with_heap(title, |heap| {
+                    heap.host_owner().is_some_and(|current| {
+                        std::sync::Arc::ptr_eq(current, &host)
+                            && host.indexed_resident(heap, &forms, self, false)
+                    })
+                }).unwrap_or(false);
+                if !ready { return false; }
+                if before == host.stable_version() {
+                    versions.push((host, before));
+                    return true;
+                }
+            }
+            false
+        });
+        if !ready { return Err("indexed descriptors lack the ordered resources prepared by this recording"); }
+        let operations = self.deferred().buffer_aliases.clone();
+        for (heap, operation) in operations {
+            // Publication can replace only one side of an alias after the
+            // list closed. The caller pins and compares this exact version.
+            let version = heap.stable_version();
+            if !heap.simultaneous_buffers(&operation) {
+                return Err("descriptor publication exposes a concurrent buffer write to a copied SRV presentation");
+            }
+            versions.push((heap, version));
+        }
+        Ok(())
     }
 
     pub(crate) fn keep_view_heap(&self, heap: &std::sync::Arc<crate::descriptor::host::HostHeap>) {
@@ -8075,6 +8125,12 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work), (from, from + len)));
     }
 
+    pub(crate) fn require_landed_alias(&self, resource: usize) {
+        if let Some(span) = crate::resource::placed_span(resource as crate::object::This) {
+            self.deferred().landed_aliases.insert(span);
+        }
+    }
+
     pub(crate) fn require_texture(&self, resource: usize, view: &crate::descriptor::View) {
         let Some(range) = crate::texture::ViewRange::for_view(view) else {
             self.refused_pipeline(0);
@@ -8118,6 +8174,17 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let (mut copies, mut refreshes, mut refreshed) = (0u64, 0u64, 0u64);
         let deferred = self.deferred();
+        for &owner in &deferred.gpu_texture_writers {
+            crate::texback::written(owner);
+        }
+        for &span in &deferred.landed_aliases {
+            if !crate::resource::gpu_target_overlaps(span).into_iter()
+                .all(|(owner, lo, hi)| crate::texback::available(owner, lo, hi))
+            {
+                refuse_frame(format_args!("GPU-owned bytes overlapping placed texture at {:#x} have no ordered byte-exact landing", span.1));
+                return Vec::new();
+            }
+        }
         let textures = deferred.texture_uploads.clone();
         for (i, step) in deferred.copies.iter().enumerate() {
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
@@ -8138,9 +8205,6 @@ impl HostList {
                     crate::port::copied(dst, src, len);
                     // Renderer port #7: into a heap's records, the rounds
                     // asked earlier did not see it.
-                    if crate::descriptor::in_shader_heap(dst, len) {
-                        crate::port_journal::prep_wrote();
-                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -8168,9 +8232,6 @@ impl HostList {
                 }
                 Step::Placed(p) => {
                     let started = std::time::Instant::now();
-                    if crate::descriptor::in_shader_heap(p.dst, p.len) {
-                        crate::port_journal::prep_wrote();
-                    }
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     batch.fill();
                     if free {

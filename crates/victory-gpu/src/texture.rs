@@ -126,6 +126,7 @@ impl Drop for UploadVersion {
 #[derive(Default)]
 struct Last {
     hash: Option<Digest>,
+    previous: Vec<u8>,
     backing: Vec<(usize, usize, usize, u64, u64)>,
     mapping_epoch: Option<u64>,
     asked: u64,
@@ -147,6 +148,7 @@ static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 /// it out for a copy (the same bytes: the texels are as wide), the written
 /// texture's layout first.
 struct Through {
+    serials: [u64; 2],
     buffer: ID3D12Resource,
     parts: Vec<(
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
@@ -154,8 +156,8 @@ struct Through {
     )>,
 }
 
-/// The most levels times layers [`alias`] copies (a cube of nine levels).
-const ALIAS_PARTS: u32 = 54;
+
+
 
 // SAFETY: a device-local buffer only lists record copies with.
 unsafe impl Send for Through {}
@@ -188,10 +190,26 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         return false;
     };
     let Some(host) = host() else { return false };
+    // A linear host copy is exact only if guest addressing assigns every
+    // corresponding element the same bytes, including packed tails. BC works
+    // here when the writer stores one encoded block per integer element.
+    let Some((a, _, _)) = crate::resource::title_texture(source) else { return false };
+    let Some((b, _, _)) = crate::resource::title_texture(placed) else { return false };
+    if a.desc.swizzle != b.desc.swizzle || a.desc.element_bytes != b.desc.element_bytes
+        || a.desc.samples != 1 || b.desc.samples != 1 || a.desc.dimension != b.desc.dimension
+        || a.mips != b.mips || a.block != b.block || a.slice_size != b.slice_size || a.slices != b.slices
+        || crate::resource::stands_in(source) || crate::resource::stands_in(placed)
+    {
+        return false;
+    }
+    let (Some(writer), Some(reader)) = (crate::resource::made_copy(source), crate::resource::made_copy(placed)) else {
+        return false;
+    };
+    let serials = [writer.serial, reader.serial];
     let through = {
         let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
         let map = map.get_or_insert_with(HashMap::new);
-        match map.get(&(placed as usize)) {
+        match map.get(&(placed as usize)).filter(|t| t.serials == serials) {
             Some(through) => through.clone(),
             None => {
                 // SAFETY: live textures.
@@ -206,12 +224,14 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                     u32::from(d.MipLevels) * layers
                 };
                 let parts = count(&of_from);
-                if parts == 0 || parts > ALIAS_PARTS || parts != count(&of_to) {
+                if parts == 0 || parts != count(&of_to) {
                     return false;
                 }
                 let mut rows = [(); 2]
                     .map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts as usize]);
                 let mut bytes = [0u64; 2];
+                let mut row_counts = [(); 2].map(|()| vec![0u32; parts as usize]);
+                let mut row_sizes = [(); 2].map(|()| vec![0u64; parts as usize]);
                 // SAFETY: plain queries; the out pointers are ours and
                 // hold `parts` layouts each.
                 unsafe {
@@ -221,8 +241,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                         parts,
                         0,
                         Some(rows[0].as_mut_ptr()),
-                        None,
-                        None,
+                        Some(row_counts[0].as_mut_ptr()),
+                        Some(row_sizes[0].as_mut_ptr()),
                         Some(&mut bytes[0]),
                     );
                     host.device.GetCopyableFootprints(
@@ -231,18 +251,17 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                         parts,
                         0,
                         Some(rows[1].as_mut_ptr()),
-                        None,
-                        None,
+                        Some(row_counts[1].as_mut_ptr()),
+                        Some(row_sizes[1].as_mut_ptr()),
                         Some(&mut bytes[1]),
                     );
                 }
                 let alike = rows[0].iter().zip(&rows[1]).all(|(a, b)| {
                     let (fa, fb) = (a.Footprint, b.Footprint);
                     a.Offset == b.Offset
-                        && (fa.Width, fa.Height, fa.Depth, fa.RowPitch)
-                            == (fb.Width, fb.Height, fb.Depth, fb.RowPitch)
+                        && (fa.Depth, fa.RowPitch) == (fb.Depth, fb.RowPitch)
                 });
-                if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
+                if bytes[0] == 0 || bytes[0] != bytes[1] || row_counts[0] != row_counts[1] || row_sizes[0] != row_sizes[1] || !alike {
                     return false;
                 }
                 let Some(buffer) = host.uav_buffer(bytes[0]) else {
@@ -266,6 +285,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 );
                 let [of_written, of_read] = rows;
                 let through = Arc::new(Through {
+                    serials,
                     buffer,
                     parts: of_written.into_iter().zip(of_read).collect(),
                 });
@@ -274,7 +294,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    list.first_use(placed as usize);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -289,9 +309,6 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
-        return true;
-    }
     card_writes(list, placed, to, None);
     crate::list::ensure_state(list, placed, COPY_DEST);
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
@@ -444,23 +461,10 @@ fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     })
 }
 
-/// Whether a texture all of whose memory is mapped is read through the
-/// kernel's copy instead of in place (`VICTORY_TEXTURE_COPY=1`; off by
-/// default). Round 3 of the memory work read every such texture that way
-/// to be safe from pages taken away under the read; it cost 0.6 ms per MB
-/// against 0.3 in place (90-105 ms a frame while the world streams in, runs
-/// 72 and 73, against 20-40), and both runs with it lost the graphics
-/// device, for a reason not found. The read in place is safe now for
-/// another reason (`crate::watch::title_memory_reading`); this switch is
-/// left to tell whether the copy was what lost the device.
-fn through_copy() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_COPY").is_some_and(|v| v == "1"))
-}
-
 /// Calls `f` with the `size` bytes of title memory at `memory`, read
 /// through the kernel into this thread's read buffer; pages that are not
 /// there read as zeros. The bytes are those a read in place would see.
+#[cfg(test)]
 fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> R {
     with_read(size, |read| {
         crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
@@ -751,14 +755,6 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     if host_written {
         return;
     }
-    // Once a list for each first level; not again for one that the list's
-    // upload of larger ones held too.
-    if !list.first_use(1 << 63 | (resource as usize) << 4 | first as usize & 15) {
-        return;
-    }
-    if !list.first_use(resource as usize) && staged_from(resource) <= first {
-        return;
-    }
     let Some(copy) = crate::resource::host_copy(resource) else {
         return;
     };
@@ -766,6 +762,12 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let Some(staging) = staging(resource, &copy, first) else {
         return;
     };
+    // Each allocation and mip range has its own retained staging object.
+    // A speculative attempt that failed above never claims a required upload.
+    if !list.first_use((1usize << 63) | Arc::as_ptr(&staging) as usize) {
+        return;
+    }
+    list.first_use(resource as usize);
     use std::sync::atomic::Ordering::Relaxed;
     let picking = PICKING.get();
     staging.used.store(crate::host::moment(), Relaxed);
@@ -842,6 +844,11 @@ pub(crate) struct ViewRange {
 }
 
 impl ViewRange {
+    pub(crate) fn includes(&self, mip: u32, slice: u32) -> bool {
+        (self.mip..self.mip.saturating_add(self.levels)).contains(&mip)
+            && (self.slice..self.slice.saturating_add(self.slices)).contains(&slice)
+    }
+
     pub(crate) fn for_view(view: &crate::descriptor::View) -> Option<Self> {
         use crate::descriptor::View;
         let whole = Self {
@@ -916,7 +923,7 @@ impl PreludeUpload {
 
     pub(crate) fn covers(&self, needed: ViewRange) -> bool {
         let stages = &self.staging;
-        let parts = stages.parts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut parts = stages.parts.lock().unwrap_or_else(|e| e.into_inner());
         let mips = stages.mips;
         let layers = stages.footprints.len() as u32 / (mips - stages.first);
         if needed.mip < stages.first
@@ -927,14 +934,33 @@ impl PreludeUpload {
         {
             return false;
         }
-        (needed.slice..layers.min(needed.slice.saturating_add(needed.slices))).all(|slice| {
+        let ready = (needed.slice..layers.min(needed.slice.saturating_add(needed.slices))).all(|slice| {
             (needed.mip..mips.min(needed.mip.saturating_add(needed.levels))).all(|mip| {
                 let i = (slice * (mips - stages.first) + mip - stages.first) as usize;
                 parts
                     .get(i)
                     .is_some_and(|p| matches!(p.content, Some((_, true))))
             })
-        })
+        });
+        if !ready { return false; }
+        if let Some(tiled) = self.on_demand.as_ref().and_then(|entry| entry.tiled()) {
+            let mask = (needed.mip..mips.min(needed.mip.saturating_add(needed.levels)))
+                .fold(0, |mask, mip| mask | tiled.with_level(mip - stages.level0));
+            let missing = tiled.without(mask);
+            if missing != 0 {
+                let held = stages.detiled.load(std::sync::atomic::Ordering::Relaxed);
+                tiled.uploaded(&self.copy.texture, held | mask, || true);
+                if tiled.without(mask) != 0 { return false; }
+                for (i, part) in parts.iter_mut().enumerate() {
+                    let mip = stages.first + i as u32 % (mips - stages.first) - stages.level0;
+                    if missing & (1u32 << mip) != 0 && part.content.is_some_and(|(_, held)| held) {
+                        part.dirty = true;
+                    }
+                }
+                stages.dirty.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        true
     }
 
     pub(crate) fn resource(&self) -> usize {
@@ -1408,13 +1434,26 @@ impl Staging {
                 }
                 read[..covered].copy_from_slice(&plane[offset..offset + covered]);
                 let hash = digest(read);
-                if last.hash != Some(hash) {
-                    self.detile(read);
+                if last.hash != Some(hash) || last.previous.as_slice() != &*read {
+                    self.detile_parts(read, None, Some(&mut last.previous));
                     last.hash = Some(hash);
                 }
                 size
             });
         }
+        // The identity comparison and the captured bytes must describe one
+        // mapping. A pending remap invalidates the old ready parts for this read.
+        let _mapping = if no_wait() {
+            let Some(guard) = crate::watch::title_memory_reading_now() else {
+                last.asked = 0;
+                last.hash = None;
+                self.parts.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                return 0;
+            };
+            guard
+        } else {
+            waited(2, crate::watch::title_memory_reading)
+        };
         let epoch = crate::watch::changes();
         if last.mapping_epoch != Some(epoch) {
             let backing = crate::inplace::backing(start, size);
@@ -1489,7 +1528,7 @@ impl Staging {
                         .any(|&(_, stamp)| stamp > previous)
                 });
                 retry = coverage.contains(&Some(false));
-                self.detile_parts(read, Some(&coverage));
+                self.detile_parts(read, Some(&coverage), None);
                 total
             });
             if retry {
@@ -1497,97 +1536,24 @@ impl Staging {
             }
             return bytes;
         }
-        // From here on the texture's memory may be read in place. Held until
-        // that read is done: the runtime changes what title memory shows
-        // only with this taken alone, so what `committed` finds mapped
-        // stays mapped (see `crate::watch::title_memory_reading`; without
-        // it a page went between the asking and the read in runs 71 and
-        // 74).
-        let _mapped = if no_wait() {
-            // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
-            };
-            mapped
-        } else {
-            waited(2, crate::watch::title_memory_reading)
-        };
-        if !committed(self.memory, size) {
-            last.asked = 0;
-            last.hash = None;
-            last.partial = Some(crate::frame::current());
-            return with_read(size, |read| {
+        // Where the private journal cannot vouch for the bytes, capture
+        // once. Comparison, detiling, and the queued copy all use that version.
+        with_read(size, |read| {
+            if !committed(self.memory, size) || !crate::host::read_into(self.memory, read) {
+                last.asked = 0;
+                last.hash = None;
+                last.partial = Some(crate::frame::current());
                 let (coverage, bytes) = self.snapshot_parts(read, |_| true);
-                self.detile_parts(read, Some(&coverage));
-                bytes
-            });
-        }
-        if through_copy() {
-            return with_title(self.memory, size, |tiled| {
-                let hash = digest(tiled);
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-                if last.hash == Some(hash) {
-                    return size;
-                }
-                last.hash = Some(hash);
-                self.detile(tiled);
-                self.keep_whole(tiled, Some(hash));
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-                size
-            });
-        }
-        // SAFETY: committed memory of the texture's layout size, and it
-        // stays committed while `_mapped` is held.
-        let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = digest(tiled);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
-            return size;
-        }
-        last.hash = Some(hash);
-        self.detile(tiled);
-        self.keep_whole(tiled, None);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        size
-    }
-
-    /// A refresh while the runtime is remapping title memory ([`no_wait`]):
-    /// the texture is read through the kernel, which fails if a page of it
-    /// is not there at this moment. Then a staging buffer that was filled
-    /// before keeps what it holds and the texture is looked at again at its
-    /// next refresh (what was learnt about writes to it is forgotten, so
-    /// that it is not passed over as unwritten); one never filled takes the
-    /// pages that are there ([`Staging::fill`]). Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
-        use std::sync::atomic::Ordering::Relaxed;
-        let read = with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
-                return false;
+                self.detile_parts(read, Some(&coverage), Some(&mut last.previous));
+                return bytes;
             }
+            if last.hash.is_some() && last.previous.as_slice() == &*read { return size; }
             let hash = digest(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
-                self.detile(read);
-                self.keep_whole(read, Some(hash));
-            }
-            true
-        });
-        if read {
-            UNLOCKED[0].fetch_add(1, Relaxed);
+            self.detile_parts(read, None, Some(&mut last.previous));
+            last.hash = Some(hash);
+            self.keep_whole(read, Some(hash));
             size
-        } else {
-            UNLOCKED[1].fetch_add(1, Relaxed);
-            last.asked = 0;
-            last.hash = None;
-            self.parts.lock().unwrap_or_else(|e| e.into_inner()).clear();
-            0
-        }
+        })
     }
 
     /// `tiled`, read whole, was detiled: a texture of all its levels from
@@ -1677,12 +1643,7 @@ impl Staging {
         (coverage, bytes)
     }
 
-    /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
-        self.detile_parts(tiled, None);
-    }
-
-    fn detile_parts(&self, tiled: &[u8], coverage: Option<&[Option<bool>]>) {
+    fn detile_parts(&self, tiled: &[u8], coverage: Option<&[Option<bool>]>, previous: Option<&mut Vec<u8>>) {
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1745,7 +1706,10 @@ impl Staging {
             };
             let resident = mip >= 32 || held & (1 << mip) != 0;
             let signature = (hash, resident);
-            if parts[i].content == Some(signature) {
+            if parts[i].content == Some(signature)
+                && previous.as_deref().is_some_and(|old| self.layout.subresource_runs(mip, slice)
+                    .is_some_and(|mut runs| runs.all(|r| old.get(r.clone()).is_some_and(|data| tiled.get(r) == Some(data)))))
+            {
                 continue;
             }
             let f = footprint.Footprint;
@@ -1779,6 +1743,22 @@ impl Staging {
                 content: Some(signature),
                 dirty: true,
             };
+        }
+        if let Some(old) = previous {
+            if let Some(coverage) = coverage {
+                old.resize(tiled.len(), 0);
+                for (i, _) in coverage.iter().enumerate().filter(|(_, c)| **c == Some(true)) {
+                    let (mip, slice) = self.part(i);
+                    if let Some(runs) = self.layout.subresource_runs(mip, slice) {
+                        for range in runs {
+                            old[range.clone()].copy_from_slice(&tiled[range]);
+                        }
+                    }
+                }
+            } else {
+                old.clear();
+                old.extend_from_slice(tiled);
+            }
         }
         self.dirty.store(
             parts.iter().any(|p| p.dirty),
@@ -1834,15 +1814,6 @@ pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let staging = map.as_ref()?.get(&(resource as usize))?;
     Some((staging.uploaded.load(Relaxed), staging.dirty.load(Relaxed)))
-}
-
-/// The first level a title texture's staging buffer holds; `u32::MAX`
-/// without one.
-fn staged_from(resource: This) -> u32 {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    map.as_ref()
-        .and_then(|map| map.get(&(resource as usize)))
-        .map_or(u32::MAX, |s| s.first)
 }
 
 /// Whether the levels from `first` on of `resource`'s host copy were filled
@@ -2093,7 +2064,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         return Some(s.clone());
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
-    let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
+    let Some(layout) = crate::resource::texture_layout(&desc).filter(|t| t.planes.len() == 1).and_then(|t| t.planes.into_iter().next().map(|p| p.layout))
     else {
         once!(
             ?desc,

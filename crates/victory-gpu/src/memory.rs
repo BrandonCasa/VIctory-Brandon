@@ -111,6 +111,7 @@ const SWEEP: usize = 128;
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Use {
     Reads,
+    SizeQuery { source: u64, destination: u64 },
     /// Stores by address, as the structure builder; `back`: its results in
     /// small title buffers come back.
     Builds { back: bool },
@@ -145,6 +146,44 @@ struct Packed {
 
 type Backing = Vec<(usize, usize, usize, u64, u64)>;
 
+// Section views have their own mapping identity. Private VA reuse has no
+// section handle, so retain a lifetime stamp for pages observed by the BVH.
+type PrivatePages = std::collections::BTreeMap<usize, u64>;
+static PRIVATE_PAGES: std::sync::OnceLock<Mutex<PrivatePages>> = std::sync::OnceLock::new();
+
+fn mapping_identity(at: usize, len: usize) -> Backing {
+    let mut backing = crate::inplace::backing(at, len);
+    if len == 0 || backing.iter().map(|&(a, b, ..)| b - a).sum::<usize>() == len {
+        return backing;
+    }
+    let mut pages = PRIVATE_PAGES.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    let range = at / PAGE as usize..at.saturating_add(len).div_ceil(PAGE as usize);
+    let generation = range.map(|p| *pages.entry(p).or_insert(0)).max().unwrap_or(0);
+    backing.push((at, at.saturating_add(len), 0, 0, generation));
+    backing
+}
+
+pub(crate) fn mapping_changed(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let Some(pages) = PRIVATE_PAGES.get() else { return };
+    let mut pages = pages.lock().unwrap_or_else(|e| e.into_inner());
+    let range = at / PAGE as usize..at.saturating_add(len).div_ceil(PAGE as usize);
+    let generation = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for (_, value) in pages.range_mut(range) {
+        *value = generation;
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct ViewSpan {
+    pub(crate) at: u64,
+    /// No byte count in a native acceleration-structure descriptor.
+    pub(crate) bytes: Option<u64>,
+}
+
 #[derive(Clone)]
 struct Structure {
     size: u64,
@@ -152,7 +191,9 @@ struct Structure {
     backing: Backing,
     compacted: Option<u64>,
     published: bool,
-    dependencies: Vec<(u64, u64)>,
+    // Instance VA, canonical producer VA and generation (zero for an
+    // externally supplied BLAS whose header is re-read before traversal).
+    dependencies: Vec<(u64, u64, u64)>,
 }
 
 struct PriorOutput {
@@ -165,7 +206,7 @@ struct PriorOutput {
     snapshot: Option<ID3D12Resource>,
 }
 
-type InstanceGraph = HashMap<u64, Vec<(u64, u64)>>;
+type InstanceGraph = HashMap<u64, Vec<(u64, u64, u64)>>;
 
 struct BuildVersion {
     instances: Arc<InstanceGraph>,
@@ -182,6 +223,7 @@ struct DirectoryAlias {
 
 struct Memory {
     directory_aliases: HashMap<u64, DirectoryAlias>,
+    declared_backing: HashMap<u64, Backing>,
     gpu_pages: std::collections::HashSet<u64>,
     versions: HashMap<u64, BuildVersion>,
     structures: HashMap<u64, Structure>,
@@ -288,6 +330,7 @@ impl Memory {
             windows: 0,
             page_scratch: vec![0; PAGE as usize],
             directory_aliases: Default::default(),
+            declared_backing: Default::default(),
             gpu_pages: Default::default(),
             versions: HashMap::new(),
             structures: HashMap::new(),
@@ -348,6 +391,9 @@ impl Memory {
         let mut output = None;
         for &[at, len, stamp] in ranges {
             let kind = stamp & 255;
+            if kind == crate::bvh::COPY_EXTENT {
+                continue;
+            }
             if kind == crate::bvh::REHYDRATE {
                 let source = len;
                 let Some(header) = crate::bvh::read(source) else {
@@ -371,19 +417,25 @@ impl Memory {
             }
             if kind == crate::bvh::COMPACT_COPY {
                 let source = len;
-                let Some(structure) = self.structures.get(&source) else {
+                let Some(canonical) = self.structure_at(source) else {
                     return false;
                 };
+                let structure = &self.structures[&canonical];
                 let Some(size) = structure.compacted else {
                     return false;
                 };
-                if !self.published_range(source) || size == 0 || size > structure.size {
+                if !self.published_range(canonical) || size == 0 || size > structure.size {
                     return false;
                 }
                 let src_len = structure.size;
                 let deps = structure.dependencies.clone();
-                if let Some((base, owner_len)) = crate::shadow::in_buffer(at, 1)
-                    && size > owner_len.saturating_sub(at - base)
+                let batch_extent = ranges.iter().find(|r| r[0] == at && r[2] & 255 == crate::bvh::COPY_EXTENT)
+                    .map(|r| r[1]);
+                let buffer_extent = crate::shadow::in_buffer(at, 1)
+                    .and_then(|(base, len)| len.checked_sub(at - base));
+                if batch_extent.into_iter().chain(buffer_extent).min().is_none_or(|len| size > len)
+                    || std::iter::once(source as usize).chain(crate::inplace::aliases(source as usize, src_len as usize))
+                        .any(|other| at.abs_diff(other as u64) < if at < other as u64 { size } else { src_len })
                 {
                     return false;
                 }
@@ -393,7 +445,7 @@ impl Memory {
                         && base < at.saturating_add(size)
                         && at < base.saturating_add(s.size)
                         && s.published
-                        && crate::inplace::backing(base as usize, s.size as usize) == s.backing
+                        && mapping_identity(base as usize, s.size as usize) == s.backing
                 }) {
                     return false;
                 }
@@ -401,17 +453,21 @@ impl Memory {
                     return false;
                 }
                 let generation = stamp >> 8;
+                let target = self.structure_at(at).unwrap_or(at);
+                if target != at && !crate::inplace::aliases(at as usize, size as usize).contains(&(target as usize)) {
+                    return false;
+                }
                 if self
                     .structures
-                    .get(&at)
+                    .get(&target)
                     .is_none_or(|s| s.generation != generation)
                 {
                     self.structures.insert(
-                        at,
+                        target,
                         Structure {
                             size,
                             generation,
-                            backing: crate::inplace::backing(at as usize, size as usize),
+                            backing: mapping_identity(target as usize, size as usize),
                             compacted: None,
                             published: false,
                             dependencies: deps,
@@ -436,16 +492,20 @@ impl Memory {
                     return false;
                 }
             } else if kind == OUTPUT {
-                output = Some(at);
+                let target = self.structure_at(at).unwrap_or(at);
+                if target != at && !crate::inplace::aliases(at as usize, len as usize).contains(&(target as usize)) {
+                    return false;
+                }
+                output = Some(target);
                 let generation = stamp >> 8;
                 if self
                     .structures
-                    .get(&at)
+                    .get(&target)
                     .is_none_or(|s| s.generation != generation)
                 {
-                    let backing = crate::inplace::backing(at as usize, len as usize);
+                    let backing = mapping_identity(target as usize, len as usize);
                     self.structures.insert(
-                        at,
+                        target,
                         Structure {
                             size: len,
                             backing,
@@ -462,7 +522,7 @@ impl Memory {
                     return false;
                 };
                 let mut visited = std::collections::HashSet::new();
-                for &(instance, blas) in records {
+                for &(instance, blas, h) in records {
                     if kind == INSTANCE_POINTERS && !self.reserve(instance, 64, false) {
                         return false;
                     }
@@ -475,21 +535,18 @@ impl Memory {
                     let canonical = self.structure_at(blas).unwrap_or(blas);
                     let size = if let Some(s) = self.structures.get(&canonical) {
                         if (!s.published && s.generation != stamp >> 8)
-                            || crate::inplace::backing(canonical as usize, s.size as usize)
+                            || mapping_identity(canonical as usize, s.size as usize)
                                 != s.backing
                         {
                             return false;
                         }
-                        dependencies.push((canonical, s.generation));
+                        dependencies.push((blas, canonical, s.generation));
                         s.size
                     } else {
-                        let Some(bytes) = crate::bvh::read(blas) else {
-                            return false;
-                        };
-                        let h = u64::from_le_bytes(bytes);
-                        if h as u16 != 6 {
+                        if h as u16 != 6 || h & 0x8100_0000 != 0x8000_0000 {
                             return false;
                         }
+                        dependencies.push((blas, blas, 0));
                         ((h >> 32) + 1) * 64
                     };
                     if !self.reserve(blas, size, false) {
@@ -517,8 +574,8 @@ impl Memory {
             .directory_aliases
             .iter()
             .filter_map(|(&p, a)| {
-                (crate::inplace::backing((p * PAGE) as usize, PAGE as usize) != a.backing
-                    || crate::inplace::backing((a.owner * PAGE) as usize, PAGE as usize)
+                (mapping_identity((p * PAGE) as usize, PAGE as usize) != a.backing
+                    || mapping_identity((a.owner * PAGE) as usize, PAGE as usize)
                         != a.owner_backing
                     || self.copy_of(a.owner).is_none())
                 .then_some(p)
@@ -534,8 +591,14 @@ impl Memory {
     }
 
     fn structure_at(&mut self, address: u64) -> Option<u64> {
-        if self.structures.contains_key(&address) {
-            return Some(address);
+        if address / PAGE >= u64::from(MEMORY_PAGES) - 1 {
+            return None;
+        }
+        if let Some(s) = self.structures.get(&address) {
+            if mapping_identity(address as usize, s.size as usize) == s.backing {
+                return Some(address);
+            }
+            self.structures.remove(&address);
         }
         for other in crate::inplace::aliases(address as usize, 1) {
             let Some(s) = self.structures.get(&(other as u64)) else {
@@ -546,7 +609,11 @@ impl Memory {
             {
                 continue;
             }
-            let pages = address / PAGE..address.checked_add(s.size)?.div_ceil(PAGE);
+            let end = address.checked_add(s.size)?.div_ceil(PAGE);
+            if end >= u64::from(MEMORY_PAGES) {
+                return None;
+            }
+            let pages = address / PAGE..end;
             if !pages
                 .clone()
                 .enumerate()
@@ -555,7 +622,11 @@ impl Memory {
                 continue;
             }
             for (i, page) in pages.enumerate() {
-                let owner = other as u64 / PAGE + i as u64;
+                let other_page = other as u64 / PAGE + i as u64;
+                let owner = self.directory_aliases.get(&other_page).map_or(other_page, |a| a.owner);
+                if owner == page {
+                    continue;
+                }
                 let value = unsafe { self.entry(owner).cast::<[u32; 2]>().read() };
                 let ptr = self.entry(page).cast::<[u32; 2]>();
                 self.directory_aliases
@@ -563,8 +634,8 @@ impl Memory {
                     .or_insert_with(|| DirectoryAlias {
                         owner,
                         previous: unsafe { ptr.read() },
-                        backing: crate::inplace::backing((page * PAGE) as usize, PAGE as usize),
-                        owner_backing: crate::inplace::backing(
+                        backing: mapping_identity((page * PAGE) as usize, PAGE as usize),
+                        owner_backing: mapping_identity(
                             (owner * PAGE) as usize,
                             PAGE as usize,
                         ),
@@ -584,13 +655,12 @@ impl Memory {
             return true;
         };
         s.published
-            && crate::inplace::backing(at as usize, s.size as usize) == s.backing
-            && s.dependencies.iter().all(|&(base, generation)| {
-                self.structures.get(&base).is_some_and(|child| {
-                    child.generation == generation
-                        && child.published
-                        && child.backing
-                            == crate::inplace::backing(base as usize, child.size as usize)
+            && mapping_identity(at as usize, s.size as usize) == s.backing
+            && s.dependencies.iter().all(|&(va, owner, generation)| {
+                generation == 0 || self.structures.get(&owner).is_some_and(|child| {
+                    child.published && child.generation == generation
+                        && child.backing == mapping_identity(owner as usize, child.size as usize)
+                        && (va == owner || crate::inplace::aliases(va as usize, child.size as usize).contains(&(owner as usize)))
                 })
             })
     }
@@ -607,23 +677,74 @@ impl Memory {
         }
         let pages = at / PAGE..end.div_ceil(PAGE);
         if !crate::texture::committed_by_query(at as *const u8, len as usize)
-            || !pages.clone().all(|page| self.map_page(page, true))
+            || !pages.clone().all(|page| self.reserve_page(page))
         {
             return false;
         }
         // Declared inputs may be filled more than once in the same frame.
         for page in pages.clone() {
-            if let Some(held) = self.pages.get_mut(&page) {
+            let owner = self.directory_aliases.get(&page).map_or(page, |alias| alias.owner);
+            if let Some(held) = self.pages.get_mut(&owner) {
                 held.looked = u64::MAX;
+            }
+            if owner != page {
+                self.bring(owner, owner + 1);
             }
         }
         self.bring(pages.start, pages.end);
         if writable {
             for page in pages {
+                let owner = self.directory_aliases.get(&page).map_or(page, |a| a.owner);
+                if !self.pages.contains_key(&owner) {
+                    let shadow = &self.copies[self.copy_of(owner).expect("reserved page")];
+                    if !shadow.preserve_raw_page((owner * PAGE) as usize, !self.gpu_pages.contains(&owner)) {
+                        return false;
+                    }
+                }
                 self.opens(page * PAGE);
             }
         }
         true
+    }
+
+    /// Reuse an arena slot only for the bytes its current guest mapping
+    /// names. Equal CPU dwords in a replacement mapping must replace any
+    /// GPU-only stores in the previous page too.
+    fn reserve_page(&mut self, page: u64) -> bool {
+        let va = (page * PAGE) as usize;
+        let backing = mapping_identity(va, PAGE as usize);
+        if self.declared_backing.get(&page).is_some_and(|old| old != &backing) {
+            self.gpu_pages.remove(&page);
+            if let Some(held) = self.pages.get_mut(&page) {
+                held.taken = 0;
+                held.looked = u64::MAX;
+            } else if !self.directory_aliases.contains_key(&page) {
+                unsafe { self.entry(page).write(0) };
+                self.invalidate_directory(page);
+            }
+        }
+        if self.declared_backing.get(&page) != Some(&backing)
+            && !self.directory_aliases.contains_key(&page) && !backing.is_empty() {
+            for other in crate::inplace::aliases(va, PAGE as usize) {
+                let owner = other as u64 / PAGE;
+                if !other.is_multiple_of(PAGE as usize) || self.directory_aliases.contains_key(&owner) || self.copy_of(owner).is_none() {
+                    continue;
+                }
+                let owner_backing = mapping_identity(other, PAGE as usize);
+                if self.declared_backing.get(&owner) != Some(&owner_backing) {
+                    continue;
+                }
+                let entry = self.entry(page).cast::<[u32; 2]>();
+                self.directory_aliases.insert(page, DirectoryAlias {
+                    owner, backing: backing.clone(), owner_backing, previous: unsafe { entry.read() },
+                });
+                unsafe { entry.write(self.entry(owner).cast::<[u32; 2]>().read()) };
+                self.invalidate_directory(page);
+                break;
+            }
+        }
+        self.declared_backing.insert(page, backing);
+        self.map_page(page, true)
     }
 
     fn descriptors(&mut self, heap: &HostHeap) -> Option<u32> {
@@ -641,8 +762,7 @@ impl Memory {
             }
         };
         for (n, shadow) in self.copies.iter().enumerate().skip(made as usize) {
-            let (_, len) = shadow.span();
-            heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+            heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, shadow.width());
         }
         self.heaps.insert(key, (base, self.copies.len() as u32));
         Some(base)
@@ -772,7 +892,8 @@ impl Memory {
         for page in address / PAGE..=(address + packed.len - 1) / PAGE {
             let Some(held) = self.pages.get_mut(&page) else { continue };
             held.owners = held.owners.saturating_sub(1);
-            if held.owners == 0 && held.theirs {
+            if held.owners == 0 && held.theirs && !self.declared_backing.contains_key(&page)
+                && !self.directory_aliases.values().any(|alias| alias.owner == page) {
                 self.free.push((held.copy, held.at));
                 self.pages.remove(&page);
                 // SAFETY: an entry of the directory, under the mutex.
@@ -823,6 +944,14 @@ impl Memory {
     /// A dispatch of the builder was given `address` to write: if it is in a
     /// title buffer's copy, stores by address reach that from here on.
     fn opens(&mut self, address: u64) {
+        let page = address / PAGE;
+        if let Some(owner) = self.directory_aliases.get(&page).map(|a| a.owner) {
+            self.opens(owner * PAGE);
+            // The owner may just have been opened for its first write.
+            unsafe { self.entry(page).cast::<[u32; 2]>().write(self.entry(owner).cast::<[u32; 2]>().read()) };
+            self.invalidate_directory(page);
+            return;
+        }
         self.gpu_pages.insert(address/PAGE);
         let Some(n) = self.map(address / PAGE).then(|| self.copy_of(address / PAGE)).flatten() else {
             return;
@@ -970,7 +1099,7 @@ impl Memory {
         };
         // Capture once. The hash, comparison and GPU upload all refer to
         // these bytes, even if a producer subsequently writes the same VA.
-        let backing = crate::inplace::backing(address as usize, len as usize);
+        let backing = mapping_identity(address as usize, len as usize);
         let Ok(length) = usize::try_from(len) else {
             return false;
         };
@@ -981,7 +1110,7 @@ impl Memory {
         bytes.resize(length, 0);
         if !crate::host::read_into(address as *const u8, &mut bytes)
             || bytes.get(..8) != Some(header.to_le_bytes().as_slice())
-            || crate::inplace::backing(address as usize, len as usize) != backing
+            || mapping_identity(address as usize, len as usize) != backing
         {
             crate::host::refuse_frame(format_args!(
                 "packed BVH changed backing during landing at {address:#x}"
@@ -1052,7 +1181,8 @@ impl Memory {
         for page in page..=last {
             let from = address.max(page * PAGE) - page * PAGE;
             let to = (address + len).min((page + 1) * PAGE) - page * PAGE;
-            if let Some(held) = self.pages.get(&page) {
+            let owner = self.directory_aliases.get(&page).map_or(page, |alias| alias.owner);
+            if let Some(held) = self.pages.get(&owner) {
                 let src = (page * PAGE + from - address) as usize;
                 let n = (to - from) as usize;
                 let dst = held.at + from as usize;
@@ -1067,7 +1197,7 @@ impl Memory {
                 // Buffer-backed entries refresh directly from title memory. An
                 // identical CPU value can still replace a GPU-produced value.
                 let shadow = &self.copies[n];
-                let Some(off) = shadow.offset_in(page * PAGE + from) else {
+                let Some(off) = shadow.offset_in(owner * PAGE + from) else {
                     return false;
                 };
                 shadow.resend(off as usize, (off + to - from) as usize);
@@ -1317,26 +1447,36 @@ fn discover_words(addresses: &[u64]) -> Option<Vec<u64>> {
             }
             let cpu = crate::bvh::read::<8>(at);
             let mut mask = [false; 2];
-            if let Some(m) = guard.as_ref()
-                && m.gpu_pages.contains(&(at / PAGE))
-                && let Some(n) = m.copy_of(at / PAGE)
-            {
-                let offset = u64::from(unsafe { m.entry(at / PAGE).add(1).read() }) + at % PAGE;
-                let shadow = m.copies.get(n)?;
-                // CPU bytes are authoritative for a native mapped resource.
-                // The private arena, in contrast, keeps the uploaded title
-                // dwords independently from its shader-visible GPU bytes.
-                if let Some(held) = m.pages.get(&(at / PAGE)) {
-                    let last = crate::bvh::read::<8>((held.at as u64) + at % PAGE)?;
-                    for i in 0..2 {
-                        mask[i] = cpu.is_none_or(|b| b[i * 4..i * 4 + 4] == last[i * 4..i * 4 + 4]);
-                    }
-                } else if shadow.carded() {
-                    let baseline = unsafe { shadow.card_data().add(offset as usize) };
-                    let mut last = [0u8; 8];
-                    if !crate::host::read_into(baseline, &mut last) {
-                        return None;
-                    }
+            let arena_word = |va: u64| guard.as_ref().and_then(|m| {
+                let page = va / PAGE;
+                let owner = m.directory_aliases.get(&page).map_or(page, |a| a.owner);
+                if !m.gpu_pages.contains(&owner) || m.declared_backing.get(&owner).is_some_and(|b|
+                    *b != mapping_identity((owner * PAGE) as usize, PAGE as usize)) {
+                    return None;
+                }
+                let offset = u64::from(unsafe { m.entry(owner).add(1).read() }) + va % PAGE;
+                let shadow = m.copies.get(m.copy_of(owner)?)?;
+                let baseline = m.pages.get(&owner).and_then(|h| crate::bvh::read::<8>(h.at as u64 + va % PAGE))
+                    .or_else(|| shadow.raw_baseline((owner * PAGE + va % PAGE) as usize));
+                Some((shadow.clone(), offset, baseline))
+            });
+            let buffer_word = |va: u64| {
+                let s = crate::shadow::peek(va, 8).filter(|s| s.written())?;
+                let off = s.offset(va);
+                Some((s, off, None))
+            };
+            let owner = arena_word(at).or_else(|| buffer_word(at)).or_else(|| {
+                // An instance can contain the interior VA of another view of
+                // the producer's pages before that VA has a directory entry.
+                crate::inplace::aliases(at as usize, 8).into_iter().find_map(|alias| {
+                    arena_word(alias as u64).or_else(|| buffer_word(alias as u64))
+                })
+            });
+            if let Some((shadow, offset, baseline)) = owner {
+                let baseline = baseline.or_else(|| shadow.carded().then_some(()).and_then(|_| {
+                    crate::bvh::read::<8>(unsafe { shadow.card_data().add(offset as usize) as u64 })
+                }));
+                if let Some(last) = baseline {
                     for i in 0..2 {
                         mask[i] = cpu.is_none_or(|b| b[i * 4..i * 4 + 4] == last[i * 4..i * 4 + 4]);
                     }
@@ -1403,10 +1543,114 @@ fn discover_instances(ranges: &[[u64; 3]]) -> Option<InstanceGraph> {
                 .iter()
                 .map(|at| at.checked_add(56))
                 .collect::<Option<Vec<_>>>()?;
-            records.extend(addresses.into_iter().zip(discover_words(&fields)?));
+            let children = discover_words(&fields)?;
+            let mut unknown = children.clone();
+            unknown.sort_unstable();
+            unknown.dedup();
+            {
+                let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+                unknown.retain(|&at| at != 0 && guard.as_mut().is_none_or(|m| m.structure_at(at).is_none()));
+            }
+            let headers: HashMap<_, _> = unknown.iter().copied().zip(discover_words(&unknown)?).collect();
+            records.extend(addresses.into_iter().zip(children).map(|(at, blas)| {
+                (at, blas, headers.get(&blas).copied().unwrap_or(0))
+            }));
         }
     }
     Some(graph)
+}
+
+/// Run after preceding producers have retired. Tracked TLASes carry the
+/// original instance dependencies. For an external TLAS, retail XDXR
+/// reads the byte offset at +52, strides its instances by 128, and shifts
+/// the dword at instance+60 left eight to obtain the referenced BLAS.
+fn reserve_trace_views(mut views: Vec<ViewSpan>) -> Option<()> {
+    use std::collections::HashSet;
+    views.sort_unstable();
+    views.dedup();
+    let mut seen = HashSet::new();
+    let mut spans = Vec::new();
+    let mut next = Vec::new();
+    while !views.is_empty() {
+        let mut external = Vec::new();
+        {
+            let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+            let m = guard.as_mut()?;
+            for view in views.drain(..) {
+                let at = view.at;
+                if at == 0 || !seen.insert(view) {
+                    continue;
+                }
+                if let Some(base) = m.structure_at(at) {
+                    if !m.published_range(base) {
+                        return None;
+                    }
+                    let s = m.structures.get(&base)?;
+                    next.extend(s.dependencies.iter().map(|&(at, _, _)| ViewSpan { at, bytes: None }));
+                    spans.push((at, s.size));
+                    if let Some(bytes) = view.bytes.filter(|&bytes| bytes > s.size) {
+                        spans.push((at, bytes));
+                    }
+                    external.push((at, true, Some(s.size)));
+                } else if let Some(len) = view.bytes {
+                    if len > 0 {
+                        spans.push((at, len));
+                    }
+                    // Retail raw SRVs can expose a TLAS just as an AS SRV
+                    // can. Follow it if its unpacked header identifies one.
+                    if len >= 64 && at % 256 == 0 {
+                        external.push((at, false, None));
+                    }
+                } else {
+                    if at % 256 != 0 || at < 1 << 32 || at >= (u64::from(MEMORY_PAGES) - 1) * PAGE {
+                        return None;
+                    }
+                    external.push((at, true, None));
+                }
+            }
+        }
+        for batch in external.chunks(2048) {
+            let fields: Vec<_> = batch.iter().flat_map(|&(at, _, _)| [at, at + 8, at + 48]).collect();
+            let headers = discover_words(&fields)?;
+            for (&(at, required, limit), words) in batch.iter().zip(headers.chunks_exact(3)) {
+                let header = words[0];
+                if !required && (header as u16 != 6 || header & (1 << 24) != 0) {
+                    continue;
+                }
+                if header as u16 != 6 || header & (1 << 24) != 0 {
+                    return None;
+                }
+                let size = ((header >> 32) + 1) * 64;
+                if size > 2 << 30 || limit.is_some_and(|bytes| size > bytes) {
+                    return None;
+                }
+                spans.push((at, size));
+                if header & (1 << 31) == 0 {
+                    let count = words[1] >> 32;
+                    let offset = words[2] >> 32;
+                    if count != 0 && (offset < 64 || offset % 64 != 0 || offset + 128 * count > size) {
+                        return None;
+                    }
+                    for start in (0..count).step_by(2048) {
+                        let fields: Vec<_> = (start..count.min(start + 2048))
+                            .map(|i| at + offset + i * 128 + 56).collect();
+                        next.extend(discover_words(&fields)?.into_iter().map(|w| ViewSpan {
+                            at: (w >> 32) << 8,
+                            bytes: None,
+                        }));
+                    }
+                }
+            }
+        }
+        std::mem::swap(&mut views, &mut next);
+    }
+    // A reservation may refresh the CPU-side upload comparison bytes. Finish
+    // all discovery against the preceding producer before changing them.
+    spans.sort_unstable();
+    spans.dedup();
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let m = guard.as_mut()?;
+    spans.into_iter().all(|(at, bytes)| m.reserve(at, bytes, false)).then_some(())
 }
 
 /// A recording can be submitted repeatedly. Assign its output generation
@@ -1417,16 +1661,19 @@ pub(crate) fn begin_build(ranges: &[[u64; 3]]) -> Option<()> {
     let key = ranges.first()?[2] >> 8;
     let generation = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let host = host()?;
-    let instances = Arc::new(discover_instances(ranges)?);
-    let mut outputs = Vec::new();
-    let mut copies = Vec::new();
     {
         let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             *guard = Memory::new();
         }
+        guard.as_mut()?.reconcile_aliases();
+    }
+    let instances = Arc::new(discover_instances(ranges)?);
+    let mut outputs = Vec::new();
+    let mut copies = Vec::new();
+    {
+        let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
         let m = guard.as_mut()?;
-        m.reconcile_aliases();
         if m.versions.contains_key(&key) {
             return None;
         }
@@ -1438,13 +1685,17 @@ pub(crate) fn begin_build(ranges: &[[u64; 3]]) -> Option<()> {
             {
                 continue;
             }
+            let at = m.structure_at(at).unwrap_or(at);
+            if outputs.iter().any(|p: &PriorOutput| p.at == at) {
+                continue;
+            }
             let previous = m
                 .structures
                 .get(&at)
                 .filter(|s| s.published && m.published_range(at))
                 .cloned();
             let bytes = previous.as_ref().map_or(0, |s| s.size);
-            let backing = crate::inplace::backing(at as usize, bytes as usize);
+            let backing = mapping_identity(at as usize, bytes as usize);
             let mut pieces = Vec::new();
             let mut snapshot = None;
             if bytes != 0 {
@@ -1503,7 +1754,7 @@ pub(crate) fn abort_builds() {
         let mut copies = Vec::new();
         for out in &version.outputs {
             if let Some(saved) = &out.snapshot
-                && crate::inplace::backing(out.at as usize, out.bytes as usize) == out.backing
+                && mapping_identity(out.at as usize, out.bytes as usize) == out.backing
             {
                 let mut pos = 0;
                 for (dst, offset, len) in &out.pieces {
@@ -1516,18 +1767,15 @@ pub(crate) fn abort_builds() {
         let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
         let Some(m) = guard.as_mut() else { return };
         for out in version.outputs {
-            if m.structures
-                .get(&out.at)
-                .is_some_and(|s| s.generation == version.generation)
-            {
-                m.structures.remove(&out.at);
-                if restored
-                    && let Some(s) = out.previous
-                    && crate::inplace::backing(out.at as usize, out.bytes as usize) == out.backing
-                {
-                    m.structures.insert(out.at, s);
-                }
+            if m.structures.get(&out.at).is_some_and(|s| s.generation == version.generation)
+                && restored
+                && let Some(s) = out.previous
+                && mapping_identity(out.at as usize, out.bytes as usize) == out.backing {
+                m.structures.insert(out.at, s);
             }
+            // Otherwise leave the unpublished generation as a tombstone.
+            // A plausible header in a partly written output is not an
+            // external, pre-built structure a later trace can discover.
         }
     }
 }
@@ -1543,18 +1791,19 @@ pub(crate) fn published(outputs: &[(u64, u64)]) {
         return;
     };
     let generation = version.generation;
-    if !outputs.iter().all(|&(at, _)| {
+    let canonical: Option<Vec<_>> = outputs.iter().map(|&(at, _)| m.structure_at(at)).collect();
+    if !canonical.as_ref().is_some_and(|bases| bases.iter().all(|&at| {
         m.structures.get(&at).is_some_and(|s| {
             s.generation == generation
-                && crate::inplace::backing(at as usize, s.size as usize) == s.backing
+                && mapping_identity(at as usize, s.size as usize) == s.backing
         })
-    }) {
+    })) {
         crate::host::refuse_frame(format_args!(
             "BVH output backing changed before publication"
         ));
         return;
     }
-    for &(at, _) in outputs {
+    for at in canonical.unwrap() {
         m.structures.get_mut(&at).unwrap().published = true;
     }
     m.versions.remove(&key);
@@ -1577,7 +1826,7 @@ impl SizeResult {
     pub(crate) fn land(&self) {
         let _mapped = crate::watch::title_memory_reading();
         if !crate::shadow::find(self.address, 8).is_some_and(|s| Arc::ptr_eq(&s, &self.owner))
-            || crate::inplace::backing(self.address as usize, 8) != self.backing
+            || mapping_identity(self.address as usize, 8) != self.backing
         {
             crate::host::refuse_frame(format_args!(
                 "compacted-size destination was replaced at {:#x}",
@@ -1601,11 +1850,12 @@ impl SizeResult {
                 }
                 drop(_mapped);
                 if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
-                    && let Some(s) = m.structures.get_mut(&self.source)
+                    && let Some(base) = m.structure_at(self.source)
+                    && let Some(s) = m.structures.get_mut(&base)
                     && self.generation.load(std::sync::atomic::Ordering::Acquire) == s.generation
                     && size != 0
                     && size <= s.size
-                    && crate::inplace::backing(self.source as usize, s.size as usize) == s.backing
+                    && mapping_identity(base as usize, s.size as usize) == s.backing
                 {
                     s.compacted = Some(size);
                 }
@@ -1643,9 +1893,9 @@ pub(crate) fn size_result(list: &HostList, address: u64, source: u64) -> Option<
         let current = MEMORY
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .and_then(|m| m.structures.get(&source))
-            .map_or(0, |s| s.generation);
+            .as_mut()
+            .and_then(|m| m.structure_at(source).map(|base| m.structures[&base].generation))
+            .unwrap_or(0);
         stamp.store(current, std::sync::atomic::Ordering::Release);
     });
     Some(SizeResult {
@@ -1654,7 +1904,7 @@ pub(crate) fn size_result(list: &HostList, address: u64, source: u64) -> Option<
         owner,
         generation,
         source,
-        backing: crate::inplace::backing(address as usize, 8),
+        backing: mapping_identity(address as usize, 8),
     })
 }
 
@@ -1733,6 +1983,8 @@ pub(crate) fn ready(
     use_: Use,
     threads: Option<[u32; 3]>,
     ranges: &[[u64; 3]],
+    views: &[ViewSpan],
+    indexed: crate::descriptor::host::IndexedSlots,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
@@ -1742,7 +1994,7 @@ pub(crate) fn ready(
     // Declared builders and their consumers acquire directory entries in
     // submission order. A later recording cannot replace an earlier reader's
     // entries while its commands are waiting for a pipeline or queue fence.
-    if !ranges.is_empty() || use_ == Use::Reads && crate::pipeline::builder_enabled() {
+    if !ranges.is_empty() || matches!(use_, Use::SizeQuery { .. }) || use_ == Use::Reads && crate::pipeline::builder_enabled() {
         let base = m.descriptors(heap)?;
         let ready = Ready {
             directory: m.directory.1.gpu(m.directory.1.span().0),
@@ -1763,10 +2015,13 @@ pub(crate) fn ready(
         }
         let spans = ranges.to_vec();
         let heap = heap.clone();
+        let fixed = views.to_vec();
         let mut pointers = addresses.to_vec();
-        for w in constants.windows(2) {
-            if (1..32).contains(&w[1]) {
-                pointers.push(u64::from(w[0]) | u64::from(w[1]) << 32);
+        if use_ != Use::Reads {
+            for w in constants.windows(2) {
+                if (1..256).contains(&w[1]) {
+                    pointers.push(u64::from(w[0]) | u64::from(w[1]) << 32);
+                }
             }
         }
         pointers.sort_unstable();
@@ -1793,23 +2048,58 @@ pub(crate) fn ready(
                     return None;
                 }
             }
-            for &at in &pointers {
-                if !(1 << 32..1 << 37).contains(&at) {
-                    continue;
+            if use_ == Use::Reads {
+                // A raw root may carry the structure VA itself without any
+                // descriptor. Look through the same GPU version that will
+                // be read by the traversal, including its instance records.
+                let mut views = fixed.clone();
+                views.extend(heap.address_candidates(&indexed));
+                let mut untyped = Vec::new();
+                for &at in &pointers {
+                    if at < 1 << 32 || views.iter().any(|v| v.at == at) {
+                        continue;
+                    }
+                    if m.structure_at(at).is_some() {
+                        views.push(ViewSpan { at, bytes: None });
+                    } else if crate::texture::committed_by_query(at as *const u8, 8) {
+                        untyped.push(at);
+                    }
                 }
-                let canonical = m.structure_at(at).unwrap_or(at);
-                if use_ == Use::Reads && !m.published_range(canonical) {
+                drop(guard);
+                for at in untyped {
+                    let bytes = if at % 256 == 0 && discover_words(&[at])?.first()? & 0xffff == 6 {
+                        None
+                    } else {
+                        let len = crate::shadow::in_buffer(at, 1).map(|(base, len)| len - (at - base))
+                            .or_else(|| crate::shadow::mapped_root_bytes(at))?;
+                        Some(len)
+                    };
+                    views.push(ViewSpan { at, bytes });
+                }
+                reserve_trace_views(views)?;
+                guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+            } else if let Use::SizeQuery { source, destination } = use_ {
+                let source_base = m.structure_at(source)?;
+                if !m.published_range(source_base) || !m.reserve(source, m.structures[&source_base].size, false)
+                    || !m.reserve(destination, 8, true) {
                     return None;
                 }
-                if let Some(s) = m.structures.get(&canonical) {
-                    let len = s.size;
-                    if !m.reserve(at, len, false) {
-                        return None;
+            } else {
+                for &at in &pointers {
+                    if !(1 << 32..1 << 37).contains(&at) {
+                        continue;
                     }
-                } else {
-                    m.ready(at, 1);
+                    let canonical = m.structure_at(at).unwrap_or(at);
+                    if let Some(s) = m.structures.get(&canonical) {
+                        if !m.reserve(at, s.size, false) {
+                            return None;
+                        }
+                    } else {
+                        m.ready(at, 1);
+                    }
                 }
             }
+            let m = guard.as_mut()?;
             m.descriptors(&heap)?;
             Some(
                 std::iter::once(m.directory.1.clone())

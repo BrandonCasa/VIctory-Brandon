@@ -54,6 +54,40 @@ impl Module {
         (self.int_value(mode)? & 1 != 0).then(|| (mode, self.guest_barriers.contains(&i)))
     }
 
+    /// A branch can separate threads only until their next common group
+    /// wait. Propagate the first reachable wait (or return) backwards.
+    /// A loop with no wait may take different numbers of trips safely.
+    pub(crate) fn has_divergent_meeting(&self) -> bool {
+        let exit = self.blocks.len();
+        let mut first = vec![None; exit];
+        let mut predecessors = vec![Vec::new(); exit];
+        let mut ready = Vec::new();
+        for (b, block) in self.blocks.iter().enumerate() {
+            for &to in successors(block.term).iter() {
+                predecessors[to].push(b);
+            }
+            if block.body.iter().any(|&i| self.exchange_barrier(i).is_some()) {
+                first[b] = Some(b);
+                ready.push(b);
+            } else if matches!(block.term, Some(Term::Ret)) {
+                first[b] = Some(exit);
+                ready.push(b);
+            }
+        }
+        while let Some(b) = ready.pop() {
+            for &from in &predecessors[b] {
+                // The wait in this block is its first wait, whatever follows.
+                if first[from].is_none() {
+                    first[from] = first[b];
+                    ready.push(from);
+                }
+            }
+        }
+        self.blocks.iter().any(|b| {
+            matches!(b.term, Some(Term::CondBr(_, a, z)) if first[a] != first[z])
+        })
+    }
+
     /// DXIL resource handles and pointers cannot be carried by a generated
     /// phi. Rematerialize a pure handle or address from its scalar inputs.
     fn rematerializable(&self, i: usize) -> bool {

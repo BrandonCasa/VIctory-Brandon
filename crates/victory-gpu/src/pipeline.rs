@@ -118,7 +118,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
-                ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                ambient: (stage == "compute" && crate::ambient::on()).then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 probe: crate::lightprobe::on().then(|| crate::lightprobe::role(bytes)).flatten(),
                 #[cfg(windows)]
@@ -292,48 +292,6 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     })
 }
 
-/// The compute pipelines of the console's ray-tracing structure builder
-/// (`XboxBvhBuilder.dll`; its programs are the ones with a spilled
-/// user-data table) run **all or none**. Its stages feed each other
-/// through memory: a stage that runs on what a dropped stage never wrote
-/// computes its store offsets from garbage. The structures lie in plain
-/// title memory, between the title's own objects, and a root view has no
-/// size, so those stores land on the neighbours (run 98, with 14 of 35
-/// stages translated: the title died within a second of the first builder
-/// submission, on pointers that had become bounding-box bit patterns).
-///
-/// So a builder dispatch runs only while every builder pipeline the title
-/// has created has a host pipeline; the first builder dispatch makes them
-/// all on the spot instead of over the next frames (a stage "still being
-/// made" would be a dropped stage). While one cannot be made the builder
-/// is off; it is looked at again when the title creates another. A stage
-/// that could not be bound stops the stages after it for the rest of that
-/// frame and the next ([`builder_rests`]); it turned the builder off for the
-/// rest of the run at first.
-///
-/// shortcut: and only with `VICTORY_BVH_BUILDER=1`, until a run has shown
-/// the whole builder and the host side of title memory by address
-/// (`memory.rs`) working on a card; nothing reads the structures before
-/// the programs that walk them translate.
-#[cfg(windows)]
-struct Builder {
-    pipelines: Vec<Arc<make::Pending>>,
-    /// Every one of `pipelines` has a host pipeline.
-    whole: bool,
-    /// One could not be made, of so many (0: none).
-    off: usize,
-    /// No stage runs before this frame.
-    rests: u64,
-}
-
-#[cfg(windows)]
-static BUILDER: Mutex<Builder> = Mutex::new(Builder {
-    pipelines: Vec::new(),
-    whole: false,
-    off: 0,
-    rests: 0,
-});
-
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
@@ -370,68 +328,10 @@ pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
 }
 
-/// A stage of the builder was dropped after all: none runs for the rest of
-/// this frame and the next (what it fed is not there).
-#[cfg(windows)]
-pub(crate) fn builder_rests(why: &'static str) {
-    let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    b.rests = crate::frame::current() + 2;
-    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
-        tracing::warn!(why, "the ray-tracing structure builder rests for this frame and the next: its stages run all or none");
-    }
-}
-
 #[cfg(windows)]
 pub(crate) fn builder_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
-}
-
-/// At a dispatch of a builder pipeline: whether the builder runs (see
-/// [`Builder`]).
-#[cfg(windows)]
-pub(crate) fn builder_runs() -> bool {
-    if !builder_enabled() {
-        return false;
-    }
-    let pipelines = {
-        let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-        if b.off == b.pipelines.len() || crate::frame::current() < b.rests {
-            return false;
-        }
-        if b.whole {
-            return true;
-        }
-        b.pipelines.clone()
-    };
-    let missing: Vec<_> = pipelines
-        .iter()
-        .filter(|p| !make::now(p))
-        .map(|p| make::hashes(p))
-        .collect();
-    let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    if b.pipelines.len() != pipelines.len() {
-        drop(b);
-        return builder_runs();
-    }
-    if !missing.is_empty() {
-        b.off = b.pipelines.len();
-        tracing::warn!(
-            missing = missing.len(),
-            of = b.pipelines.len(),
-            which = ?missing,
-            "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
-        );
-        return false;
-    }
-    b.off = 0;
-    tracing::info!(
-        pipelines = b.pipelines.len(),
-        "the ray-tracing structure builder runs: all of its programs have host pipelines"
-    );
-    b.whole = true;
-    true
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "0"))
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,
@@ -494,7 +394,7 @@ struct Pipeline {
     host: Arc<make::Pending>,
     #[cfg(windows)]
     topology_variant: OnceLock<Option<Arc<make::Pending>>>,
-    /// One of the ray-tracing structure builder's ([`Builder`]).
+    /// One of the ray-tracing structure builder's pipelines.
     #[cfg(windows)]
     builder: bool,
 }
@@ -740,15 +640,6 @@ fn hand_out(
     make::early(&host);
     #[cfg(windows)]
     let builder = of_builder(&shaders);
-    #[cfg(windows)]
-    if builder {
-        // Another stage: the group is looked at again at its next dispatch.
-        let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-        if !b.pipelines.iter().any(|p| Arc::ptr_eq(p, &host)) {
-            b.pipelines.push(host.clone());
-            b.whole = false;
-        }
-    }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],

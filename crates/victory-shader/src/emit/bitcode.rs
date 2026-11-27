@@ -8,9 +8,7 @@
 use std::collections::HashMap;
 
 pub mod census;
-pub mod census;
 mod cooperative;
-pub mod census;
 pub mod opt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -327,6 +325,52 @@ impl Module {
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    /// Possible byte positions in a dword. Only facts established by the
+    /// emitted integer address arithmetic can justify a one-dword store.
+    pub fn byte_positions(&self, value: V, depth: u8) -> u8 {
+        const ALL: u8 = 0b1111;
+        if let Some(n) = self.int_value(value) {
+            return 1 << (n & 3);
+        }
+        let V::Inst(id) = value else { return ALL };
+        let inst = &self.insts[id as usize];
+        if depth == 0 || self.types[inst.ty.0 as usize] != TypeDef::Int(32) {
+            return ALL;
+        }
+        let positions = |v| self.byte_positions(v, depth - 1);
+        match inst.op {
+            Op::Select(_, a, b) => positions(a) | positions(b),
+            Op::Bin(Bin::Shl, a, b) => match self.int_value(b) {
+                Some(0) => positions(a),
+                Some(1) => 0b0101,
+                Some(2..=31) => 1,
+                _ => ALL,
+            },
+            Op::Bin(op @ (Bin::Add | Bin::Sub | Bin::Mul | Bin::And | Bin::Or | Bin::Xor), a, b) => {
+                let (a, b) = (positions(a), positions(b));
+                let mut possible = 0;
+                for x in 0..4u8 {
+                    for y in 0..4u8 {
+                        if (a >> x) & (b >> y) & 1 != 0 {
+                            let result = match op {
+                                Bin::Add => x + y,
+                                Bin::Sub => x.wrapping_sub(y),
+                                Bin::Mul => x * y,
+                                Bin::And => x & y,
+                                Bin::Or => x | y,
+                                Bin::Xor => x ^ y,
+                                _ => unreachable!(),
+                            };
+                            possible |= 1 << (result & 3);
+                        }
+                    }
+                }
+                possible
+            }
+            _ => ALL,
         }
     }
 

@@ -260,16 +260,16 @@ pub fn run(
         if let Some(name) = host.adapter_name() {
             println!("pipeline adapter: {name}");
         }
-        host.translation_caps()
+        host.translation_wave_caps()
     } else {
         None
     };
     // Without VICTORY_HOST_WAVE / VICTORY_HOST_MAX_WAVE (`wave`, set per
     // worker), translate as for the adapter the pipelines are made on.
     if wave.is_none()
-        && let Some((lanes, _)) = host_caps
+        && let Some(((min, max), _)) = host_caps
     {
-        victory_shader::emit::set_host_max_wave(lanes);
+        victory_shader::emit::set_host_wave_range(min, max);
     }
     // `VICTORY_HOST_RDNA=1`: as for an AMD RDNA card (`VICTORY_RDNA_FLOAT`).
     victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").map_or_else(

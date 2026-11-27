@@ -295,7 +295,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
-/// into lists (`crate::queue::cuts`). On the console the queue runs the
+/// into native lists. On the console the queue runs the
 /// list up to the wait, stands there until the value is in memory, and
 /// runs on; the list's bottom-of-pipe writes before the wait are done by
 /// then, and other queues may be waiting for exactly those. So the
@@ -327,12 +327,7 @@ fn cut(this: This, wait: Option<ValueWait>) {
         return;
     }
     let Some(fresh) = fresh_list() else {
-        // shortcut: without a new host list the wait stands before the part
-        // it was recorded in.
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!("no host list for the part after a wait: the wait moves to the part's start"));
-        if wait.is_none() { current.refused_pipeline(0); }
-        list.gate.extend(wait);
+        current.refused_command(0, "cannot allocate a command list at a required ordering boundary");
         return;
     };
     current.close();
@@ -616,11 +611,6 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         return E_INVALIDARG;
     }
     let _called = crate::timeline::span("the title's list Reset");
-    // A wait recorded and never submitted goes with the recording.
-    VALUE_WAITS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|&(list, _)| list != this as usize);
     // Every submission of the list has run (submissions are waited for).
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
@@ -803,14 +793,21 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
 /// A copy of title memory that `list` records: on the card at its place in
 /// the list ([`crate::host::HostList::place_copy`]), or at submission.
 #[cfg(windows)]
-fn buffer_copy(this: This, list: &crate::host::HostList, to: *mut u8, from: *const u8, len: usize) {
-    if len == 0 {
-        return;
+fn buffer_copy(this: This, to: *mut u8, from: *const u8, len: usize) {
+    if len == 0 { return; }
+    let descriptors = crate::descriptor::in_shader_heap(to as usize, len);
+    if descriptors {
+        cut(this, None);
     }
+    let Some(list) = host_list(this) else { return; };
     if list.place_copy(to as usize, from as usize, len) {
         with_state(this, |_, state| state.copied());
     } else {
         list.defer_copy(to, from, len);
+    }
+    if descriptors {
+        list.descriptor_write_boundary();
+        cut(this, None);
     }
 }
 
@@ -824,11 +821,10 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && let Some(to) = buffer_range(dst, dst_offset, len)
+    if let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        buffer_copy(this, list, to, from, len as usize);
+        buffer_copy(this, to, from, len as usize);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
@@ -837,7 +833,7 @@ extern "system" fn copy_buffer_region(
 #[cfg(windows)]
 fn texture_copy_finished(this: This, list: &crate::host::HostList, resource: This) {
     if crate::resource::title_fills(resource) {
-        list.texture_written(resource);
+        list.texture_written(resource, None, false);
         if list.take_texture_boundary() {
             cut(this, None);
         }
@@ -924,7 +920,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            buffer_copy(this, list, to, from, a.min(b) as usize);
+            buffer_copy(this, to, from, a.min(b) as usize);
         }
     }
     #[cfg(not(windows))]
@@ -1377,23 +1373,8 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && dst != 0
-        && src != 0
-    {
-        let len = len as usize;
-        if list.place_copy(dst as usize, src as usize, len) {
-            with_state(this, |_, state| state.copied());
-            return;
-        }
-        list.defer(move || {
-            if crate::texture::committed(src as *const u8, len)
-                && crate::texture::committed(dst as *const u8, len)
-            {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
-            }
-        });
+    if dst != 0 && src != 0 {
+        buffer_copy(this, dst as *mut u8, src as *const u8, len as usize);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);
@@ -1931,9 +1912,8 @@ pub(crate) struct ValueWait {
 
 impl ValueWait {
     /// Whether the memory holds what is waited for now.
-    /// shortcut: the comparison codes are taken to be the comparison
-    /// functions' (1 never .. 8 always, value against reference); one not
-    /// known counts as met, and so does memory that is not mapped.
+    /// Compare the memory value to the reference (1 never .. 8 always).
+    /// A missing page cannot satisfy a conditional wait.
     ///
     /// The value is read through the kernel, which reports memory that is
     /// not there instead of faulting (as the copies of title memory are
@@ -1960,21 +1940,28 @@ impl ValueWait {
         met
     }
 
+    #[cfg(not(windows))]
     fn holds(&self) -> bool {
+        self.comparison == 8
+    }
+
+    #[cfg(windows)]
+    fn holds(&self) -> bool {
+        if self.comparison == 8 { return true; }
         let bytes = if self.wide { 8 } else { 4 };
         if self.address == 0 {
-            return true;
+            return false;
         }
         static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *ASK.get_or_init(|| std::env::var_os("VICTORY_WAIT_ASK").is_some_and(|v| v == "1"))
             && !crate::texture::committed(self.address as *const u8, bytes)
         {
-            return true;
+            return false;
         }
         // The low `bytes` bytes; the rest stays zero.
         let mut raw = [0u8; 8];
         if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
-            return true;
+            return false;
         }
         self.holds_for(u64::from_le_bytes(raw))
     }
@@ -2001,53 +1988,10 @@ impl ValueWait {
             5 => value > reference,
             6 => value != reference,
             7 => value >= reference,
-            _ => true,
+            8 => true,
+            _ => false,
         }
     }
-}
-
-/// The waits lists recorded since their last reset, by list.
-static VALUE_WAITS: std::sync::Mutex<Vec<(usize, ValueWait)>> = std::sync::Mutex::new(Vec::new());
-
-/// The waits of the submitted `lists` that are not met yet (taken from
-/// them): what the console's GPU would stop at. The title orders work
-/// between its queues this way (the title: the compute queue's
-/// lighting passes wait for a value the graphics queue's depth pass writes
-/// at the bottom of the pipe; run at once, they read a cleared depth
-/// buffer and nothing was lit).
-/// shortcut: a wait holds its whole list (and submission) back, not only
-/// the commands after it.
-pub(crate) fn unmet_waits(lists: &[This]) -> Vec<ValueWait> {
-    let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut unmet = Vec::new();
-    waits.retain(|&(list, wait)| {
-        if !lists.iter().any(|&l| l as usize == list) {
-            return true;
-        }
-        if !wait.met() {
-            unmet.push(wait);
-        }
-        false
-    });
-    unmet
-}
-
-/// The waits each of the submitted `lists` recorded (taken from them),
-/// met or not, at the list's first place in the submission.
-#[cfg(windows)]
-pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
-    let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut by = vec![Vec::new(); lists.len()];
-    waits.retain(|&(list, wait)| {
-        match lists.iter().position(|&l| l as usize == list) {
-            Some(i) => {
-                by[i].push(wait);
-                false
-            }
-            None => true,
-        }
-    });
-    by
 }
 
 fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: bool) {
@@ -2079,14 +2023,9 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
     }
     // The list is cut here, and the wait stands before what follows.
     #[cfg(windows)]
-    if crate::queue::cuts() {
-        cut(this, Some(wait));
-        return;
-    }
-    VALUE_WAITS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((this as usize, wait));
+    cut(this, Some(wait));
+    #[cfg(not(windows))]
+    let _ = this;
 }
 extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64) {
     wait_for(this, address, comparison, reference, false);
@@ -2170,7 +2109,6 @@ fn value_written(this: This, address: u64, value: u64) {
         }
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_CUT_WRITES").is_some_and(|v| v == "1"))
-            || !crate::queue::cuts()
         {
             return;
         }
@@ -2208,6 +2146,10 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     #[cfg(windows)]
     if let Some(list) = host_list(this) {
         list.defer_write(address as *mut u8, what, bytes);
+        if crate::descriptor::in_shader_heap(address as usize, bytes) {
+            list.descriptor_write_boundary();
+            cut(this, None);
+        }
         return;
     }
     let _ = this;

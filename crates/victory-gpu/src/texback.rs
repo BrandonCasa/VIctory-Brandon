@@ -66,6 +66,32 @@ struct Ticket {
     valid: AtomicBool,
 }
 
+// Only fully landed host textures can vouch for an arbitrary overlapping
+// view. Tickets also invalidate the proof on title release or backing remap.
+static PUBLISHED: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, Arc<Ticket>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+static GPU_WRITTEN: std::sync::LazyLock<Mutex<std::collections::HashSet<usize>>> =
+    std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn written(owner: usize) {
+    GPU_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).insert(owner);
+    PUBLISHED.lock().unwrap_or_else(|e| e.into_inner()).remove(&owner);
+}
+
+pub(crate) fn available(owner: usize, lo: usize, hi: usize) -> bool {
+    if !GPU_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).contains(&owner) { return true; }
+    PUBLISHED.lock().unwrap_or_else(|e| e.into_inner()).get(&owner)
+        .is_some_and(|t| t.valid.load(Ordering::Acquire) && t.at <= lo && hi <= t.end)
+}
+
+fn publish(back: &Back) {
+    if back.level0 == 0 && back.parts.len() == back.shape.footprints.len() {
+        PUBLISHED.lock().unwrap_or_else(|e| e.into_inner())
+            .insert(back.ticket.owner, back.ticket.clone());
+    }
+}
+
 static TICKETS: Mutex<Vec<Weak<Ticket>>> = Mutex::new(Vec::new());
 static TRACKING: AtomicBool = AtomicBool::new(false);
 
@@ -92,6 +118,8 @@ fn invalidate(matches: impl Fn(&Ticket) -> bool) {
 }
 
 pub(crate) fn released(owner: usize) {
+    GPU_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).remove(&owner);
+    PUBLISHED.lock().unwrap_or_else(|e| e.into_inner()).remove(&owner);
     invalidate(|ticket| ticket.owner == owner);
 }
 
@@ -106,19 +134,31 @@ pub(crate) fn remapped(at: usize, len: usize) {
 
 pub(crate) struct Target {
     pub(crate) copy: Arc<crate::resource::HostTexture>,
+    ranges: Option<Vec<crate::texture::ViewRange>>,
     layout: victory_formats::texture::Layout,
     ticket: Arc<Ticket>,
 }
 
 impl Target {
-    pub(crate) fn new(resource: This) -> Option<Self> {
+    pub(crate) fn new(resource: This, range: Option<crate::texture::ViewRange>) -> Option<Self> {
         // Keep the host copy independently of the title's resource lifetime.
         let copy = crate::resource::host_copy(resource)?;
         let _mapping = crate::watch::title_memory_reading();
         let (layout, at, size) = crate::resource::title_texture(resource)?;
         let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
+        if crate::resource::stands_in(resource) || layout.desc.samples > 1 || layout.desc.swizzle.xor() {
+            return None;
+        }
         let ticket = track(resource as usize, at, end);
-        Some(Self { copy, layout, ticket })
+        Some(Self { copy, layout, ticket, ranges: range.map(|r| vec![r]) })
+    }
+
+    pub(crate) fn include(&mut self, range: Option<crate::texture::ViewRange>) {
+        match (&mut self.ranges, range) {
+            (_, None) => self.ranges = None,
+            (Some(ranges), Some(r)) if !ranges.contains(&r) => ranges.push(r),
+            _ => {}
+        }
     }
 
     pub(crate) fn owner(&self) -> usize { self.ticket.owner }
@@ -130,6 +170,8 @@ pub(crate) struct Back {
     shape: Arc<Footprints>,
     dense: Option<usize>,
     mips: u32,
+    level0: u32,
+    parts: Vec<usize>,
     layout: victory_formats::texture::Layout,
     ticket: Arc<Ticket>,
 }
@@ -263,7 +305,14 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
         && row * u64::from(mip.height) == guest.size
         && guest.size == (target.ticket.end - target.ticket.at) as u64)
         .then_some(f.Offset as usize);
-    for (i, footprint) in shape.footprints.iter().enumerate() {
+    let level0 = target.copy.base;
+    let parts: Vec<_> = (0..subresources as usize).filter(|&i| {
+        let (mip, slice) = (level0 + i as u32 % mips, i as u32 / mips);
+        target.ranges.as_ref().is_none_or(|ranges| ranges.iter().any(|r| r.includes(mip, slice)))
+    }).collect();
+    if parts.is_empty() { return None; }
+    for &i in &parts {
+        let footprint = &shape.footprints[i];
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
             pResource: unsafe { std::mem::transmute_copy(&*buffer) },
@@ -284,6 +333,8 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
         shape,
         dense,
         mips,
+        level0,
+        parts,
         layout: target.layout,
         ticket: target.ticket,
     })
@@ -308,6 +359,7 @@ pub(crate) fn land(back: &Back) {
     // SAFETY: our read-back buffer, written by the list that has run.
     unsafe {
         if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+            crate::host::refuse_frame(format_args!("texture readback could not map completed bytes for {at:#x}"));
             return;
         }
     }
@@ -322,23 +374,43 @@ pub(crate) fn land(back: &Back) {
             }
         }
         crate::inplace::notify_texture_write(at, size);
+        publish(back);
         COPIED.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    // Read the slabs shared with other levels (notably the packed tail)
+    // before replacing only the shader-addressable subresources.
+    let parts = back.parts.iter().map(|&i| (i, back.level0 + i as u32 % back.mips, i as u32 / back.mips));
+    let mut spans = Vec::new();
+    for (_, mip, slice) in parts.clone() {
+        let Some(runs) = back.layout.subresource_runs(mip, slice) else {
+            unsafe { back.buffer.Unmap(0, None) };
+            crate::host::refuse_frame(format_args!("unknown readback layout at {at:#x}, mip {mip}, slice {slice}"));
+            return;
+        };
+        spans.extend(runs);
+    }
+    spans.sort_unstable_by_key(|r| (r.start, r.end));
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    for span in spans {
+        if let Some(last) = merged.last_mut() && span.start <= last.end {
+            last.end = last.end.max(span.end);
+        } else {
+            merged.push(span);
+        }
+    }
     let mut tiled = vec![0u8; size];
-    if !crate::host::read_into(at as *const u8, &mut tiled) {
-        unsafe { back.buffer.Unmap(0, None) };
-        return;
+    for span in &merged {
+        if !crate::host::read_into((at + span.start) as *const u8, &mut tiled[span.clone()]) {
+            unsafe { back.buffer.Unmap(0, None) };
+            crate::host::refuse_frame(format_args!("could not preserve texture backing at {:#x}", at + span.start));
+            return;
+        }
     }
     let mut conversion = back.layout.conversion();
-    for (i, (footprint, &rows)) in back
-        .shape
-        .footprints
-        .iter()
-        .zip(&back.shape.rows)
-        .enumerate()
-    {
-        let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
+    for (i, mip, slice) in parts {
+        let footprint = &back.shape.footprints[i];
+        let rows = back.shape.rows[i];
         let f = footprint.Footprint;
         let pitch = f.RowPitch as usize;
         let len = (pitch * rows as usize * f.Depth as usize)
@@ -346,20 +418,20 @@ pub(crate) fn land(back: &Back) {
         // SAFETY: the subresource's part of the mapped buffer.
         let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
         if let Err(e) = conversion.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
-            // SAFETY: mapped above.
             unsafe { back.buffer.Unmap(0, None) };
+            crate::host::refuse_frame(format_args!("could not retile mip {mip}, slice {slice} at {at:#x} ({e:?})"));
             return;
         }
     }
-    // SAFETY: mapped above.
     unsafe { back.buffer.Unmap(0, None) };
-    if !crate::host::write_mapped_exact(at, tiled.as_ptr(), size) {
-        crate::host::refuse_frame(format_args!("texture readback could not write {at:#x}"));
-        return;
+    for span in merged {
+        if !crate::host::write_mapped_exact(at + span.start, tiled[span.clone()].as_ptr(), span.len()) {
+            crate::host::refuse_frame(format_args!("texture readback could not write {:#x}", at + span.start));
+            return;
+        }
+        crate::inplace::notify_texture_write(at + span.start, span.len());
     }
-    crate::inplace::notify_texture_write(at, size);
+    publish(back);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
         tracing::info!(copied, bytes = size, "texture readback landed");

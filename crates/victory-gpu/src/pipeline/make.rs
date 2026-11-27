@@ -360,12 +360,6 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
-/// The hashes of the shaders `p` is made of.
-pub(crate) fn hashes(p: &Pending) -> String {
-    let hashes: Vec<&str> = p.shaders.iter().map(|s| s.hash.as_str()).collect();
-    hashes.join("+")
-}
-
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
@@ -428,10 +422,6 @@ fn demand(p: &Pending) {
         super::known::note(p.key(), &p.shaders, p.graphics.as_deref());
         super::library::note_used(&p.key);
     }
-}
-
-pub(crate) fn now(p: &Arc<Pending>) -> bool {
-    completed(p).is_some()
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier

@@ -57,7 +57,7 @@ pub(super) trait Work: Send {
     type Ask;
     fn ask(&self) -> Option<Self::Ask>;
     fn met(ask: &Self::Ask) -> bool;
-    /// Whether it is a present: everything before it goes first, met or not.
+    /// Whether it is a present: everything before it goes first.
     fn shows(&self) -> bool;
     /// Whether it is a submission.
     fn runs(&self) -> bool;
@@ -82,8 +82,8 @@ pub(super) trait Work: Send {
     {
         Err(next)
     }
-    /// Does it. `forced`: its wait was not met.
-    fn go(self, forced: bool);
+    /// Runs the ready entry.
+    fn go(self);
     /// Renderer port #7 (`crate::port_journal`, from renderer patch #4): a mark taken when an entry is
     /// put in the line (by the thread that puts it, before the line's lock):
     /// the round of the heaps' records begun after that. 0: none.
@@ -143,6 +143,7 @@ impl<W> State<W> {
     }
 
     fn raise(&mut self, queue: usize, mark: u64) {
+        if mark == 0 { return; }
         match self.floors.iter_mut().find(|f| f.0 == queue) {
             Some(f) => f.1 = f.1.max(mark),
             None => self.floors.push((queue, mark)),
@@ -246,10 +247,11 @@ impl<W: Work> Lane<W> {
         }
     }
 
-    /// Waits until at most `most` presents are in the line.
+    /// Throttle frames while work can advance. A blocked queue may need a
+    /// producer that the submitting title thread has yet to enqueue.
     pub(super) fn wait_presents(&self, most: usize) {
         let mut state = self.lock();
-        while state.presents > most {
+        while state.presents > most && state.served < state.asked {
             state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
@@ -313,41 +315,23 @@ impl<W: Work> Lane<W> {
     fn step(&self, limit: u64) -> bool {
         // Each queue's first entry, oldest first.
         let mut heads: Vec<(u64, usize, Option<W::Ask>, bool)> = Vec::new();
-        // Whether one of them stands for others not known yet.
-        let mut folded = false;
         {
             let state = self.lock();
             for e in state.items.iter().take_while(|e| e.number < limit) {
                 if !heads.iter().any(|h| h.1 == e.queue) {
                     heads.push((e.number, e.queue, e.what.ask(), e.what.shows()));
-                    folded |= e.what.folded();
                 }
             }
         }
         let Some(&(first, ..)) = heads.first() else {
             return false;
         };
-        let ready = heads.iter().find(|(number, _, ask, shows)| match ask {
-            Some(ask) => W::met(ask),
-            // A present comes behind everything given before it.
-            None => !shows || *number == first || !super::forces(),
-        });
-        let (number, forced) = match ready {
-            Some(head) => (head.0, false),
-            None => {
-                // Nothing is free to run. With a present in the line the
-                // oldest goes on regardless: a wait is not kept across
-                // frames (`super::present`). (Not while there is work whose
-                // parts are not known: it may be what is waited for.)
-                if folded {
-                    return false;
-                }
-                let state = self.lock();
-                if !super::forces() || !state.items.iter().any(|e| e.number < limit && e.what.shows()) {
-                    return false;
-                }
-                (first, true)
-            }
+        let Some(&(number, ..)) = heads.iter().find(|(number, _, ask, shows)| {
+            (!shows || *number == first) && ask.as_ref().is_none_or(W::met)
+        }) else {
+            // A later producer on another queue can still become runnable.
+            // Presenting cannot satisfy a fence or complete a translation.
+            return false;
         };
         let mut entry = {
             let mut state = self.lock();
@@ -383,10 +367,11 @@ impl<W: Work> Lane<W> {
         }
         // What follows it in its queue, if that can go with it. (Nobody else
         // takes anything out, and what comes in goes to the end.)
-        while runs > 0 && !forced {
+        while runs > 0 {
             let next = {
                 let mut state = self.lock();
-                let at = state.items.iter().position(|e| e.queue == entry.queue && e.number < limit);
+                let at = state.items.iter().take_while(|e| e.number < limit && !e.what.shows())
+                    .position(|e| e.queue == entry.queue);
                 at.and_then(|at| Some((at, state.items.remove(at)?)))
             };
             let Some((at, next)) = next else {
@@ -424,7 +409,7 @@ impl<W: Work> Lane<W> {
             let floor = self.lock().floor(entry.queue);
             entry.what.marked(mark.max(floor));
         }
-        entry.what.go(forced);
+        entry.what.go();
         {
             let mut state = self.lock();
             state.running = None;
@@ -441,7 +426,7 @@ type Recordings = std::sync::Arc<[std::sync::Arc<crate::list::thin::Recording>]>
 /// What the title's queues put in the line.
 enum Job {
     /// The queue waits for the fence (its address) to reach the value.
-    Wait(usize, u64),
+    Wait(crate::fence::Point),
     /// A part of a submission waits for a memory value.
     Value(crate::list::ValueWait),
     /// A submission, or a part of one: the lists' host sides and the order
@@ -449,18 +434,13 @@ enum Job {
     Run(usize, Vec<crate::list::Detached>, Vec<usize>),
     /// A submission whose lists are being translated ([`crate::list::thin`]):
     /// the parts of it are known when they are.
-    Lists(usize, Recordings),
+    Lists(usize, u32, Recordings),
     /// Parts taken along with a submission ([`crate::host::joins`]): where they
-    /// begin in the order, and the signals given behind them.
-    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(usize, u64)>),
+    /// begin in the execution order.
+    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>),
     /// A signal of the queue's.
-    Signal(usize, u64),
-    /// A frame is shown: the base texture (and optional overlay plane) and the states their lists leave them in.
-    Present(
-        Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
-        Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
-        super::Shown,
-    ),
+    Signal(crate::fence::Point),
+    Present(super::Presentation),
 }
 
 // SAFETY: D3D12 objects are free-threaded; a job is touched by whoever put it
@@ -479,9 +459,9 @@ impl Work for Job {
 
     fn ask(&self) -> Option<Ask> {
         match self {
-            &Job::Wait(fence, value) => Some(Ask::Wait(fence, value)),
+            Job::Wait(point) => Some(Ask::Wait(point.0, point.1)),
             Job::Value(wait) => Some(Ask::Value(*wait)),
-            Job::Lists(_, lists) => Some(Ask::Lists(lists.clone())),
+            Job::Lists(_, _, lists) => Some(Ask::Lists(lists.clone())),
             _ => None,
         }
     }
@@ -491,11 +471,11 @@ impl Work for Job {
     }
 
     fn unfold(self) -> Vec<Self> {
-        let Job::Lists(queue, recordings) = self else {
+        let Job::Lists(queue, kind, recordings) = self else {
             return vec![self];
         };
         let lists: Vec<This> = recordings.iter().map(|r| r.back()).collect();
-        let jobs = jobs_of(queue as This, &lists);
+        let jobs = jobs_of(queue, kind, &lists);
         // It stood for one submission not begun.
         let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
         QUEUED.fetch_add(runs, Relaxed);
@@ -556,28 +536,17 @@ impl Work for Job {
         if most < 2 {
             return Err(next);
         }
-        // Nothing but waits and signals that a submission may follow.
-        let (count, lists, signals) = match self {
-            Job::Run(_, lists, order) => (1, (&*lists, &*order), &[][..]),
-            Job::Joined(_, lists, order, parts, signals) => (1 + parts.len(), (&*lists, &*order), &signals[..]),
+        // Only adjacent runs may be joined across this queue head.
+        let (count, lists) = match self {
+            Job::Run(_, lists, order) => (1, (&*lists, &*order)),
+            Job::Joined(_, lists, order, parts) => (1 + parts.len(), (&*lists, &*order)),
             _ => return Err(next),
         };
         let hosts = || lists.1.iter().map(|&i| lists.0[i].host());
         match &next {
-            Job::Value(wait) => {
-                let met = wait.met()
-                    || crate::host::late_met_known(wait) == Some(true)
-                    || hosts().any(|list| crate::host::will_meet(list, wait));
-                if !met {
-                    return Err(next);
-                }
-            }
-            &Job::Wait(fence, value) => {
-                if crate::fence::completed(fence as This) < value && !signals.iter().any(|&(f, v)| f == fence && v >= value) {
-                    return Err(next);
-                }
-            }
-            Job::Signal(..) => {}
+            // A signal belongs to this submission's retirement. A following
+            // wait observes that point, including any readback it publishes.
+            Job::Signal(..) | Job::Wait(..) | Job::Value(..) => return Err(next),
             Job::Run(_, more, order) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
                 if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
@@ -586,31 +555,25 @@ impl Work for Job {
             }
             Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
         }
-        let taken = std::mem::replace(self, Job::Wait(0, 0));
-        let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
-            Job::Run(queue, lists, order) => (queue, lists, order, Vec::new(), Vec::new()),
-            Job::Joined(queue, lists, order, parts, signals) => (queue, lists, order, parts, signals),
+        let taken = std::mem::replace(self, Job::Run(0, Vec::new(), Vec::new()));
+        let (queue, mut lists, mut order, mut parts) = match taken {
+            Job::Run(queue, lists, order) => (queue, lists, order, Vec::new()),
+            Job::Joined(queue, lists, order, parts) => (queue, lists, order, parts),
             other => {
                 *self = other;
                 return Err(next);
             }
         };
-        let run = matches!(next, Job::Run(..));
-        match next {
-            Job::Run(_, more, then) => {
-                parts.push(order.len());
-                order.extend(then.into_iter().map(|i| i + lists.len()));
-                lists.extend(more);
-                STATS[JOINED].fetch_add(1, Relaxed);
-            }
-            Job::Signal(fence, value) => signals.push((fence, value)),
-            _ => {}
-        }
-        *self = Job::Joined(queue, lists, order, parts, signals);
-        Ok(run)
+        let Job::Run(_, more, then) = next else { unreachable!() };
+        parts.push(order.len());
+        order.extend(then.into_iter().map(|i| i + lists.len()));
+        lists.extend(more);
+        STATS[JOINED].fetch_add(1, Relaxed);
+        *self = Job::Joined(queue, lists, order, parts);
+        Ok(true)
     }
 
-    fn go(self, forced: bool) {
+    fn go(self) {
         let began = Instant::now();
         let _doing = crate::timeline::span(match self {
             Job::Run(..) => "the line: a submission",
@@ -619,13 +582,6 @@ impl Work for Job {
             Job::Signal(..) => "the line: a signal",
             _ => "the line: a wait that is met",
         });
-        if forced {
-            STATS[FORCED].fetch_add(1, Relaxed);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::Forced, 1);
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("a queue still stood at a wait at a present: it was not met"));
-        }
         match self {
             // (A folded one is unfolded, never done.)
             Job::Wait(..) | Job::Value(..) | Job::Lists(..) => {}
@@ -639,7 +595,7 @@ impl Work for Job {
                 }
                 QUEUED.fetch_sub(1, Relaxed);
             }
-            Job::Joined(queue, lists, order, parts, signals) => {
+            Job::Joined(queue, lists, order, parts) => {
                 let _ = queue;
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || {
@@ -651,29 +607,15 @@ impl Work for Job {
                 }
                 // (A part that had no list is one all the same.)
                 QUEUED.fetch_sub(1 + parts.len() as u64, Relaxed);
-                for (fence, value) in signals {
-                    if !crate::host::late_signal(fence, value) {
-                        crate::fence::set(fence as This, value);
-                    }
+            }
+            Job::Signal(point) => {
+                if !crate::host::late_signal(point.0, point.1) {
+                    point.publish();
                 }
             }
-            Job::Signal(fence, value) => {
-                if !crate::host::late_signal(fence, value) {
-                    crate::fence::set(fence as This, value);
-                }
-            }
-            Job::Present(texture, overlay, shown) => {
-                if let Some((texture, state)) = texture {
-                    // (Where its lists were not translated when the title
-                    // presented: the state they left it in.)
-                    let state = if state == u32::MAX { texture.state.load(Relaxed) } else { state };
-                    let over = overlay.as_ref().map(|(ov, ov_state)| {
-                        let st = if *ov_state == u32::MAX { ov.state.load(Relaxed) } else { *ov_state };
-                        (&ov.texture, st)
-                    });
-                    if !super::show_planes(&texture.texture, state, over, shown) {
-                        tracing::error!(frame = shown.frame, "queued presentation failed");
-                    }
+            Job::Present(present) => {
+                if !present.show() {
+                    tracing::error!(frame = present.shown.frame, "queued presentation failed");
                 }
                 QUEUED.fetch_sub(1, Relaxed);
             }
@@ -693,9 +635,8 @@ static QUEUED: AtomicU64 = AtomicU64::new(0);
 /// Since the last frame-rate line: submissions put in the line, presents, the
 /// times they found things in it (the sum of their numbers) and the most; what
 /// threads of the title waited, in microseconds, for room in the line, at a
-/// present, and for a drain, and the drains; what our thread worked; waits
-/// not met at a present.
-static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// present, and for a drain, and the drains; what our thread worked.
+static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 const RUNS: usize = 0;
 const PRESENTS: usize = 1;
 const DEPTH: usize = 2;
@@ -705,9 +646,8 @@ const AT_PRESENT: usize = 5;
 const DRAINING: usize = 6;
 const DRAINS: usize = 7;
 const BUSY: usize = 8;
-const FORCED: usize = 9;
 /// Parts prepared together with the one before them.
-const JOINED: usize = 10;
+const JOINED: usize = 9;
 
 /// How many submissions may be in the line when a submit call returns
 /// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
@@ -740,7 +680,9 @@ pub(super) fn on() -> bool {
     // Diagnostics: on and off while the title runs (`crate::ab`).
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_ASYNC_SUBMIT") {
-        return on && started();
+        return if on { started() } else {
+            LANE.state.try_lock().map_or(true, |state| state.running.is_some() || !state.items.is_empty())
+        };
     }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -749,10 +691,9 @@ pub(super) fn on() -> bool {
 }
 
 /// The line is about to be left for the way without it: everything in it is
-/// done first. (At a present, by the title's thread that submits.)
+/// sent as far as its waits permit. Pending work keeps the worker selected.
 #[cfg(feature = "diagnostics")]
 pub(super) fn leave() {
-    LANE.wait_presents(0);
     LANE.drain();
 }
 
@@ -760,8 +701,8 @@ pub(super) fn leave() {
 fn started() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        if !crate::host::late_free_present() || !super::cuts() {
-            tracing::warn!("VICTORY_ASYNC_SUBMIT=1 needs the relay and lists cut at their waits: submissions are prepared by the thread that makes them");
+        if !crate::host::late_free_present() {
+            tracing::warn!("VICTORY_ASYNC_SUBMIT=1 needs the relay: submissions are prepared by the thread that makes them");
             return false;
         }
         let worker = || {
@@ -825,7 +766,7 @@ pub(super) fn drain() {
 
 /// A submission of `lists` to queue `this`.
 pub(super) fn submit(this: This, lists: &[This]) {
-    let queue = this as usize;
+    let queue = super::queue(this);
     if crate::list::thin::on() {
         let recordings = crate::list::thin::submitted(lists);
         if recordings.is_empty() {
@@ -834,17 +775,17 @@ pub(super) fn submit(this: This, lists: &[This]) {
         let before = QUEUED.fetch_add(1, Relaxed);
         STATS[DEPTH].fetch_add(before, Relaxed);
         STATS[DEEPEST].fetch_max(before + 1, Relaxed);
-        LANE.push(queue, [Job::Lists(queue, recordings)]);
+        LANE.push(queue.id, [Job::Lists(this as usize, queue.kind, recordings)]);
         room(before + 1);
         return;
     }
-    let jobs = jobs_of(this, lists);
+    let jobs = jobs_of(this as usize, queue.kind, lists);
     let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
     let before = QUEUED.fetch_add(runs, Relaxed);
     STATS[RUNS].fetch_add(runs, Relaxed);
     STATS[DEPTH].fetch_add(before, Relaxed);
     STATS[DEEPEST].fetch_max(before + runs, Relaxed);
-    LANE.push(queue, jobs);
+    LANE.push(queue.id, jobs);
     room(before + runs);
 }
 
@@ -859,8 +800,7 @@ fn room(queued: u64) {
 }
 
 /// What a submission of `lists` is in the line.
-fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
-    let queue = this as usize;
+fn jobs_of(queue: usize, _kind: u32, lists: &[This]) -> Vec<Job> {
     // In one piece up to the first list that waits for a memory value, as
     // `super::submit_cut` runs them; the rest part by part.
     let first = lists.iter().position(|&l| crate::list::cut_list(l)).unwrap_or(lists.len());
@@ -875,7 +815,7 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
             .collect();
         format!(
             "SUBMIT queue kind {} lists {named:?} to the line (the first {first} in one piece)",
-            super::queue(this).kind
+            _kind
         )
     });
     let mut jobs: Vec<Job> = Vec::new();
@@ -896,7 +836,7 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
 /// nothing, behind the flights in the air, or now.
 pub(super) fn signal(this: This, fence: This, value: u64) {
     let fence = fence as usize;
-    LANE.push_behind(this as usize, false, Job::Signal(fence, value), || {
+    LANE.push_behind(super::queue(this).id, false, Job::Signal(crate::fence::Point::new(fence as This, value)), || {
         if !crate::host::late_signal(fence, value) {
             crate::fence::set(fence as This, value);
         }
@@ -907,20 +847,15 @@ pub(super) fn signal(this: This, fence: This, value: u64) {
 /// the fence is there already.
 pub(super) fn wait(this: This, fence: This, value: u64) {
     let always = crate::fence::completed(fence) < value;
-    LANE.push_behind(this as usize, always, Job::Wait(fence as usize, value), || {});
+    LANE.push_behind(super::queue(this).id, always, Job::Wait(crate::fence::Point::new(fence, value)), || {});
 }
 
 /// A present on queue `this` of `texture`, in the state the lists recorded so
 /// far leave it in.
-pub(super) fn present(
-    this: This,
-    texture: Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
-    overlay: Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
-    shown: super::Shown,
-) {
+pub(super) fn present(this: This, present: super::Presentation) {
     QUEUED.fetch_add(1, Relaxed);
     STATS[PRESENTS].fetch_add(1, Relaxed);
-    LANE.push(this as usize, [Job::Present(texture, overlay, shown)]);
+    LANE.push(super::queue(this).id, [Job::Present(present)]);
     let began = Instant::now();
     let _waiting = crate::timeline::span("a present waits for the one before it to be sent");
     LANE.wait_presents(frames_most());
@@ -934,7 +869,7 @@ pub(super) fn line(frames: f64) {
     tracing::info!(
         "submissions prepared by a thread of ours, per frame (VICTORY_ASYNC_SUBMIT): {:.1} in {:.1} presents, {:.1} in the line \
          when one was added (at most {:.0}); that thread worked {:.1} ms; threads of the title waited {:.1} ms for room in the \
-         line, {:.1} ms at presents, {:.1} ms in {:.1} drains; waits not met at a present {:.2}; {:.1} of the \
+         line, {:.1} ms at presents, {:.1} ms in {:.1} drains; {:.1} of the \
          submissions were prepared together with the one before them (VICTORY_JOIN_PARTS)",
         s[RUNS] / frames,
         s[PRESENTS] / frames,
@@ -945,7 +880,6 @@ pub(super) fn line(frames: f64) {
         ms(AT_PRESENT),
         ms(DRAINING),
         s[DRAINS] / frames,
-        s[FORCED] / frames,
         s[JOINED] / frames
     );
 }
@@ -1004,13 +938,9 @@ mod tests {
                 other => Err(other),
             }
         }
-        fn go(self, forced: bool) {
+        fn go(self) {
             match self {
-                T::Wait(..) => {
-                    if forced {
-                        FORCED_HERE.with(|f| f.set(f.get() + 1));
-                    }
-                }
+                T::Wait(..) => {}
                 T::Run(name, log) | T::Present(name, log) => log.lock().unwrap().push(name.into()),
                 T::Slow(name, log, gate) => {
                     let mut open = gate.0.lock().unwrap();
@@ -1048,7 +978,6 @@ mod tests {
     }
 
     thread_local! {
-        static FORCED_HERE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         /// What [`Work::mark_now`] and [`Work::mark_later`] give in a test.
         static NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static LATER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -1154,20 +1083,22 @@ mod tests {
         lane.look(limit);
         assert_eq!(
             *log.lock().unwrap(),
-            ["a+b+c", "other queue+behind a's signal", "d", "held", "present", "next frame"],
+            ["a+b+c", "other queue+behind a's signal", "d"],
             "{:?}",
             lane.lock().items.len()
         );
+        crate::fence::set(f as This, 9);
+        lane.look(limit);
+        assert!(log.lock().unwrap().ends_with(&["held".into(), "present".into(), "next frame".into()]));
         look(&lane);
         assert_eq!(log.lock().unwrap().last().unwrap(), "later");
         let state = lane.lock();
         assert_eq!((state.presents, state.runs, state.items.len()), (0, 0, 0));
     }
 
-    /// A wait that nothing meets holds its queue until a present, which
-    /// comes behind everything given before it and before what comes after.
+    /// A present stays behind earlier producers even when they wait on another queue.
     #[test]
-    fn a_present_goes_behind_everything_before_it_met_or_not() {
+    fn a_present_stays_behind_an_unmet_producer() {
         let lane = Lane::new();
         let log: Log = Default::default();
         let f = fence();
@@ -1180,13 +1111,14 @@ mod tests {
         lane.push(1, [run("next frame")]);
         lane.push(2, [T::Wait(f, 10), run("held again")]);
         look(&lane);
-        assert_eq!(*log.lock().unwrap(), ["draw", "held", "present", "next frame"]);
-        assert_eq!(FORCED_HERE.get(), 1);
+        assert_eq!(*log.lock().unwrap(), ["draw"]);
+        lane.push(3, [T::Signal(f, 9, log.clone())]);
+        look(&lane);
+        assert_eq!(*log.lock().unwrap(), ["draw", "signal 9", "held", "present", "next frame"]);
         // The second wait is met by a signal of the CPU.
         crate::fence::set(f as This, 10);
         look(&lane);
         assert_eq!(log.lock().unwrap().last().unwrap(), "held again");
-        assert_eq!(FORCED_HERE.get(), 1);
         let state = lane.lock();
         assert_eq!((state.presents, state.runs, state.items.len()), (0, 0, 0));
     }

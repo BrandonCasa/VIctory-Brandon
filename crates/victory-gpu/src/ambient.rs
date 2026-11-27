@@ -1,6 +1,6 @@
 //! A stand-in for the indirect light the title traces rays for.
 //!
-//! With the ray-tracing structure builder off (`crate::pipeline::builder_runs`)
+//! With the ray-tracing structure builder off (`crate::pipeline::builder_enabled`)
 //! the title's rays find nothing. Its program that resolves the diffuse light
 //! of its screen probes (`CS_ScreenProbes_TemporalResolve_*`) then leaves the
 //! sky's light outdoors, nothing indoors (walls are black where no lamp or

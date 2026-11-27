@@ -25,7 +25,9 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// must be ready when it runs, not only those its tables name.
 pub const SLOT_STRIDES: u8 = 255;
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
-pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+pub const VIEW_STRIDE_BITS: u32 = (1 << VIEW_PREFIX_SHIFT) - 1;
+/// Dwords between the raw host descriptor start and its guest interval.
+pub const VIEW_PREFIX_SHIFT: u32 = 28;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format
 /// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
 /// (After VIctory 4243a96a.)
@@ -256,6 +258,8 @@ pub(crate) struct Shader {
     pub cmp_samplers: u64,
     /// Root CBVs read, by root parameter index, with their handles.
     pub root_cbvs: Vec<(u8, V)>,
+    /// Byte prefix of a guest raw descriptor, keyed by its annotated DXIL handle.
+    pub raw_prefixes: std::collections::HashMap<V, V>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
@@ -315,6 +319,7 @@ impl Shader {
             samplers: 0,
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
+            raw_prefixes: Default::default(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             flags: 0,
@@ -359,6 +364,23 @@ impl Shader {
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
         let mut all = vec![self.m.i32(opcode)];
         all.extend(args);
+        // DXIL raw loads, stores and atomics use a byte coordinate. Keep the
+        // original operation (including the returned atomic value) on the same
+        // allocation, and leave an overflowing guest offset outside the view.
+        let coordinate = match opcode {
+            139 | 140 | 79 => Some(2),
+            78 => Some(3),
+            _ => None,
+        };
+        if let Some(i) = coordinate
+            && let Some(bias) = args.first().and_then(|h| self.raw_prefixes.get(h)).copied()
+        {
+            let offset = all[i];
+            let biased = self.m.bin(block, super::bitcode::Bin::Add, offset, bias);
+            let wraps = self.m.cmp(block, super::bitcode::pred::IULT, biased, offset);
+            let outside = self.m.i32(u32::MAX & !3);
+            all[i] = self.m.select(block, wraps, outside, biased);
+        }
         self.m.call(block, f, all)
     }
 

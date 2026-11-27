@@ -219,6 +219,10 @@ impl Host {
     /// The maximum wave size and whether the adapter is AMD RDNA, for
     /// offline shader translation followed by host pipeline creation.
     pub fn translation_caps(&self) -> Option<(u32, bool)> {
+        self.translation_wave_caps().map(|((_, max), rdna)| (max, rdna))
+    }
+
+    pub fn translation_wave_caps(&self) -> Option<((u32, u32), bool)> {
         let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
         // SAFETY: a feature structure of the requested type and size.
         unsafe {
@@ -232,7 +236,7 @@ impl Host {
         let rdna = waves.WaveLaneCountMin == 32
             && waves.WaveLaneCountMax == 64
             && adapter_desc(&self.device).is_ok_and(|desc| desc.VendorId == 0x1002);
-        Some((waves.WaveLaneCountMax, rdna))
+        Some(((waves.WaveLaneCountMin, waves.WaveLaneCountMax), rdna))
     }
 
     /// Whether the adapter runs 32-lane waves. A pipeline that declares
@@ -739,7 +743,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
-        indexed_forms: 0,
+        indexed_forms: Default::default(),
         root_indexed_views: Vec::new(),
     }
 }

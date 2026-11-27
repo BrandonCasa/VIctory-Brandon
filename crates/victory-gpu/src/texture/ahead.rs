@@ -63,7 +63,7 @@ impl Job {
             Some(then) => then.push(Box::new(f)),
             None => {
                 drop(then);
-                f();
+                if self.copy.ahead.load(std::sync::atomic::Ordering::Acquire) == DONE { f(); }
             }
         }
     }
@@ -126,9 +126,11 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     let staging = super::staging(resource, &copy, first);
     super::PICKING.set(None);
     let Some(staging) = staging.filter(|s| {
-        !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed)
+        !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed)
     }) else {
-        copy.ahead.store(LISTED, Relaxed);
+        let _way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+        copy.ahead.store(LISTED, std::sync::atomic::Ordering::Release);
+        LANDED.notify_all();
         return turned_down();
     };
     if super::no_wait() && super::fill_unlocked() {
@@ -154,9 +156,8 @@ pub(crate) fn listed(copy: &HostTexture) {
     }
     STATS[5].fetch_add(1, Relaxed);
     let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
-    let started = std::time::Instant::now();
-    while way.iter().any(|(serial, _)| *serial == copy.serial) && started.elapsed().as_millis() < 1000 {
-        way = LANDED.wait_timeout(way, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+    while copy.ahead.load(std::sync::atomic::Ordering::Acquire) == PENDING {
+        way = LANDED.wait(way).unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -231,10 +232,11 @@ impl Worker {
                 }
             }
             value += 1;
-            if let Err(e) = self.copy(&jobs, value) {
+            let result = self.copy(&jobs, value);
+            if let Err(e) = &result {
                 tracing::warn!(error = %e, "uploads ahead did not run");
             }
-            finish(jobs);
+            finish(jobs, result.is_ok());
         }
     }
 
@@ -248,7 +250,7 @@ impl Worker {
             self.allocator.Reset()?;
             self.list.Reset(&self.allocator, None)?;
             for job in jobs {
-                job.record(&self.list);
+                if job.complete() { job.record(&self.list); }
             }
             self.list.Close()?;
             self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
@@ -261,6 +263,12 @@ impl Worker {
 }
 
 impl Job {
+    fn complete(&self) -> bool {
+        let parts = self.staging.parts.lock().unwrap_or_else(|e| e.into_inner());
+        parts.len() == self.staging.footprints.len()
+            && parts.iter().all(|part| matches!(part.content, Some((_, true))))
+    }
+
     /// # Safety
     /// `list` is an open copy list, and the job lives until it has run.
     unsafe fn record(&self, list: &ID3D12GraphicsCommandList) {
@@ -270,7 +278,10 @@ impl Job {
                 // SAFETY: a borrowed pointer the location never releases.
                 pResource: unsafe { std::mem::transmute_copy(texture) },
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: s.first - s.level0 + i as u32 },
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: {
+                    let (mip, slice) = s.part(i);
+                    mip - s.level0 + slice * (s.mips - s.level0)
+                } },
             };
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: as above.
@@ -287,12 +298,19 @@ impl Job {
 }
 
 /// The jobs' copies have run.
-fn finish(jobs: Vec<Arc<Job>>) {
+fn finish(jobs: Vec<Arc<Job>>, succeeded: bool) {
     for job in &jobs {
-        job.staging.uploaded.store(true, Relaxed);
-        job.staging.dirty.store(false, Relaxed);
-        job.staging.note_held();
-        job.copy.ahead.store(DONE, Relaxed);
+        if succeeded && job.complete() {
+            job.staging.uploaded.store(true, Relaxed);
+            job.staging.dirty.store(false, Relaxed);
+            for part in &mut *job.staging.parts.lock().unwrap_or_else(|e| e.into_inner()) {
+                part.dirty = false;
+            }
+            job.staging.note_held();
+            job.copy.ahead.store(DONE, std::sync::atomic::Ordering::Release);
+        } else {
+            job.copy.ahead.store(LISTED, std::sync::atomic::Ordering::Release);
+        }
         BYTES.fetch_sub(job.staging.read as u64, Relaxed);
     }
     {
@@ -317,8 +335,8 @@ fn finish(jobs: Vec<Arc<Job>>) {
             );
         }
         let then = job.then.lock().unwrap_or_else(|e| e.into_inner()).take();
-        for f in then.into_iter().flatten() {
-            f();
+        if job.copy.ahead.load(std::sync::atomic::Ordering::Acquire) == DONE {
+            for f in then.into_iter().flatten() { f(); }
         }
     }
     crate::descriptor::host::flip_now();

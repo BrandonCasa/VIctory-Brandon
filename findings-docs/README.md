@@ -6,25 +6,25 @@ Checkboxes reflect individual findings at the last static review. Check the curr
 
 ## Open work
 
-- [ ] **1.** [Keep draws and dispatches whose pipelines are still compiling](present-retain-plane-crops-color-and-blend-order.md) - Keep dependent submissions and presents behind their producer fences when a present would force an unmet wait.
-- [ ] **2.** [Restore the scene geometry used by lighting rays](lighting-publish-complete-bvh-builds-before-tracing.md) - Failed in-place refits now have a rollback path. Complete first-access coverage (rank 5) before enabling the builder in normal playback.
-- [ ] **3.** [Run the three refused wave64 compute shaders on wave32 GPUs](shader-emulate-wave64-compute-on-wave32.md) - Logical-wave scheduling is in place. Confirm that all three title kernels preserve cross-half lane reads, shared memory and barrier order on wave32.
-- [ ] **5.** [Make every reachable BVH page available on first access](lighting-map-reachable-bvh-pages-before-first-access.md) - Known structures reserve their full range. Resolve the reachable range for untracked trace addresses that still fall back to one page.
-- [ ] **8.** [Publish the compacted BVH size before the game allocates its destination](lighting-publish-compacted-bvh-size-at-guest-completion.md) - The query now reads back its exact eight bytes before guest completion. Bound the compaction write to its destination allocation when no buffer object supplies that extent.
-- [ ] **10.** [Track which physical bytes back each streamed texture subresource](texture-track-subresource-backing-across-remaps.md) - Staging tracks backing changes per mip and slice. Carry that readiness through indexed descriptor publication so a remap preserves the view’s original mip and layer.
-- [ ] **11.** [Make texture writes visible through every alias](texture-publish-writes-across-backing-aliases.md) - Each heap consumes write notifications. Order the first indexed read after an alias write, including when the GPU owns the latest bytes.
-- [ ] **12.** [Give placed texture UAVs and their readers the same backing](texture-share-placed-uav-writes-with-alias-readers.md) - Compatible placed UAVs resolve to writable textures. Preserve exact bytes across overlapping views that need a different format or storage layout.
-- [ ] **13.** [Map the entire guest descriptor heap to valid host slots](bindless-map-full-guest-view-heap-to-host-slots.md) - Pending slots are filtered by descriptor type. Narrow same-type candidates to the slots a draw can reach when the resident arena fills.
-- [ ] **14.** [Use the title's probe resolve for final diffuse lighting](lighting-use-title-probe-resolve-for-diffuse-light.md) - The stock playback profile still requests the ambient estimate. Use the title’s resolve once tracing and placed-UAV publication are ready (ranks 2 and 12).
-- [ ] **15.** [Read the exact bytes of unaligned constant buffers](draw-bind-exact-bytes-for-unaligned-cbvs.md) - Unaligned CBVs have raw-view and ordered-copy paths. Preserve the accessible range for root CBVs whose source extends beyond the 64 KiB cap.
-- [ ] **16.** [Preserve buffer views that start between host elements](bindless-preserve-byte-offsets-in-buffer-views.md) - Ordered reads can copy from a preceding writer. Handle overlapping writable views whose byte offsets cannot be represented by native element-aligned descriptors.
+- [ ] **10.** [Track which physical bytes back each streamed texture subresource](texture-track-subresource-backing-across-remaps.md) - A streamed depth/stencil upload still needs the title's XOR address permutation for both planes. The recorded format-19 surface uses mode 24 (64KB_Z_X), and the imported xg_xs.dll implementation is unavailable.
+- [ ] **11.** [Make texture writes visible through every alias](texture-publish-writes-across-backing-aliases.md) - A partial overlap with a GPU-written target still needs a compatible native copy or a complete, ordered readback. The reader is refused when neither supplies its bytes.
+- [ ] **12.** [Give placed texture UAVs and their readers the same backing](texture-share-placed-uav-writes-with-alias-readers.md) - Incompatible typed UAVs used together still lack coherent storage. CPU readback also lacks the title's pipe/bank permutation for XOR-tiled surfaces.
+- [ ] **13.** [Map the entire guest descriptor heap to valid host slots](bindless-map-full-guest-view-heap-to-host-slots.md) - The wind-field compute shader fetches an unmasked heap index from a CBV. When its same-type candidates exceed the host arena, the runtime cannot establish a smaller resident set before dispatch.
+- [ ] **16.** [Preserve buffer views that start between host elements](bindless-preserve-byte-offsets-in-buffer-views.md) - Sub-element typed UAV starts, counter-bearing aliases and unaligned atomics still lack a byte-exact writable representation on the original backing.
 
 ## Implemented and closed findings
 
+- [x] **1.** [Keep draws and dispatches whose pipelines are still compiling](present-retain-plane-crops-color-and-blend-order.md)
+- [x] **2.** [Restore the scene geometry used by lighting rays](lighting-publish-complete-bvh-builds-before-tracing.md)
+- [x] **3.** [Run the three refused wave64 compute shaders on wave32 GPUs](shader-emulate-wave64-compute-on-wave32.md)
 - [x] **4.** [Use the same descriptor address for memory preparation and shader binding](draw-snapshot-descriptor-addresses-per-stage-bind.md)
+- [x] **5.** [Make every reachable BVH page available on first access](lighting-map-reachable-bvh-pages-before-first-access.md)
 - [x] **6.** [Publish streamed BVH bytes and their page-directory entries together](memory-publish-bvh-landing-writes-in-command-order.md)
 - [x] **7.** [Keep refresh planning on the correct side of each BVH upload](submit-order-refreshes-around-bvh-landing-writes.md)
+- [x] **8.** [Publish the compacted BVH size before the game allocates its destination](lighting-publish-compacted-bvh-size-at-guest-completion.md)
 - [x] **9.** [Decode the archive builder's zlib swizzle modes](dstorage-decode-zlib-archive-swizzle-modes.md)
+- [x] **14.** [Use the title's probe resolve for final diffuse lighting](lighting-use-title-probe-resolve-for-diffuse-light.md)
+- [x] **15.** [Read the exact bytes of unaligned constant buffers](draw-bind-exact-bytes-for-unaligned-cbvs.md)
 - [x] **17.** [Complete rectangles after the original three vertex invocations](draw-complete-rectangles-after-vertex-shading.md)
 - [x] **18.** [Upload the Bink slot and plane that finished decoding](texture-upload-completed-bink-frame-planes.md)
 - [x] **19.** [Accept live DirectStorage page lists at Submit](dstorage-honor-submit-boundary-for-live-page-lists.md)

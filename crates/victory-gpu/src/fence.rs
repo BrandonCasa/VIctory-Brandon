@@ -126,6 +126,29 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     waiters.push((value, event as usize));
     S_OK
 }
+/// Keep a queued fence alive through its last wait or notification.
+#[cfg(windows)]
+pub(crate) struct Point(pub(crate) usize, pub(crate) u64);
+
+#[cfg(windows)]
+impl Point {
+    pub(crate) fn new(fence: This, value: u64) -> Self {
+        object::add_ref(fence);
+        Self(fence as usize, value)
+    }
+
+    pub(crate) fn publish(&self) {
+        set(self.0 as This, self.1);
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Point {
+    fn drop(&mut self) {
+        release(self.0 as This);
+    }
+}
+
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
@@ -146,7 +169,7 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     set(this, value);
     // A queue may have waited for it: what it held runs now.
     #[cfg(windows)]
-    crate::queue::release_held(false);
+    crate::queue::release_held();
     S_OK
 }
 

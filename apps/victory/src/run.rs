@@ -290,6 +290,8 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
+    #[cfg(windows)]
+    victory_hle::bvh::identify_allocator(image.base(), image.info().size_of_image as usize);
     victory_loader::report_crashes();
     victory_loader::set_before_thread_shutdown(victory_hle::known_pipelines::flush);
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));

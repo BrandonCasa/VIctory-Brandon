@@ -459,11 +459,17 @@ pub(crate) fn aliases(at: usize, len: usize) -> Vec<usize> {
 /// Notify every virtual view of a completed write, including partial
 /// overlaps and physical pages with many mappings.
 pub(crate) fn notify_texture_write(at: usize, len: usize) {
+    for (lo, hi) in aliases_of_bytes(at, len) {
+        crate::descriptor::host::page_written(lo, hi - lo);
+    }
+}
+
+pub(crate) fn aliases_of_bytes(at: usize, len: usize) -> Vec<(usize, usize)> {
     let Some(end) = at.checked_add(len) else {
-        return;
+        return Vec::new();
     };
     if at >= end {
-        return;
+        return Vec::new();
     }
     let mut ranges = vec![(at, end)];
     {
@@ -490,16 +496,18 @@ pub(crate) fn notify_texture_write(at: usize, len: usize) {
         }
     }
     ranges.sort_unstable();
+    let mut merged = Vec::new();
     let mut range = ranges[0];
     for (lo, hi) in ranges.into_iter().skip(1) {
         if lo <= range.1 {
             range.1 = range.1.max(hi);
         } else {
-            crate::descriptor::host::page_written(range.0, range.1 - range.0);
+            merged.push(range);
             range = (lo, hi);
         }
     }
-    crate::descriptor::host::page_written(range.0, range.1 - range.0);
+    merged.push(range);
+    merged
 }
 
 /// The address of the 64 KiB page shown at `page` in every title view that

@@ -18,6 +18,10 @@
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
+pub mod bink;
+#[cfg(windows)]
+pub mod bvh;
+#[cfg(windows)]
 mod lightprobe;
 #[cfg(windows)]
 mod texlate;
@@ -100,10 +104,6 @@ mod ab;
 mod tdr;
 #[cfg(windows)]
 mod texture;
-#[cfg(windows)]
-mod tiles;
-#[cfg(windows)]
-mod tiles;
 pub mod timeline;
 #[cfg(windows)]
 pub mod titlewrite;

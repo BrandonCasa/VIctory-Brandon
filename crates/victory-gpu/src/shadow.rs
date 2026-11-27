@@ -94,6 +94,10 @@ pub(crate) struct Shadow {
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: std::sync::atomic::AtomicBool,
+    // A directly writable shared buffer has no staging copy to distinguish
+    // unchanged title bytes from GPU-only raw stores. Remember only pages
+    // actually opened by the builder.
+    raw_pages: std::sync::OnceLock<Mutex<BTreeMap<usize, Vec<u8>>>>,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
     /// Canonical allocation behind a byte-aligned read presentation.
@@ -3264,6 +3268,7 @@ impl Shadow {
             card: None,
             window: false,
             changes_only: Default::default(),
+            raw_pages: Default::default(),
             mapped: false,
             source: None,
             place: None,
@@ -4409,6 +4414,31 @@ impl Shadow {
                 crate::host::copy_mapped(unsafe { self.data.add(a) }, (start + a) as *const u8, b - a, false);
                 crate::host::upcheck::note(self.id, a, &was, &self.card_held(a, b - a));
             });
+        } else if let Some(pages) = self.raw_pages.get() {
+            let mut pages = pages.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pos = from;
+            while pos < to {
+                let base = pos & !(PAGE - 1);
+                let end = to.min(base + PAGE);
+                let dst = unsafe { self.data.add(pos - start) };
+                if let Some(last) = pages.get_mut(&base) {
+                    let mut title = vec![0; end - pos];
+                    crate::host::copy_mapped(title.as_mut_ptr(), pos as *const u8, title.len(), false);
+                    let old = &mut last[pos - base..end - base];
+                    let mut i = 0;
+                    while i < title.len() {
+                        let j = title.len().min(i + 4 - ((pos + i) & 3));
+                        if old[i..j] != title[i..j] {
+                            unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(i), dst.add(i), j - i) };
+                            old[i..j].copy_from_slice(&title[i..j]);
+                        }
+                        i = j;
+                    }
+                } else {
+                    crate::host::copy_mapped(dst, pos as *const u8, end - pos, false);
+                }
+                pos = end;
+            }
         } else {
             crate::host::copy_mapped(at, from as *const u8, to - from, false);
         }
@@ -4428,6 +4458,34 @@ impl Shadow {
     /// the title changes go up ([`by_address`]).
     pub(crate) fn keep_stores(&self) {
         self.changes_only.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn preserve_raw_page(&self, base: usize, replaced: bool) -> bool {
+        if self.carded() || self.in_place() {
+            return true;
+        }
+        if self.offset_in(base as u64).is_none() || self.left(base as u64) < PAGE as u64 {
+            return false;
+        }
+        let mut pages = self.raw_pages.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        if !replaced && pages.contains_key(&base) {
+            return true;
+        }
+        let mut baseline = vec![0; PAGE];
+        if !crate::host::read_into(base as *const u8, &mut baseline) {
+            return false;
+        }
+        // All earlier writers retired at this boundary. The first raw write
+        // starts with the current guest page, including ordinary UAV landings.
+        unsafe { std::ptr::copy_nonoverlapping(baseline.as_ptr(), self.data.add(base - self.start as usize), PAGE) };
+        pages.insert(base, baseline);
+        true
+    }
+
+    pub(crate) fn raw_baseline(&self, address: usize) -> Option<[u8; 8]> {
+        let pages = self.raw_pages.get()?.lock().unwrap_or_else(|e| e.into_inner());
+        let offset = address % PAGE;
+        pages.get(&(address - offset))?.get(offset..offset + 8)?.try_into().ok()
     }
 
     /// Offsets `[from, to)` go up again whole, as the CPU's side has them.
@@ -5152,12 +5210,25 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
     BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Lower bound for a containing allocation's start, even when many smaller
+/// suballocations precede the requested address. Updated under BUFFERS' lock.
+static LARGEST_BUFFER: AtomicU64 = AtomicU64::new(0);
+
+fn containing_buffer(map: &BTreeMap<(u64, usize), Entry>, address: u64, end: u64) -> Option<(&(u64, usize), &Entry)> {
+    let first = end.saturating_sub(LARGEST_BUFFER.load(Ordering::Relaxed));
+    if first > address { return None }
+    map.range((first, 0)..=(address, usize::MAX)).rev().find(|(_, entry)| entry.end >= end)
+}
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let Some(end) = start.checked_add(len) else { return };
+    let mut map = buffers();
+    LARGEST_BUFFER.fetch_max(len, Ordering::Relaxed);
+    map.insert(
         (start, resource),
         Entry {
-            end: start + len,
+            end,
             shadow: None,
         },
     );
@@ -5172,11 +5243,7 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end > address)
+    containing_buffer(&buffers_read(), address, address.checked_add(1)?)
         .map(|(k, e)| (k.0, e.end - k.0))
 }
 
@@ -5257,7 +5324,7 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// The copy [`find`] gives for a range inside a title buffer, if it was made.
 pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    buffers_read().range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).and_then(|(_, e)| e.shadow.clone())
+    containing_buffer(&buffers_read(), address, end).and_then(|(_, e)| e.shadow.clone())
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
@@ -5268,7 +5335,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     {
         let map = buffers_read();
-        match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
+        match containing_buffer(&map, address, end) {
             // The copy is made already (nearly always).
             Some((_, Entry { shadow: Some(shadow), .. })) => {
                 if quick {
@@ -5285,11 +5352,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
     }
     let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
+    let key = containing_buffer(&map, address, end)
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
@@ -5502,8 +5565,33 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 pub(crate) fn in_buffer(address: u64, len: u64) -> Option<(u64, u64)> {
     let end = address.checked_add(len)?;
     let map = buffers_read();
-    let found = map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end);
+    let found = containing_buffer(&map, address, end);
     found.map(|(k, e)| (k.0, e.end - k.0))
+}
+
+/// Readable bytes left in one virtual allocation when a root address has no
+/// registered buffer object. Guarded write-watch pages retain their backing.
+pub(crate) fn mapped_root_bytes(address: u64) -> Option<u64> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery};
+    let mut end = usize::try_from(address).ok()?;
+    let mut owner = None;
+    loop {
+        // SAFETY: VirtualQuery initializes this structure without reading guest memory.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let read = unsafe { VirtualQuery(end as *const _, &mut info, size_of_val(&info)) };
+        if read == 0 || info.State != MEM_COMMIT || info.Protect & PAGE_NOACCESS != 0 {
+            break;
+        }
+        if owner.get_or_insert(info.AllocationBase) != &info.AllocationBase {
+            break;
+        }
+        let next = (info.BaseAddress as usize).checked_add(info.RegionSize)?;
+        if next <= end {
+            return None;
+        }
+        end = next;
+    }
+    (end as u64).checked_sub(address).filter(|&len| len != 0)
 }
 
 /// Whether a title buffer of at most `most` bytes lies in `[address, address

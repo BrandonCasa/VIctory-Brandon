@@ -136,12 +136,20 @@ pub struct RootIndexedView {
     pub shift: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeapOffset {
+    pub bytes: u32,
+    pub constant: Option<(u8, u32, u8)>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Resources {
     /// Every scalar memory access by address (`s_load_*`, `s_store_*`), and
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
     pub descriptors: Vec<Descriptor>,
+    /// Direct heap loads whose byte offset is a constant or a shifted root constant.
+    pub heap_offsets: Vec<(Site, HeapOffset)>,
     /// Direct descriptor sources with a draw-evaluable index.
     pub root_indexed_views: Vec<RootIndexedView>,
     /// User SGPRs holding root parameters: value on entry, layout index,
@@ -335,6 +343,23 @@ pub fn track(
     }
     // What follows traces no access of one block.
     t.at.set(None);
+    for &(site, address) in &out.scalar {
+        if t.layout.get(address.param).is_some_and(|p| p.root == RootType::ResourceHeap) {
+            let constant = match address.dynamic {
+                Some(value) => match t.shifted_constant(value) {
+                    Some(term) => Some(term),
+                    None => continue,
+                },
+                None => None,
+            };
+            out.heap_offsets.push((site, HeapOffset { bytes: address.offset, constant }));
+        }
+    }
+    out.root_indexed_views = out
+        .descriptors
+        .iter()
+        .filter_map(|d| t.root_indexed_view(d, &out.scalar))
+        .collect();
     // The proof needs the per-lane form. Without it nothing is emitted, and
     // its failure is the one to report, so the reads stay unproven here.
     if t.lanes.is_none() {
@@ -366,11 +391,6 @@ pub fn track(
     out.lane_copied = t.lane_copied.take();
     out.lane_copied.sort_unstable();
     out.lane_copied.dedup();
-    out.root_indexed_views = out
-        .descriptors
-        .iter()
-        .filter_map(|d| t.root_indexed_view(d, &out.scalar))
-        .collect();
     Ok(out)
 }
 
@@ -617,23 +637,24 @@ impl<'a> Tracer<'a> {
         if base.root != RootType::Table {
             return None;
         }
-        let dynamic = address.dynamic?;
-        let (input, shift) = match self.sop2(dynamic, &["s_lshl_b32"]) {
-            Some((_, [Term::Value(input), Term::Const(shift)])) => (input, (shift & 31) as u8),
-            _ => (dynamic, 0),
-        };
-        let (param, constant_dword) = self.param_of(self.inputs[input.0 as usize]?)?;
-        let constant = self.layout.get(param)?;
-        if constant.root != RootType::Constants {
-            return None;
-        }
+        let (constant_slot, constant_dword, shift) = self.shifted_constant(address.dynamic?)?;
         Some(RootIndexedView {
             table_slot: base.slot,
-            constant_slot: constant.slot,
+            constant_slot,
             constant_dword,
             byte_offset: address.offset.wrapping_add(u32::from(first) * 4),
             shift,
         })
+    }
+
+    fn shifted_constant(&self, dynamic: Value) -> Option<(u8, u32, u8)> {
+        let (input, shift) = match self.sop2(dynamic, &["s_lshl_b32"]) {
+            Some((_, [Term::Value(input), Term::Const(shift)])) => (input, (shift & 31) as u8),
+            _ => (dynamic, 0),
+        };
+        let (param, dword) = self.param_of(self.inputs[input.0 as usize]?)?;
+        let constant = self.layout.get(param)?;
+        (constant.root == RootType::Constants).then_some((constant.slot, dword, shift))
     }
 
     fn sum(&self, t: Term) -> Sum {

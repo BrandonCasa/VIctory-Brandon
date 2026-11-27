@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The encoding of entries ([`encode`]), part of the key.
-const FORMAT: u32 = 2;
+const FORMAT: u32 = 3;
 
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
@@ -146,6 +146,7 @@ fn build() -> [u8; 32] {
     for value in victory_shader::emit::host_settings() {
         hash.update(&value.to_le_bytes());
     }
+    hash.update(&victory_shader::emit::host_wave_range().0.to_le_bytes());
     *hash.finalize().as_bytes()
 }
 
@@ -238,7 +239,7 @@ fn cached_by(
             .map_err(|e| format!("{e:#}"))?;
         if let Some((shader, made_by)) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let ran = converter.ran.load(Ordering::Relaxed);
-            if !shader.supports_wave_limit(victory_shader::emit::host_settings()[0]) {
+            if !shader.supports_wave_range(victory_shader::emit::host_wave_range()) {
                 if ran {
                     return Err(
                         "translated compute shader requires an unsupported wave width".to_owned(),
@@ -284,7 +285,7 @@ fn cached_by(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -366,7 +367,20 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
-    word(&mut out, u32::from(s.indexed_forms));
+    word(&mut out, u32::from(s.indexed_forms.opaque));
+    word(&mut out, s.indexed_forms.offsets.len() as u32);
+    for (offset, form) in &s.indexed_forms.offsets {
+        word(&mut out, offset.bytes);
+        word(&mut out, u32::from(*form));
+        match offset.constant {
+            None => word(&mut out, u32::MAX),
+            Some((slot, dword, shift)) => {
+                word(&mut out, u32::from(slot));
+                word(&mut out, dword);
+                word(&mut out, u32::from(shift));
+            }
+        }
+    }
     word(&mut out, s.root_indexed_views.len() as u32);
     for view in &s.root_indexed_views {
         for value in [
@@ -438,7 +452,19 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
-    let indexed_forms = u8::try_from(r.word()?).ok()?;
+    let opaque = u8::try_from(r.word()?).ok()?;
+    let count = r.word()? as usize;
+    let mut offsets = Vec::with_capacity(count.min(256));
+    for _ in 0..count {
+        let bytes = r.word()?;
+        let form = u8::try_from(r.word()?).ok()?;
+        let slot = r.word()?;
+        let constant = if slot == u32::MAX { None } else {
+            Some((u8::try_from(slot).ok()?, r.word()?, u8::try_from(r.word()?).ok().filter(|s| *s < 32)?))
+        };
+        offsets.push((victory_shader::resource::HeapOffset { bytes, constant }, form));
+    }
+    let indexed_forms = victory_shader::emit::IndexedAccess { opaque, offsets };
     let n = r.word()? as usize;
     let mut root_indexed_views = Vec::with_capacity(n.min(256));
     for _ in 0..n {
@@ -491,7 +517,7 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![1],
-            indexed_forms: 0,
+            indexed_forms: Default::default(),
             root_indexed_views: vec![RootIndexedView {
                 table_slot: 1,
                 constant_slot: 2,
@@ -523,7 +549,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH2 broken").unwrap();
+            std::fs::write(e, b"VSH3 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -554,10 +580,12 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
-        // Entries of the encoding before the translator's build was in them.
-        let mut v1 = bytes.clone();
-        v1[3] = b'1';
-        assert_eq!(decode(&v1), None);
+        // Earlier encodings omit the build or indexed binding provenance.
+        for version in [b'1', b'2'] {
+            let mut old = bytes.clone();
+            old[3] = version;
+            assert_eq!(decode(&old), None);
+        }
     }
 
     /// An entry an earlier build of the translator made, under the same

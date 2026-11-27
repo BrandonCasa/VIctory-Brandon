@@ -118,11 +118,11 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
+pub use lower::{host_settings, host_wave_range, set_host_max_wave, set_host_rdna, set_host_wave_range, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    mapped_views, VIEW_CONSTANT_BOUNDS, FRESH_TABLE_SIZES, MAPPED_DYNAMIC, SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, VIEW_MAPPING, VIEW_MAPPING_BYTES, USER_CBV_BYTES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    mapped_views, VIEW_CONSTANT_BOUNDS, FRESH_TABLE_SIZES, MAPPED_DYNAMIC, SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, VIEW_MAPPING, VIEW_MAPPING_BYTES, USER_CBV_BYTES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_PREFIX_SHIFT, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -167,11 +167,8 @@ pub fn helper_own() -> bool {
 /// - unset or `2`: every barrier waits, as before.
 /// - `1`: the title's `s_barrier` waits only in a block every lane runs,
 ///   in a program no lane can be cut out of at the iteration limit.
-/// - `0`: no barrier waits, neither the title's nor the ones the
-///   translation adds (wave64 programs in two host waves exchange through
-///   them, so such programs compute wrong values). For one run that tells
-///   whether a barrier is what stops the card: with it no run can stand in
-///   a barrier.
+/// - `0`: remove waits in the ordinary lowering for comparison. Exact
+///   logical waves keep the synchronization their lane exchanges require.
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
@@ -192,13 +189,11 @@ pub fn builder_fences() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_FENCES").is_none_or(|v| v != "0"))
 }
 
-/// Whether the structure builder's accesses through its root views stay near
-/// them, and a size in a structure's header that cannot be one counts as none
-/// (`VICTORY_BVH_BOUNDS=0`: neither). Part of the translation: the shader
-/// cache keys on it.
+/// Reproduce the historical 64 MiB builder clamp for explicit comparisons.
+/// Normal shaders use the declared owner extents and the original header.
 pub fn builder_bounds() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUNDS").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUNDS").is_some_and(|v| v == "1"))
 }
 
 /// The clean-up passes that run over a translated program before it is
@@ -294,6 +289,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
         out.push(0);
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
+    out.extend_from_slice(&lower::host_wave_range().0.to_le_bytes());
     out.extend_from_slice(&lower::host_rdna().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&shader::raw_views().to_le_bytes());
@@ -330,12 +326,19 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// Per-access reachability for descriptors selected directly from the guest heap.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct IndexedAccess {
+    pub opaque: u8,
+    pub offsets: Vec<(crate::resource::HeapOffset, u8)>,
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
     /// Access forms fetched through a computed ResourceHeap index.
-    /// Bits 0..3 are CBV, buffer SRV, buffer UAV and texture.
-    pub indexed_forms: u8,
+    /// Bits 0..4 are CBV, buffer SRV/UAV and texture SRV/UAV.
+    pub indexed_forms: IndexedAccess,
     pub stage: HwStage,
     /// The DXIL container, hashed as D3D12 expects.
     pub dxil: Vec<u8>,
@@ -362,18 +365,24 @@ pub struct HostShader {
 impl HostShader {
     /// A cached compute artifact may declare a required width in PSV0.
     pub fn supports_wave_limit(&self, limit: u32) -> bool {
-        if self.stage != HwStage::Cs || limit == 0 {
+        self.supports_wave_range((0, limit))
+    }
+
+    pub fn supports_wave_range(&self, (min, max): (u32, u32)) -> bool {
+        if self.stage != HwStage::Cs || max == 0 {
             return true;
         }
-        let min = Container::parse(&self.dxil).ok().and_then(|container| {
+        let range = Container::parse(&self.dxil).ok().and_then(|container| {
             let psv = container.part(FourCC::PSV0)?.data;
             let size = u32::from_le_bytes(psv.get(..4)?.try_into().ok()?);
             if size < 24 {
                 return None;
             }
-            Some(u32::from_le_bytes(psv.get(20..24)?.try_into().ok()?))
+            let first = u32::from_le_bytes(psv.get(20..24)?.try_into().ok()?);
+            let last = u32::from_le_bytes(psv.get(24..28)?.try_into().ok()?);
+            Some((first, last))
         });
-        min.is_none_or(|required| required <= limit)
+        range.is_some_and(|(first, last)| first <= last && first <= max && min <= last)
     }
 
     /// Size of the user-data buffer the shader declares, in dwords (a
@@ -515,6 +524,19 @@ pub fn emit(
             }
         };
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
+        // Preserve the original scalar CFG when splitting waves that share
+        // LDS. In particular, an early-out may end a wave before its peers
+        // reach their next guest barrier.
+        let shared = matches!(native.io, crate::native::StageIo::Cs(cs)
+            if cs.lds_bytes() > 0 && cs.threads.iter().product::<u32>().is_multiple_of(64));
+        if wide_on && shared {
+            let again = widen(c, native, p, why);
+            report("logical waves sharing LDS", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+        }
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
@@ -554,9 +576,6 @@ pub fn emit(
                 }
             }
         }
-        // A single guest wave can take its entire CFG in group lockstep.
-        // This includes loop backedges and scalar decisions on EXEC or VCC.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -578,7 +597,7 @@ pub fn emit(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on {
+                if wide_on && !shared {
                     let again = widen(c, native, p, why);
                     report("wave-wide branches", &again);
                     if done(&again) {
@@ -649,10 +668,11 @@ pub fn emit(
         other => other,
     };
     let supported = |(shader, wave): (HostShader, Option<u32>)| {
-        if native.stage == HwStage::Cs && lower::host_max_wave() == 32 && wave == Some(64) {
+        let (min, max) = host_wave_range();
+        if native.stage == HwStage::Cs && max != 0 && wave.is_some_and(|n| n < min || n > max) {
             Err(ShaderError::Unsupported {
                 offset: 0,
-                what: "logical wave64 operation without an exact wave32 lowering",
+                what: "a required compute wave width outside the host range",
             })
         } else {
             Ok(shader)
@@ -708,17 +728,17 @@ fn widen(
     let cooperative = split_wave
         && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() > 64);
     let mut wide = std::collections::HashSet::new();
-    if split_wave {
-        let st = structure::structure(p)?;
-        wide.extend(
-            st.wave_any
-                .iter()
-                .enumerate()
-                .filter_map(|(b, kind)| kind.map(|_| b)),
-        );
-    }
     loop {
         let st = structure::structure_wide(p, &wide)?;
+        if split_wave {
+            // Keeping both sides in the wave can expose another mask-based SCC
+            // at a join. Widen those newly visible decisions as well.
+            let old = wide.len();
+            wide.extend(st.wave_any.iter().enumerate().filter_map(|(b, kind)| kind.map(|_| b)));
+            if wide.len() != old {
+                continue;
+            }
+        }
         if split_wave && !lower::lockstep_branches(&st) {
             return Err(ShaderError::Unsupported {
                 offset: 0,
@@ -1733,7 +1753,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
-            indexed_forms: 0,
+            indexed_forms: Default::default(),
             root_indexed_views: Vec::new(),
         };
         let file = |var: &str, stage| {
@@ -1746,7 +1766,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
-                indexed_forms: 0,
+                indexed_forms: Default::default(),
                 root_indexed_views: Vec::new(),
             })
         };
@@ -2356,7 +2376,7 @@ mod tests {
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
-            indexed_forms: 0,
+            indexed_forms: Default::default(),
             root_indexed_views: Vec::new(),
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2492,7 +2512,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
-                indexed_forms: 0,
+                indexed_forms: Default::default(),
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2640,7 +2660,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
-                indexed_forms: 0,
+                indexed_forms: Default::default(),
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -3057,7 +3077,7 @@ mod barycentric_tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
-            indexed_forms: 0,
+            indexed_forms: Default::default(),
             root_indexed_views: Vec::new(),
         };
         validate(&vs);
