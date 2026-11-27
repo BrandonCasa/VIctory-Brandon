@@ -169,12 +169,6 @@ fn submit_cut(this: This, lists: &[This]) {
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
         host.execute(&now);
-        // They have run: their descriptor tables' slots are free again, as
-        // on the path without cuts ([`execute`]). This path replaced that
-        // one without the call, so the lists that run at once kept their
-        // slots until the title's reset and the ring ran out as before
-        // (run 45: 3,143 of 15,942 tables refused in one frame).
-        crate::list::tables_done(&lists[..first]);
     }
     if first < lists.len() {
         let parts = crate::list::detach_parts(&lists[first..]);
@@ -580,7 +574,18 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             behind::submit(this, lists);
             return;
         }
-        if cuts() && !this.is_null() {
+        let recordings = crate::list::thin::submitted(lists);
+        let native;
+        let lists = if recordings.is_empty() {
+            lists
+        } else {
+            for r in recordings.iter() {
+                r.wait();
+            }
+            native = recordings.iter().map(|r| r.back()).collect::<Vec<_>>();
+            &native[..]
+        };
+        if (cuts() || lists.iter().any(|&l| crate::list::cut_list(l))) && !this.is_null() {
             submit_cut(this, lists);
             return;
         }
@@ -631,7 +636,6 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
         host.execute(&host_lists);
-        crate::list::tables_done(lists);
         // What the lists wrote at the bottom of the pipe may be a fence
         // another queue waits for.
         release_held(false);
@@ -645,6 +649,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
 }
 
 /// The start of a present plane: frame token, then the plane's resources.
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
@@ -655,6 +660,7 @@ pub(crate) struct Plane {
 /// space and seven option words after the common prefix. Older callers pass
 /// only the prefix for single-plane presents.
 #[cfg(windows)]
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct RetailPlane {
     prefix: Plane,
@@ -666,46 +672,48 @@ struct RetailPlane {
 #[cfg(windows)]
 const _: () = assert!(size_of::<RetailPlane>() == 72);
 
-/// Whether the second plane of a present is shown over the first
-/// (`VICTORY_PLANES=1`, [`crate::compose::on`]). Says once, either way, that
-/// the title presents more than one plane and what the second one is.
+/// Copy the caller-owned record and both rectangles while PresentX owns them.
 #[cfg(windows)]
-fn planes_seen(planes: u32, parameters: *const Plane) -> bool {
-    static ONCE: AtomicBool = AtomicBool::new(false);
-    let on = crate::compose::on();
-    if !ONCE.swap(true, Ordering::Relaxed) {
-        let second = overlay_resource(parameters);
-        tracing::info!(
-            planes,
-            second = ?second,
-            second_known = second.is_some_and(|r| crate::resource::host_resource(r).is_some()),
-            composed = on,
-            "the title presents more than one plane (VICTORY_PLANES=1: the second is composed over the first)"
-        );
+fn display_plane(
+    parameters: *const Plane,
+    index: usize,
+    retail: bool,
+) -> Option<(This, crate::compose::Geometry)> {
+    fn read<T: Copy>(src: *const T) -> Option<T> {
+        if src.is_null() {
+            return None;
+        }
+        let mut out = std::mem::MaybeUninit::<T>::uninit();
+        // SAFETY: read_into fills the complete plain-data ABI value before use.
+        unsafe {
+            let bytes = std::slice::from_raw_parts_mut(out.as_mut_ptr().cast(), size_of::<T>());
+            crate::host::read_into(src.cast(), bytes).then(|| out.assume_init())
+        }
     }
-    on
-}
-
-#[cfg(windows)]
-fn overlay_resource(parameters: *const Plane) -> Option<This> {
-    // Read only the second prefix at the 72-byte retail PresentX stride. A
-    // caller using a different layout can still present its base plane safely.
-    let second = parameters.cast::<RetailPlane>().wrapping_add(1).cast::<u8>();
-    let mut prefix = [0; size_of::<Plane>()];
-    if !crate::host::read_into(second, &mut prefix) {
+    let (prefix, mut geometry) = if retail {
+        let plane = read(parameters.cast::<RetailPlane>().wrapping_add(index))?;
+        let mut g = crate::compose::Geometry::default();
+        if !plane.source_rects.is_null() {
+            g.source = Some(read(plane.source_rects.cast())?);
+        }
+        if !plane.destination.is_null() {
+            g.destination = read(plane.destination.cast())?;
+        }
+        g.color = plane.color_space;
+        (plane.prefix, g)
+    } else {
+        (read(parameters.wrapping_add(index))?, Default::default())
+    };
+    if prefix.count == 0 {
         return None;
     }
-    // SAFETY: the prefix has the C layout above and its bytes were copied.
-    let plane = unsafe { prefix.as_ptr().cast::<Plane>().read_unaligned() };
-    let mut pointer = [0; size_of::<This>()];
-    if plane.count == 0
-        || plane.resources.is_null()
-        || !crate::host::read_into(plane.resources.cast(), &mut pointer)
-    {
+    let resource = read(prefix.resources)?;
+    if !crate::resource::is_resource(resource) {
         return None;
     }
-    let resource = usize::from_ne_bytes(pointer) as This;
-    crate::resource::is_resource(resource).then_some(resource)
+    let copy = crate::resource::host_copy(resource)?;
+    geometry.serial = copy.serial;
+    Some((resource, geometry))
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -913,8 +921,26 @@ pub(crate) fn presented() -> u64 {
 extern "system" fn present(
     this: This,
     planes: u32,
+    parameters: *const Plane,
+    _: *const u8,
+) -> HRESULT {
+    present_with(this, planes, parameters, false)
+}
+
+extern "system" fn present_retail(
+    this: This,
+    planes: u32,
+    parameters: *const Plane,
+    _: *const u8,
+) -> HRESULT {
+    present_with(this, planes, parameters, true)
+}
+
+fn present_with(
+    this: This,
+    planes: u32,
     plane_parameters: *const Plane,
-    _parameters: *const u8,
+    retail: bool,
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = this;
@@ -981,86 +1007,48 @@ extern "system" fn present(
         }
     }
     #[cfg(windows)]
-    if behind::on() && !this.is_null() {
-        const COPY_SOURCE: u32 = 0x800;
-        let base_res = if planes > 0
-            // SAFETY: the title passes `planes` plane descriptions.
-            && let Some(plane) = unsafe { plane_parameters.as_ref() }
-            && plane.count > 0
-            && !plane.resources.is_null()
-        {
-            // SAFETY: the plane lists `count` resources.
-            Some(unsafe { *plane.resources })
+    if planes != 0 && crate::host::host().is_some() {
+        let Some((resource, base)) = display_plane(plane_parameters, 0, retail) else {
+            return E_INVALIDARG;
+        };
+        let second = if planes > 1 && crate::compose::on() {
+            let Some(over) = display_plane(plane_parameters, 1, retail) else {
+                return E_INVALIDARG;
+            };
+            Some(over)
         } else {
             None
         };
-        let take_copy = |resource: This| {
-            crate::resource::host_copy(resource).map(|copy| {
-                let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
-                crate::resource::host_transition(resource, state);
-                // (Lists not translated yet leave it in no state yet: the
-                // one it is in when its turn in the line comes.)
-                let state = if crate::list::thin::wanted() { u32::MAX } else { state };
-                (resource as usize, copy, state)
-            })
+        let Some(texture) = crate::resource::host_copy(resource) else {
+            return E_INVALIDARG;
         };
-        let texture = base_res.and_then(take_copy);
-        let overlay = (planes > 1 && !plane_parameters.is_null() && planes_seen(planes, plane_parameters))
-            .then(|| overlay_resource(plane_parameters))
-            .flatten()
-            .filter(|&over_res| base_res != Some(over_res))
-            .and_then(take_copy);
-        let resource = texture.as_ref().map_or(0, |t| t.0);
-        behind::present(
-            this,
-            texture.map(|(_, copy, state)| (copy, state)),
-            overlay.map(|(_, copy, state)| (copy, state)),
-            Shown { frame, resource },
-        );
-        called.end();
-        #[cfg(feature = "diagnostics")]
-        frame_ends();
-        return S_OK;
-    }
-    #[cfg(windows)]
-    if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
-        && let Some(host) = crate::host::host()
-    {
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let overlay = (planes > 1 && planes_seen(planes, plane_parameters))
-            .then(|| overlay_resource(plane_parameters))
-            .flatten()
-            .filter(|&over_res| over_res != resource)
-            .and_then(|over_res| {
-                crate::resource::host_resource(over_res).map(|over_tex| {
-                    let over_state = crate::resource::host_transition(over_res, COPY_SOURCE)
-                        .map_or(COPY_SOURCE, |(_, before)| before);
-                    (over_res, over_tex, over_state)
-                })
-            });
-        show_planes(
-            texture,
-            state,
-            overlay.as_ref().map(|(_, tex, st)| (*tex, *st)),
-            Shown { frame, resource: resource as usize },
-        );
-        crate::resource::host_transition(resource, state);
-        if let Some((over_res, _, over_state)) = overlay {
-            crate::resource::host_transition(over_res, over_state);
+        let overlay = second.and_then(|(r, _)| crate::resource::host_copy(r));
+        let geometry = [base, second.map(|p| p.1).unwrap_or_default()];
+        let shown = Shown {
+            frame,
+            resource: resource as usize,
+            geometry,
+        };
+        if behind::on() && !this.is_null() {
+            // Read resource state when this queue head executes, after preceding lists.
+            behind::present(
+                this,
+                Some((texture, u32::MAX)),
+                overlay.map(|o| (o, u32::MAX)),
+                shown,
+            );
+        } else {
+            let state = texture.state.load(Ordering::Relaxed);
+            let over = overlay
+                .as_ref()
+                .map(|o| (&o.texture, o.state.load(Ordering::Relaxed)));
+            if !show_planes(&texture.texture, state, over, shown) {
+                return 0x80004005u32 as i32;
+            }
         }
-        let _ = host;
     }
     #[cfg(not(windows))]
-    let _ = (planes, plane_parameters);
+    let _ = (planes, plane_parameters, retail);
     called.end();
     #[cfg(all(windows, feature = "diagnostics"))]
     frame_ends();
@@ -1095,6 +1083,7 @@ fn frame_ends() {
 #[cfg(windows)]
 #[derive(Clone, Copy)]
 struct Shown {
+    geometry: [crate::compose::Geometry; 2],
     frame: u64,
     resource: usize,
 }
@@ -1106,15 +1095,19 @@ fn show_planes(
     state: u32,
     overlay: Option<(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
     what: Shown,
-) {
+) -> bool {
     let Some(host) = crate::host::host() else {
-        return;
+        return false;
     };
-    let shown = host.present_planes(texture, state, overlay, what.frame);
+    if crate::host::take_failed_frame() {
+        return false;
+    }
+    let shown = host.present_planes(texture, state, overlay, what.geometry, what.frame);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]
-    let _ = (shown, what.resource);
+    let _ = what.resource;
+    shown.is_some()
 }
 
 /// Diagnostics: logs a presented frame that is black after one that was
@@ -1282,7 +1275,11 @@ const fn queue_table(newer: bool) -> [*const (); 36] {
     let mut i = 0;
     while i < METHODS.len() {
         let (slot, method) = METHODS[i];
-        f[if newer { newer_slot(slot) } else { slot }] = method;
+        f[if newer { newer_slot(slot) } else { slot }] = if newer && slot == 30 {
+            present_retail as *const ()
+        } else {
+            method
+        };
         i += 1;
     }
     f

@@ -43,6 +43,17 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 pub const VIEW_ADDRESSES: u32 = SLOT_STRIDES_COUNT * 4;
 /// Bytes of the whole [`SLOT_STRIDES`] buffer.
 pub const SLOT_STRIDES_BYTES: u32 = VIEW_ADDRESSES + SLOT_STRIDES_COUNT * 8;
+/// On million-descriptor hosts, two header words (logical title count and
+/// physical scratch base) followed by one physical slot per logical view.
+pub const VIEW_MAPPING: u32 = SLOT_STRIDES_BYTES;
+pub const FRESH_TABLE_SIZES: u32 = VIEW_MAPPING + 8 + 4 * SLOT_STRIDES_COUNT;
+pub const MAPPED_DYNAMIC: u32 = 1 << 18;
+/// Physical CBV slot to (prefix bytes before the guest range, guest byte length).
+pub const VIEW_CONSTANT_BOUNDS: u32 = FRESH_TABLE_SIZES + 4 * MAPPED_DYNAMIC;
+pub const VIEW_MAPPING_BYTES: u32 = VIEW_CONSTANT_BOUNDS + 8 * 1_000_000;
+pub fn mapped_views() -> bool {
+    view_heap_limit() == 999_999
+}
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -103,6 +114,8 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// Visible extent of a raw root constant buffer, starting at the guest VA.
+pub const USER_CBV_BYTES: u32 = 0x107;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

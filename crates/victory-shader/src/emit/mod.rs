@@ -122,7 +122,7 @@ pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    mapped_views, VIEW_CONSTANT_BOUNDS, FRESH_TABLE_SIZES, MAPPED_DYNAMIC, SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, VIEW_MAPPING, VIEW_MAPPING_BYTES, USER_CBV_BYTES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -333,6 +333,9 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
+    /// Access forms fetched through a computed ResourceHeap index.
+    /// Bits 0..3 are CBV, buffer SRV, buffer UAV and texture.
+    pub indexed_forms: u8,
     pub stage: HwStage,
     /// The DXIL container, hashed as D3D12 expects.
     pub dxil: Vec<u8>,
@@ -357,6 +360,22 @@ pub struct HostShader {
 }
 
 impl HostShader {
+    /// A cached compute artifact may declare a required width in PSV0.
+    pub fn supports_wave_limit(&self, limit: u32) -> bool {
+        if self.stage != HwStage::Cs || limit == 0 {
+            return true;
+        }
+        let min = Container::parse(&self.dxil).ok().and_then(|container| {
+            let psv = container.part(FourCC::PSV0)?.data;
+            let size = u32::from_le_bytes(psv.get(..4)?.try_into().ok()?);
+            if size < 24 {
+                return None;
+            }
+            Some(u32::from_le_bytes(psv.get(20..24)?.try_into().ok()?))
+        });
+        min.is_none_or(|required| required <= limit)
+    }
+
     /// Size of the user-data buffer the shader declares, in dwords (a
     /// multiple of 4; 0 when it reads none). Root constants must cover it.
     pub fn user_data_dwords(&self) -> u32 {
@@ -500,11 +519,9 @@ pub fn emit(
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
         // Where the wave operations are the allocation idiom
-        // ([`lower::wave_local`]) that is exact. Other programs are taken
-        // the same way last of all, each half-wave giving its own results
-        // (approximate: a tile-wide result becomes two half-tile ones);
-        // `VICTORY_WAVE_LOCAL=idiom` refuses those instead.
-        let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
+        // ([`lower::wave_local`]) that is exact. Half-wave approximations
+        // are available only in the explicit comparison mode.
+        let strict = !std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "approximate");
         let idiom = |p: &ir::Program, st: &structure::Structured| match lower::wave_local(p, st) {
             Ok(()) => true,
             Err((offset, what)) => {
@@ -537,12 +554,9 @@ pub fn emit(
                 }
             }
         }
-        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
-        // waves: this form puts group barriers inside branches and loops, and runs 121-124
-        // lost the card in a submission of two programs that had just moved to it
-        // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
-        // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // A single guest wave can take its entire CFG in group lockstep.
+        // This includes loop backedges and scalar decisions on EXEC or VCC.
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -565,18 +579,10 @@ pub fn emit(
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
                 if wide_on {
-                    let bases = [
-                        deep.as_ref().map(|f| &f.0),
-                        forms[1].1.as_ref().map(|f| &f.0),
-                        forms[0].1.as_ref().map(|f| &f.0),
-                        Some(p),
-                    ];
-                    if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why);
-                        report("wave-wide branches", &again);
-                        if done(&again) {
-                            return again.map(|(shader, _)| shader);
-                        }
+                    let again = widen(c, native, p, why);
+                    report("wave-wide branches", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
                     }
                 }
                 if strict {
@@ -642,7 +648,17 @@ pub fn emit(
         }
         other => other,
     };
-    let original = original.map(|(shader, _)| shader);
+    let supported = |(shader, wave): (HostShader, Option<u32>)| {
+        if native.stage == HwStage::Cs && lower::host_max_wave() == 32 && wave == Some(64) {
+            Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "logical wave64 operation without an exact wave32 lowering",
+            })
+        } else {
+            Ok(shader)
+        }
+    };
+    let original = original.and_then(supported);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -656,16 +672,15 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_program(c, native, &p, &st, &io, &res).and_then(supported)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
 /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
 /// lowering names the blocks where the two host waves must meet and could not
 /// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
-/// it translates or a branch cannot be widened. Only where a thread group is one console
-/// wave: with several, the waves of a group would decide differently and a barrier inside
-/// such a branch would wait for threads that never come.
+/// it translates or a branch cannot be widened. Groups of several full
+/// console waves use a uniform host sweep with separate guest PCs.
 fn widen(
     c: &Container,
     native: &NativeProgram,
@@ -674,12 +689,13 @@ fn widen(
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
-        what: "wave-wide branches in a thread group of several console waves",
+        what: "wave-wide branches in an incomplete logical wave group",
     };
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>().is_multiple_of(64) => {
+        }
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -688,13 +704,33 @@ fn widen(
         }
         _ => return Err(NOT),
     }
+    let split_wave = native.wave64 && lower::host_max_wave() == 32;
+    let cooperative = split_wave
+        && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() > 64);
     let mut wide = std::collections::HashSet::new();
+    if split_wave {
+        let st = structure::structure(p)?;
+        wide.extend(
+            st.wave_any
+                .iter()
+                .enumerate()
+                .filter_map(|(b, kind)| kind.map(|_| b)),
+        );
+    }
     loop {
         let st = structure::structure_wide(p, &wide)?;
+        if split_wave && !lower::lockstep_branches(&st) {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a logical wave with a divergent scalar branch",
+            });
+        }
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
-        let r = emit_program(c, native, p, &st, &io, &res);
+        let r = lower::with_cooperative(cooperative, split_wave, || {
+            emit_program(c, native, p, &st, &io, &res)
+        });
         let needs = lower::take_needs();
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)
@@ -826,6 +862,7 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        indexed_forms: l.indexed_forms,
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
@@ -1696,6 +1733,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            indexed_forms: 0,
             root_indexed_views: Vec::new(),
         };
         let file = |var: &str, stage| {
@@ -1708,6 +1746,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                indexed_forms: 0,
                 root_indexed_views: Vec::new(),
             })
         };
@@ -2317,6 +2356,7 @@ mod tests {
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
+            indexed_forms: 0,
             root_indexed_views: Vec::new(),
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2452,6 +2492,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                indexed_forms: 0,
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2599,6 +2640,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                indexed_forms: 0,
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -3015,6 +3057,7 @@ mod barycentric_tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            indexed_forms: 0,
             root_indexed_views: Vec::new(),
         };
         validate(&vs);

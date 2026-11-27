@@ -42,6 +42,14 @@ struct Block {
     size: usize,
     apu: u32,
     layout: Layout,
+    overlaps: BTreeMap<usize, Area>,
+}
+
+#[derive(Default)]
+struct Area {
+    owner: Option<u32>,
+    saved: Option<xma::Overlap>,
+    pending: Option<xma::Overlap>,
 }
 
 struct Heap {
@@ -66,6 +74,21 @@ static HEAP: Mutex<Heap> = Mutex::new(Heap {
 const APU_BASE: u32 = 0x0001_0000;
 
 impl Heap {
+    fn area_at(&mut self, host: usize) -> Option<(&mut Block, usize)> {
+        let (&base, block) = self.blocks.range_mut(..=host).next_back()?;
+        let offset = host - base;
+        (offset.checked_add(512)? <= block.size).then_some((block, offset))
+    }
+
+    fn area(&mut self, address: u32) -> Option<&mut Area> {
+        let (&apu, &host) = self.by_apu.range(..=address).next_back()?;
+        let (block, offset) = self.area_at(host.checked_add((address - apu) as usize)?)?;
+        if block.apu != apu {
+            return None;
+        }
+        Some(block.overlaps.entry(offset).or_default())
+    }
+
     /// First fit in the free ranges.
     fn take(&mut self, size: u32, align: u32) -> Option<u32> {
         if self.free.is_empty() && !self.created {
@@ -111,8 +134,15 @@ fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
         heap.give_back(apu, apu + layout.size() as u32);
         return None;
     }
-    heap.blocks
-        .insert(ptr as usize, Block { size, apu, layout });
+    heap.blocks.insert(
+        ptr as usize,
+        Block {
+            size,
+            apu,
+            layout,
+            overlaps: BTreeMap::new(),
+        },
+    );
     heap.by_apu.insert(apu, ptr as usize);
     // The big ones are named in the log: they are the title's audio memory
     // given out of our allocator, which the memory line counts as ours.
@@ -132,6 +162,77 @@ fn heap_free(ptr: *mut u8) {
     drop(heap);
     // SAFETY: allocated by `heap_alloc` with this layout.
     unsafe { std::alloc::dealloc(ptr, block.layout) };
+}
+
+// The guest's opaque overlap area is too small to store the host decoder's
+// floating-point representation. Its lifetime follows this allocation and offset.
+static CRT_COPY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CRT_SET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn overlap_import(name: &str, next: usize) -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    match name {
+        "memcpy" => {
+            CRT_COPY.store(next, Relaxed);
+            overlap_copy as *const () as usize
+        }
+        "memset" => {
+            CRT_SET.store(next, Relaxed);
+            overlap_set as *const () as usize
+        }
+        _ => next,
+    }
+}
+
+unsafe extern "system-unwind" fn overlap_copy(to: *mut u8, from: *const u8, n: usize) -> *mut u8 {
+    type Copy = unsafe extern "system-unwind" fn(*mut u8, *const u8, usize) -> *mut u8;
+    // SAFETY: the next implementation in the title's import chain has this ABI.
+    let next: Copy =
+        unsafe { std::mem::transmute(CRT_COPY.load(std::sync::atomic::Ordering::Relaxed)) };
+    if n != 512 || heap_map(to as usize) == 0 {
+        return unsafe { next(to, from, n) };
+    }
+    let engine = XMA.write().unwrap_or_else(|e| e.into_inner());
+    let mut heap = lock(&HEAP);
+    let snapshot = heap
+        .area_at(from as usize)
+        .and_then(|(block, offset)| block.overlaps.get(&offset))
+        .and_then(|area| {
+            area.owner
+                .and_then(|id| engine.voices.get(id as usize))
+                .and_then(|slot| {
+                    lock(slot)
+                        .as_ref()
+                        .filter(|v| !v.ended)
+                        .and_then(|v| v.decoder.as_ref().map(|d| d.overlap()))
+                })
+                .or_else(|| area.saved.clone())
+                .or_else(|| area.pending.clone())
+        });
+    if let Some((block, offset)) = heap.area_at(to as usize) {
+        if snapshot.is_some() || block.overlaps.contains_key(&offset) {
+            let area = block.overlaps.entry(offset).or_default();
+            area.pending = snapshot;
+            area.saved = None;
+        }
+    }
+    unsafe { next(to, from, n) }
+}
+
+unsafe extern "system-unwind" fn overlap_set(to: *mut u8, value: i32, n: usize) -> *mut u8 {
+    type Set = unsafe extern "system-unwind" fn(*mut u8, i32, usize) -> *mut u8;
+    // SAFETY: the next implementation in the title's import chain has this ABI.
+    let next: Set =
+        unsafe { std::mem::transmute(CRT_SET.load(std::sync::atomic::Ordering::Relaxed)) };
+    if n != 512 || value as u8 != 0 || heap_map(to as usize) == 0 {
+        return unsafe { next(to, value, n) };
+    }
+    let _engine = XMA.write().unwrap_or_else(|e| e.into_inner());
+    let mut heap = lock(&HEAP);
+    if let Some((block, offset)) = heap.area_at(to as usize) {
+        block.overlaps.remove(&offset);
+    }
+    unsafe { next(to, value, n) }
 }
 
 /// Sizes the heap once, before anything is allocated from it. The console
@@ -273,6 +374,7 @@ pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts)
     *allocated = Some(arrays.map(|p| p as usize));
     let mut xma = XMA.write().unwrap_or_else(|e| e.into_inner());
     xma.array = arrays[4] as usize;
+    xma.enabled = Mutex::new(vec![0; (counts[4] as usize).div_ceil(64)]);
     xma.voices = (0..counts[4]).map(|_| Mutex::new(None)).collect();
     S_OK
 }
@@ -281,6 +383,9 @@ pub extern "system" fn AcpHalReleaseShapeContexts() -> HRESULT {
     match lock(&CONTEXTS).take() {
         Some(arrays) => {
             *XMA.write().unwrap_or_else(|e| e.into_inner()) = Xma::EMPTY;
+            for block in lock(&HEAP).blocks.values_mut() {
+                block.overlaps.clear();
+            }
             arrays.iter().for_each(|&p| heap_free(p as *mut u8));
             S_OK
         }
@@ -306,9 +411,6 @@ pub extern "system" fn AcpHalReleaseShapeContexts() -> HRESULT {
 //    9: read block (0-4).
 // Titles read back only the write block, "writable" and the read block,
 // and take whatever lies between read and write.
-// shortcut: each enabled context decodes from a cold state and the overlap
-// buffer is ignored (titles copy it between consecutive contexts of one
-// voice); keep decoder state there if a title's seams turn out audible.
 
 use victory_formats::xma;
 
@@ -324,6 +426,7 @@ const SAMPLES_PER_BLOCK: usize = BLOCK_BYTES / 2;
 const INPUT_INVALID: u32 = 4;
 
 struct Voice {
+    index: u32,
     decoder: Option<xma::Decoder>,
     pcm: VecDeque<i16>,
     /// Samples per channel still to drop (start or loop subframe skips).
@@ -357,12 +460,14 @@ struct Xma {
     /// so a command for one voice never waits for others to decode (the
     /// title sends them from its time-critical mixer thread).
     voices: Vec<Mutex<Option<Voice>>>,
+    enabled: Mutex<Vec<u64>>,
 }
 
 impl Xma {
     const EMPTY: Xma = Xma {
         array: 0,
         voices: Vec::new(),
+        enabled: Mutex::new(Vec::new()),
     };
 }
 
@@ -422,7 +527,12 @@ impl Xma {
         );
         #[cfg(feature = "diagnostics")]
         dump_input(index, context);
+        if let Some(area) = lock(&HEAP).area(context.get(8)) {
+            area.owner = Some(index);
+            area.saved = None;
+        }
         *slot = Some(Voice {
+            index,
             decoder: None,
             pcm: VecDeque::new(),
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
@@ -439,6 +549,7 @@ impl Xma {
                 ended_ms: None,
             },
         });
+        lock(&self.enabled)[index as usize / 64] |= 1 << (index % 64);
         drop(slot);
         wake_decoder();
     }
@@ -447,9 +558,20 @@ impl Xma {
         let Some(context) = self.context(index) else {
             return;
         };
-        let Some(voice) = lock(&self.voices[index as usize]).take() else {
+        let mut slot = lock(&self.voices[index as usize]);
+        let Some(voice) = slot.take() else {
             return;
         };
+        lock(&self.enabled)[index as usize / 64] &= !(1 << (index % 64));
+        if let Some(area) = lock(&HEAP).area(context.get(8))
+            && area.owner == Some(index)
+        {
+            if !voice.ended {
+                area.saved = voice.decoder.as_ref().map(|d| d.overlap());
+            }
+            area.owner = None;
+        }
+        drop(slot);
         let t = &voice.trace;
         tracing::debug!(
             index,
@@ -493,21 +615,27 @@ impl Xma {
     }
 
     /// Fills every enabled context's output as far as it has room.
-    fn pump(&self) {
+    fn pump(&self) -> bool {
         let start = Instant::now();
         let mut active = 0;
-        for index in 0..self.voices.len() as u32 {
-            if let (Some(context), Some(voice)) =
-                (self.context(index), &mut *lock(&self.voices[index as usize]))
-            {
-                pump(context, voice);
-                active += 1;
+        let snapshot = lock(&self.enabled).clone();
+        for (word, mut bits) in snapshot.into_iter().enumerate() {
+            while bits != 0 {
+                let index = word * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if let (Some(context), Some(voice)) =
+                    (self.context(index as u32), &mut *lock(&self.voices[index]))
+                {
+                    pump(context, voice);
+                    active += 1;
+                }
             }
         }
         let took = start.elapsed();
         if took.as_millis() >= 4 {
             tracing::debug!(active, ms = took.as_millis(), "slow XMA decoding pass");
         }
+        active > 0
     }
 }
 
@@ -590,6 +718,11 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         if valid & (1 << (1 - current)) == 0 {
             // Out of input: the overlap tail, then nothing.
             if let Some(decoder) = &mut voice.decoder {
+                if let Some(area) = lock(&HEAP).area(context.get(8))
+                    && area.owner == Some(voice.index)
+                {
+                    area.saved = Some(decoder.overlap());
+                }
                 let mut tail = Vec::new();
                 decoder.flush(&mut tail);
                 voice.pcm.extend(tail);
@@ -616,54 +749,41 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     if at < 32 {
         at = 32 + xma::packet(data, 0).map_or(0, |p| p.first_frame_bit as usize);
     }
-    let Some(frame) = xma::read_frame(data, at) else {
-        // This input is used up.
+    thread_local! { static FRAME: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) }; }
+    let next = FRAME.with_borrow_mut(|packed| {
+        let (bits, successor) = xma::read_frame_into(data, at, packed)?;
+        let decoder = voice.decoder.get_or_insert_with(|| {
+            const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
+            let mut decoder = xma::Decoder::new(channels, RATES[context.field(1, 27, 2) as usize]);
+            if let Some(saved) = lock(&HEAP).area(context.get(8)).and_then(|a| a.pending.take()) {
+                decoder.restore_overlap(&saved);
+            }
+            decoder
+        });
+        let loops = context.field(0, 12, 8);
+        let end = context.field(4, 0, 26) as usize;
+        let looping = loops != 0 && end != 0 && (at == end || (at < end && successor.is_none_or(|n| end < n)));
+        let kept = if looping { (context.field(1, 12, 2) as usize + 1) * xma::SUBFRAME_SAMPLES }
+            else { xma::FRAME_SAMPLES };
+        let skip = voice.skip.min(kept);
+        voice.skip -= skip;
+        voice.trace.frames += 1;
+        if let Err(e) = decoder.decode_range(packed, bits, skip * channels..kept * channels, |v| voice.pcm.push_back(v)) {
+            voice.trace.bad_frames += 1;
+            if voice.trace.bad_frames <= 2 {
+                tracing::debug!(at, bits, head = ?&packed[..packed.len().min(8)], %e, "XMA frame did not decode");
+            }
+        }
+        if looping {
+            if loops != 255 { context.set_field(0, 12, 8, loops - 1); }
+            voice.skip = context.field(1, 17, 3) as usize * xma::SUBFRAME_SAMPLES;
+            Some(context.field(3, 0, 26) as usize)
+        } else { Some(successor.unwrap_or(0)) }
+    });
+    let Some(next) = next else {
         context.set_field(0, 20 + current, 1, 0);
         return true;
     };
-    let decoder = voice.decoder.get_or_insert_with(|| {
-        const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
-        xma::Decoder::new(channels, RATES[context.field(1, 27, 2) as usize])
-    });
-    let mut pcm = Vec::with_capacity(xma::FRAME_SAMPLES * channels);
-    voice.trace.frames += 1;
-    if let Err(e) = decoder.decode(&frame.data, frame.bits, &mut pcm) {
-        voice.trace.bad_frames += 1;
-        if voice.trace.bad_frames <= 2 {
-            tracing::debug!(
-                at,
-                bits = frame.bits,
-                head = ?&frame.data[..frame.data.len().min(8)],
-                %e,
-                "XMA frame did not decode"
-            );
-        }
-    }
-    let mut next = frame.next.unwrap_or(0);
-    let loops = context.field(0, 12, 8);
-    let loop_end = context.field(4, 0, 26) as usize;
-    let ends_loop = loop_end != 0
-        && (frame.start == loop_end
-            || (frame.start < loop_end && frame.next.is_none_or(|n| loop_end < n)));
-    let looping = loops > 0 && ends_loop;
-    if looping {
-        let keep = (context.field(1, 12, 2) as usize + 1) * xma::SUBFRAME_SAMPLES * channels;
-        pcm.truncate(keep);
-        next = context.field(3, 0, 26) as usize;
-        if loops != 255 {
-            context.set_field(0, 12, 8, loops - 1);
-        }
-    }
-    // What is still to skip is this frame's (the stream's first, or a
-    // loop's first when it is its last too).
-    let skip = (voice.skip * channels).min(pcm.len());
-    voice.skip -= skip / channels;
-    voice.pcm.extend(&pcm[skip..]);
-    if looping {
-        // The loop's own skip is of its first frame, decoded next: not of
-        // this one, its last.
-        voice.skip = context.field(1, 17, 3) as usize * xma::SUBFRAME_SAMPLES;
-    }
     if next == 0 {
         context.set_field(0, 20 + current, 1, 0);
     }
@@ -705,9 +825,13 @@ fn wake_decoder() {
                 .name("victory XMA decoder".into())
                 .spawn(|| {
                     loop {
-                        xma().pump();
+                        let active = xma().pump();
                         // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
-                        std::thread::park_timeout(std::time::Duration::from_millis(2));
+                        if active {
+                            std::thread::park_timeout(std::time::Duration::from_millis(2));
+                        } else {
+                            std::thread::park();
+                        }
                     }
                 })
                 .map_or_else(|_| std::thread::current(), |h| h.thread().clone())
@@ -1319,6 +1443,7 @@ mod tests {
         context.set(4, second);
         context.set(5, input_apu);
         let mut voice = Voice {
+            index: 0,
             decoder: None,
             pcm: VecDeque::new(),
             skip: 0,

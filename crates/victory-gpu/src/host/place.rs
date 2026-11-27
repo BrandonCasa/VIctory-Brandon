@@ -37,6 +37,7 @@
 
 use super::*;
 use crate::shadow::Shadow;
+use std::sync::Arc;
 
 pub(super) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -128,7 +129,8 @@ pub(super) fn read_by(runs: &[&HostList], written: &[(usize, usize)]) -> bool {
         }
     }
     runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| {
+        let deferred = list.deferred();
+        deferred.copies.iter().any(|step| {
             // What reads, by kind ([`READERS`]).
             let (read, kind) = match step {
                 Step::Placed(p) => {
@@ -141,10 +143,11 @@ pub(super) fn read_by(runs: &[&HostList], written: &[(usize, usize)]) -> bool {
                 _ if ranges.is_empty() => (false, 0),
                 &Step::Copy(_, src, len) => (touches(&ranges, src, src + len), 1),
                 &Step::Fill(_, src, len, _) => (touches(&ranges, src, src + len), 2),
-                Step::Texture(staging) => {
-                    let (at, len) = staging.memory();
+                Step::Texture(index) => {
+                    let (at, len) = deferred.texture_uploads[*index].memory();
                     (touches(&ranges, at, at + len), 3)
                 }
+                Step::Builder(_) => (true, 4),
                 Step::Host(_, (from, to)) => (touches(&ranges, *from, *to), 4),
                 _ => (false, 0),
             };
@@ -318,6 +321,87 @@ impl HostList {
             wait_for_all(host, &self.list);
         }
         Some(between)
+    }
+
+    /// The canonical bytes of a read-only exact view, ordered between
+    /// earlier producers and the shader that consumes it.
+    pub(crate) fn copy_read_view(
+        &self,
+        from: &Arc<Shadow>,
+        to: &Arc<Shadow>,
+        address: u64,
+        len: u64,
+    ) {
+        if from.offset_in(address).is_none() || to.offset_in(address).is_none() {
+            return;
+        }
+        let len = len.min(from.left(address)).min(to.left(address));
+        if len == 0 {
+            return;
+        }
+        let Some(host) = host() else { return };
+        from.refresh(self, address, len);
+        self.keep(&from.buffer);
+        self.keep(&to.buffer);
+        // SAFETY: resources and offsets come from live shadows, and the
+        // destination has dedicated storage. Leave it in COMMON for reuse.
+        unsafe {
+            wait_for_all(host, &self.list);
+            self.list.CopyBufferRegion(
+                &to.buffer,
+                to.offset(address),
+                &from.buffer,
+                from.offset(address),
+                len,
+            );
+            self.list.ResourceBarrier(&[transition(
+                &to.buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+            wait_for_all(host, &self.list);
+        }
+    }
+
+    /// Snapshot constants from the authoritative GPU allocation at the
+    /// consuming command. The source may contain stores by an earlier draw
+    /// in the same list; a submission prelude cannot observe those stores.
+    pub(crate) fn gpu_constants(
+        &self,
+        from: &std::sync::Arc<Shadow>,
+        address: u64,
+        len: u64,
+    ) -> Option<ID3D12Resource> {
+        let max_len = if victory_shader::emit::mapped_views() {
+            u64::from(u32::MAX)
+        } else {
+            65536
+        };
+        if len == 0
+            || len > max_len
+            || from.offset_in(address).is_none()
+            || from.left(address) < len
+        {
+            return None;
+        }
+        let host = host()?;
+        let copy = self.between(host, len)?;
+        from.refresh(self, address, len);
+        self.keep(&from.buffer);
+        // SAFETY: both allocations are kept by the recording; only the
+        // guest-visible bytes are copied to the aligned beginning.
+        unsafe {
+            wait_for_all(host, &self.list);
+            self.list
+                .CopyBufferRegion(&copy, 0, &from.buffer, from.offset(address), len);
+            self.list.ResourceBarrier(&[transition(
+                &copy,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            )]);
+            wait_for_all(host, &self.list);
+        }
+        Some(copy)
     }
 
     /// A buffer on the card for this recording alone.

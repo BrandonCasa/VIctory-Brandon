@@ -863,6 +863,7 @@ impl Panel {
         back: &ID3D12Resource,
         (width, height): (u32, u32),
         format: DXGI_FORMAT,
+        state: &mut D3D12_RESOURCE_STATES,
     ) {
         self.last_size = (width, height);
         if !shown().load(Ordering::Relaxed) || self.failed {
@@ -936,6 +937,10 @@ impl Panel {
                 bottom: h.min(height),
                 back: 1,
             };
+            if *state != D3D12_RESOURCE_STATE_COPY_DEST {
+                list.ResourceBarrier(&[transition(back, *state, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                *state = D3D12_RESOURCE_STATE_COPY_DEST;
+            }
             list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&part));
         }
         self.cost += began.elapsed();

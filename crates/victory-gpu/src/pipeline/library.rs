@@ -516,7 +516,7 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
-    name: &str,
+    key: &dyn Fn() -> String,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
@@ -524,11 +524,13 @@ pub(crate) fn pipeline(
         let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
         create()
     };
-    let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
+    let key = key();
+    let name = key.as_str();
+    let wide = HSTRING::from(name);
     let began = std::time::Instant::now();
     let loaded = {
         let mut loading = crate::timeline::span("pipeline: acquire library load guards");

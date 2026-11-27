@@ -256,6 +256,21 @@ impl Tables {
 /// the block count. The stream carries no size: bytes after the last one the
 /// lanes need are ignored, a stream that runs out is an error.
 pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(), Error> {
+    decode_to(bc, src, dst, tables, false)
+}
+
+/// Decode into private storage which the caller discards on error.
+pub fn decode_private(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(), Error> {
+    decode_to(bc, src, dst, tables, true)
+}
+
+fn decode_to(
+    bc: u8,
+    src: &[u8],
+    dst: &mut [u8],
+    tables: &Tables,
+    private: bool,
+) -> Result<(), Error> {
     let block = match bc {
         1 | 4 => 8,
         3 | 5 | 6 | 7 => 16,
@@ -274,10 +289,43 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
     };
     let stride = widths.len() * per;
-    let mut records = vec![0u8; blocks * stride];
-    let mut next = src.iter().copied();
-    lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
-    let records = records.chunks_exact(stride);
+    let mut input = src.iter().copied();
+    let mut reader = LaneReader::new(widths, per);
+    if !private {
+        let mut all = vec![0; blocks * stride];
+        for record in all.chunks_exact_mut(stride) {
+            reader.read(tables, |_| input.next(), record)?;
+        }
+        return reconstruct(bc, all.chunks_exact(stride), dst, block, tables);
+    }
+    let mut lane_error = None;
+    let mut records = (0..blocks)
+        .map_while(|_| {
+            let mut record = [0; 32];
+            match reader.read(tables, |_| input.next(), &mut record[..stride]) {
+                Ok(()) => Some(record),
+                Err(error) => {
+                    lane_error = Some(error);
+                    None
+                }
+            }
+        })
+        .fuse();
+    let result = reconstruct(bc, &mut records, dst, block, tables);
+    // Lane errors historically precede any error in block reconstruction.
+    if result.is_err() {
+        records.for_each(drop);
+    }
+    lane_error.map_or(result, Err)
+}
+
+fn reconstruct<R: AsRef<[u8]>>(
+    bc: u8,
+    records: impl Iterator<Item = R>,
+    dst: &mut [u8],
+    block: usize,
+    tables: &Tables,
+) -> Result<(), Error> {
     let out = dst.chunks_exact_mut(block);
     let t = tables;
     match bc {
@@ -406,6 +454,7 @@ fn bucket_of(t: &Tables, model: u8, slot: u32) -> usize {
 // shortcut: one lane step at a time (BC1 roughly 30-60 MB/s, BC7 15-20 MB/s
 // on one core); if texture streaming needs more, run the schedule only to
 // split the input per lane and decode the lanes apart.
+#[cfg(test)]
 fn lanes(
     t: &Tables,
     widths: &[u8],
@@ -414,59 +463,81 @@ fn lanes(
     mut fetch: impl FnMut(usize) -> Option<u8>,
     records: &mut [u8],
 ) -> Result<(), Error> {
-    let mut lanes = [Lane::default(); 16];
-    let lanes = &mut lanes[..widths.len()];
-    for (lane, &width) in lanes.iter_mut().zip(widths) {
-        lane.width = width;
-        lane.need = true;
-    }
-    let stride = widths.len() * per;
-    let full = (1u32 << widths.len()) - 1;
-    let (mut pos, mut done, mut idle) = (0, 0u32, 0);
-    // Where symbol `pos` of lane 0 goes; lane j's is `per * j` further on.
-    let mut at = 0;
-    while pos < blocks * per {
-        let (mut taken, mut moved) = (0, false);
-        for (j, lane) in lanes.iter_mut().enumerate() {
-            let bit = 1 << j;
-            let before = taken;
-            if !lane.stalled {
-                lane.step(t)?;
-            }
-            let waiting = lane.out.is_some() && done & bit != 0;
-            if lane.need && !waiting && taken < ROUND_BYTES {
-                // Past the end nothing arrives; in a valid stream only finished lanes ask there.
-                if let Some(b) = fetch(j) {
-                    lane.latch = Some(b);
-                    taken += 1;
-                }
-            }
-            lane.stalled = (lane.need && before >= ROUND_BYTES) || waiting;
-            if !lane.stalled
-                && let Some(sym) = lane.out.take()
-            {
-                records[at + j * per] = sym;
-                done |= bit;
-                moved = true;
-            }
-        }
-        if done == full {
-            pos += 1;
-            at += if pos.is_multiple_of(per) {
-                stride - per + 1
-            } else {
-                1
-            };
-            done = 0;
-            moved = true;
-        }
-        // Nothing read and nothing delivered for a few rounds: no lane can go on.
-        idle = if taken > 0 || moved { 0 } else { idle + 1 };
-        if idle > 3 {
-            return Err(Error("the stream ends early or is corrupt"));
-        }
+    let mut reader = LaneReader::new(widths, per);
+    for record in records.chunks_exact_mut(widths.len() * per).take(blocks) {
+        reader.read(t, &mut fetch, record)?;
     }
     Ok(())
+}
+
+struct LaneReader {
+    lanes: [Lane; 16],
+    count: usize,
+    per: usize,
+}
+
+impl LaneReader {
+    fn new(widths: &[u8], per: usize) -> Self {
+        let mut lanes = [Lane::default(); 16];
+        for (lane, &width) in lanes.iter_mut().zip(widths) {
+            lane.width = width;
+            lane.need = true;
+        }
+        Self {
+            lanes,
+            count: widths.len(),
+            per,
+        }
+    }
+
+    fn read(
+        &mut self,
+        t: &Tables,
+        mut fetch: impl FnMut(usize) -> Option<u8>,
+        records: &mut [u8],
+    ) -> Result<(), Error> {
+        let lanes = &mut self.lanes[..self.count];
+        let per = self.per;
+        let full = (1u32 << self.count) - 1;
+        let (mut pos, mut done, mut idle) = (0usize, 0u32, 0);
+        while pos < per {
+            let (mut taken, mut moved) = (0, false);
+            for (j, lane) in lanes.iter_mut().enumerate() {
+                let bit = 1 << j;
+                let before = taken;
+                if !lane.stalled {
+                    lane.step(t)?;
+                }
+                let waiting = lane.out.is_some() && done & bit != 0;
+                if lane.need && !waiting && taken < ROUND_BYTES {
+                    // Past the end nothing arrives; in a valid stream only finished lanes ask there.
+                    if let Some(b) = fetch(j) {
+                        lane.latch = Some(b);
+                        taken += 1;
+                    }
+                }
+                lane.stalled = (lane.need && before >= ROUND_BYTES) || waiting;
+                if !lane.stalled
+                    && let Some(sym) = lane.out.take()
+                {
+                    records[pos + j * per] = sym;
+                    done |= bit;
+                    moved = true;
+                }
+            }
+            if done == full {
+                pos += 1;
+                done = 0;
+                moved = true;
+            }
+            // Nothing read and nothing delivered for a few rounds: no lane can go on.
+            idle = if taken > 0 || moved { 0 } else { idle + 1 };
+            if idle > 3 {
+                return Err(Error("the stream ends early or is corrupt"));
+            }
+        }
+        Ok(())
+    }
 }
 
 // Blocks.
@@ -526,8 +597,8 @@ const BC3: Widths = widths([5, 6, 5, 5, 6, 5, 8, 8], 16, 16, true);
 const BC4: Widths = widths([8, 8, 0, 0, 0, 0, 0, 0], 16, 0, false);
 const BC5: Widths = widths([8, 8, 8, 8, 0, 0, 0, 0], 32, 0, true);
 
-fn plain<'a>(
-    records: impl Iterator<Item = &'a [u8]>,
+fn plain<'a, R: AsRef<[u8]>>(
+    records: impl Iterator<Item = R>,
     out: impl Iterator<Item = &'a mut [u8]>,
     dictionary: &[Plain],
     w: &Widths,
@@ -537,6 +608,7 @@ fn plain<'a>(
     let mut history = vec![Plain::default(); HISTORY];
     let zero = Plain::default();
     for (i, (s, block)) in records.zip(out).enumerate() {
+        let s = s.as_ref();
         let (ep_ref, ix_ref) = references(s, w.paired);
         let ep_ref = &pick(i, ep_ref, &history, dictionary, &zero).ep;
         let ix_ref = &pick(i, ix_ref, &history, dictionary, &zero).ix;
@@ -757,14 +829,15 @@ fn bc7_precision(ctrl: u16) -> [u8; 4] {
     p
 }
 
-fn bc7<'a>(
-    records: impl Iterator<Item = &'a [u8]>,
+fn bc7<'a, R: AsRef<[u8]>>(
+    records: impl Iterator<Item = R>,
     out: impl Iterator<Item = &'a mut [u8]>,
     t: &Tables,
 ) -> Result<(), Error> {
     let mut history = vec![(Bc7Ep::default(), Bc7Ix::default()); HISTORY];
     let zero = (Bc7Ep::default(), Bc7Ix::default());
     for (i, (s, block)) in records.zip(out).enumerate() {
+        let s = s.as_ref();
         let (ep_ref, ix_ref) = references(s, true);
         let ctrl = t.ctrl7[usize::from(s[31] & 15) << 5 | usize::from(s[30] & 31)];
         if ctrl == 0 {
@@ -1057,8 +1130,8 @@ fn bc6_index_bits(mode: u8) -> u8 {
     }
 }
 
-fn bc6<'a>(
-    records: impl Iterator<Item = &'a [u8]>,
+fn bc6<'a, R: AsRef<[u8]>>(
+    records: impl Iterator<Item = R>,
     out: impl Iterator<Item = &'a mut [u8]>,
     dictionary: &[(Bc6Ep, Bc6Ix)],
 ) -> Result<(), Error> {
@@ -1077,6 +1150,7 @@ fn bc6<'a>(
         })
     };
     for (i, (s, block)) in records.zip(out).enumerate() {
+        let s = s.as_ref();
         let (ep_ref, ix_ref) = references(s, true);
         let mode = s[30].wrapping_add(1);
         if !(1..=14).contains(&mode) {

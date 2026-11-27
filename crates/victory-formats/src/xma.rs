@@ -126,12 +126,29 @@ impl Cursor<'_> {
 /// Reads the frame starting at bit `start` (a frame start inside a packet's
 /// payload) of `data`, a buffer of whole packets of one stream.
 pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
+    let mut data_out = Vec::new();
+    let (bits, next) = read_frame_into(data, start, &mut data_out)?;
+    Some(Frame {
+        data: data_out,
+        bits,
+        start,
+        next,
+    })
+}
+
+/// Packs one frame into reusable storage; returns its bit count and successor.
+pub fn read_frame_into(
+    data: &[u8],
+    start: usize,
+    out: &mut Vec<u8>,
+) -> Option<(usize, Option<usize>)> {
+    out.clear();
     let mut cursor = Cursor { data, pos: start };
     let bits = cursor.bits(LENGTH_BITS)? as usize;
     if bits <= LENGTH_BITS as usize || bits == 0x7fff {
         return None;
     }
-    let mut out = Vec::with_capacity(bits.div_ceil(8));
+    out.reserve(bits.div_ceil(8));
     let mut cursor = Cursor { data, pos: start };
     for _ in 0..bits / 8 {
         out.push(cursor.byte()?);
@@ -142,12 +159,7 @@ pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
     }
     let end = cursor.pos;
     let next = next_frame(data, start, end);
-    Some(Frame {
-        data: out,
-        bits,
-        start,
-        next,
-    })
+    Some((bits, next))
 }
 
 /// Where the frame after the one at `start`..`end` begins: right after it,
@@ -240,6 +252,7 @@ impl Bits<'_> {
 struct Vlc {
     /// Left-aligned code, length, symbol; sorted by code.
     codes: Vec<(u32, u8, i32)>,
+    prefix: [[u16; 2]; 256],
 }
 
 impl Vlc {
@@ -250,13 +263,30 @@ impl Vlc {
             codes.push((code as u32, len, symbol));
             code += 1 << (32 - len);
         }
-        Vlc { codes }
+        let prefix = std::array::from_fn(|p| {
+            let lo = (p as u32) << 24;
+            let first = codes.partition_point(|c| c.0 <= lo) - 1;
+            let last = codes.partition_point(|c| c.0 <= (lo | 0x00ff_ffff)) - 1;
+            if first == last {
+                let (_, bits, symbol) = codes[first];
+                [symbol as i16 as u16, u16::from(bits) | 0x8000]
+            } else {
+                [first as u16, last as u16]
+            }
+        });
+        Vlc { codes, prefix }
     }
 
     fn read(&self, bits: &mut Bits) -> i32 {
         let v = bits.peek32();
-        let i = self.codes.partition_point(|c| c.0 <= v) - 1;
-        let (_, len, symbol) = self.codes[i];
+        let [first, last] = self.prefix[(v >> 24) as usize];
+        if last & 0x8000 != 0 {
+            bits.pos += usize::from(last & 0xff);
+            return i32::from(first as i16);
+        }
+        let candidates = &self.codes[usize::from(first)..=usize::from(last)];
+        let i = candidates.partition_point(|c| c.0 <= v) - 1;
+        let (_, len, symbol) = candidates[i];
         bits.pos += len as usize;
         symbol
     }
@@ -546,13 +576,22 @@ impl Channel {
     }
 }
 
+struct BandLayout {
+    num_sfb: [usize; BLOCK_SIZES],
+    sfb_offsets: [[usize; MAX_BANDS + 1]; BLOCK_SIZES],
+    sf_offsets: [[[usize; MAX_BANDS]; BLOCK_SIZES]; BLOCK_SIZES],
+}
+
+#[derive(Clone)]
+pub struct Overlap {
+    channels: Vec<(usize, [f32; FRAME_SAMPLES / 2])>,
+}
+
 /// Decodes the frames of one mono or stereo stream.
 #[derive(Clone)]
 pub struct Decoder {
     channels: usize,
-    num_sfb: [usize; BLOCK_SIZES],
-    sfb_offsets: [[usize; MAX_BANDS + 1]; BLOCK_SIZES],
-    sf_offsets: [[[usize; MAX_BANDS]; BLOCK_SIZES]; BLOCK_SIZES],
+    layout: &'static BandLayout,
     ch: [Channel; 2],
     // Per subframe.
     subframe_len: usize,
@@ -572,52 +611,54 @@ pub struct Decoder {
 impl Decoder {
     pub fn new(channels: usize, sample_rate: u32) -> Decoder {
         let channels = channels.clamp(1, 2);
-        let rate = match sample_rate {
-            r if r > 44_100 => 48_000,
-            r if r > 32_000 => 44_100,
-            r if r > 24_000 => 32_000,
-            _ => 24_000,
-        };
-        let mut sfb_offsets = [[0usize; MAX_BANDS + 1]; BLOCK_SIZES];
-        let mut num_sfb = [0usize; BLOCK_SIZES];
-        for i in 0..BLOCK_SIZES {
-            let subframe_len = FRAME_SAMPLES >> i;
-            let offsets = &mut sfb_offsets[i];
-            let mut band = 1;
-            for &freq in CRITICAL_FREQ.iter().take(MAX_BANDS - 1) {
-                if offsets[band - 1] >= subframe_len {
-                    break;
-                }
-                let offset = ((subframe_len * 2 * freq as usize) / rate + 2) & !3;
-                if offset > offsets[band - 1] {
-                    offsets[band] = offset;
-                    band += 1;
-                }
-                if offset >= subframe_len {
-                    break;
-                }
-            }
-            offsets[band - 1] = subframe_len;
-            num_sfb[i] = band - 1;
-        }
-        let mut sf_offsets = [[[0usize; MAX_BANDS]; BLOCK_SIZES]; BLOCK_SIZES];
-        for i in 0..BLOCK_SIZES {
-            for b in 0..num_sfb[i] {
-                let offset = ((sfb_offsets[i][b] + sfb_offsets[i][b + 1] - 1) << i) >> 1;
-                for x in 0..BLOCK_SIZES {
-                    let mut v = 0;
-                    while v + 1 < MAX_BANDS && (sfb_offsets[x][v + 1] << x) < offset {
-                        v += 1;
+        static LAYOUTS: [OnceLock<BandLayout>; 4] = [const { OnceLock::new() }; 4];
+        let index = [24_000, 32_000, 44_100].partition_point(|&limit| sample_rate > limit);
+        let layout = LAYOUTS[index].get_or_init(|| {
+            let rate = [24_000, 32_000, 44_100, 48_000][index];
+            let mut sfb_offsets = [[0usize; MAX_BANDS + 1]; BLOCK_SIZES];
+            let mut num_sfb = [0usize; BLOCK_SIZES];
+            for i in 0..BLOCK_SIZES {
+                let subframe_len = FRAME_SAMPLES >> i;
+                let offsets = &mut sfb_offsets[i];
+                let mut band = 1;
+                for &freq in CRITICAL_FREQ.iter().take(MAX_BANDS - 1) {
+                    if offsets[band - 1] >= subframe_len {
+                        break;
                     }
-                    sf_offsets[i][x][b] = v;
+                    let offset = ((subframe_len * 2 * freq as usize) / rate + 2) & !3;
+                    if offset > offsets[band - 1] {
+                        offsets[band] = offset;
+                        band += 1;
+                    }
+                    if offset >= subframe_len {
+                        break;
+                    }
+                }
+                offsets[band - 1] = subframe_len;
+                num_sfb[i] = band - 1;
+            }
+            let mut sf_offsets = [[[0usize; MAX_BANDS]; BLOCK_SIZES]; BLOCK_SIZES];
+            for i in 0..BLOCK_SIZES {
+                for b in 0..num_sfb[i] {
+                    let offset = ((sfb_offsets[i][b] + sfb_offsets[i][b + 1] - 1) << i) >> 1;
+                    for x in 0..BLOCK_SIZES {
+                        let mut v = 0;
+                        while v + 1 < MAX_BANDS && (sfb_offsets[x][v + 1] << x) < offset {
+                            v += 1;
+                        }
+                        sf_offsets[i][x][b] = v;
+                    }
                 }
             }
-        }
+            BandLayout {
+                num_sfb,
+                sfb_offsets,
+                sf_offsets,
+            }
+        });
         Decoder {
             channels,
-            num_sfb,
-            sfb_offsets,
-            sf_offsets,
+            layout,
             ch: [Channel::new(), Channel::new()],
             subframe_len: FRAME_SAMPLES,
             channels_for_cur_subframe: 0,
@@ -636,6 +677,29 @@ impl Decoder {
         self.channels
     }
 
+    pub fn overlap(&self) -> Overlap {
+        Overlap {
+            channels: self.ch[..self.channels]
+                .iter()
+                .map(|c| {
+                    (
+                        c.prev_block_len,
+                        c.out[..FRAME_SAMPLES / 2].try_into().unwrap(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    pub fn restore_overlap(&mut self, saved: &Overlap) {
+        if saved.channels.len() == self.channels {
+            for (channel, (previous, tail)) in self.ch.iter_mut().zip(&saved.channels) {
+                channel.prev_block_len = *previous;
+                channel.out[..FRAME_SAMPLES / 2].copy_from_slice(tail);
+            }
+        }
+    }
+
     /// Forgets the overlap with earlier frames (a new stream or a seek).
     pub fn reset(&mut self) {
         self.ch = [Channel::new(), Channel::new()];
@@ -644,6 +708,18 @@ impl Decoder {
     /// Decodes one frame (`frame.data`, `frame.bits`) and appends
     /// `FRAME_SAMPLES` interleaved samples per channel to `out`.
     pub fn decode(&mut self, data: &[u8], bits: usize, out: &mut Vec<i16>) -> Result<(), Error> {
+        self.decode_range(data, bits, 0..FRAME_SAMPLES * self.channels, |v| {
+            out.push(v)
+        })
+    }
+
+    pub fn decode_range(
+        &mut self,
+        data: &[u8],
+        bits: usize,
+        range: std::ops::Range<usize>,
+        mut emit: impl FnMut(i16),
+    ) -> Result<(), Error> {
         let mut b = Bits {
             data,
             pos: 0,
@@ -660,10 +736,8 @@ impl Decoder {
                 self.ch[c].out = [0.0; FRAME_SAMPLES + FRAME_SAMPLES / 2];
             }
         }
-        for i in 0..FRAME_SAMPLES {
-            for c in 0..self.channels {
-                out.push(to_i16(self.ch[c].out[i]));
-            }
+        for n in range.start..range.end.min(FRAME_SAMPLES * self.channels) {
+            emit(to_i16(self.ch[n % self.channels].out[n / self.channels]));
         }
         for c in 0..self.channels {
             self.ch[c].out.copy_within(FRAME_SAMPLES.., 0);
@@ -908,7 +982,7 @@ impl Decoder {
         let codes = codes();
         for i in 0..self.channels_for_cur_subframe {
             let c = self.channel_indexes[i];
-            let sf_offsets = self.sf_offsets[self.table_idx][self.ch[c].table_idx];
+            let sf_offsets = self.layout.sf_offsets[self.table_idx][self.ch[c].table_idx];
             let ch = &mut self.ch[c];
             let target = 1 - ch.scale_factor_idx;
             ch.scale_factors = target;
@@ -992,7 +1066,7 @@ impl Decoder {
             self.parsed_all_subframes = true;
         }
         self.table_idx = log2(FRAME_SAMPLES / subframe_len) as usize;
-        self.num_bands = self.num_sfb[self.table_idx];
+        self.num_bands = self.layout.num_sfb[self.table_idx];
         self.subframe_len = subframe_len;
         self.esc_len = log2(subframe_len - 1) + 1;
 
@@ -1083,16 +1157,28 @@ impl Decoder {
             self.inverse_channel_transform();
             // Output in [-1, 1] for 16-bit streams.
             let scale = 2.0 / subframe_len as f32 / 32768.0;
-            let sfb = self.sfb_offsets[self.table_idx];
+            let sfb = self.layout.sfb_offsets[self.table_idx];
+            static GAINS: OnceLock<[f32; 505]> = OnceLock::new();
+            let gains = GAINS.get_or_init(|| {
+                std::array::from_fn(|i| 10f32.powf((i as i32 - 256) as f32 / 20.0))
+            });
             let mut tmp = [0f32; FRAME_SAMPLES];
             for i in 0..self.channels_for_cur_subframe {
                 let ch = &mut self.ch[self.channel_indexes[i]];
                 let sf = ch.saved_scale_factors[ch.scale_factors];
                 for band in 0..self.num_bands {
                     let end = sfb[band + 1].min(subframe_len);
-                    let exp = ch.quant_step - (ch.max_scale_factor - sf[band]) * ch.scale_factor_step;
-                    let quant = 10f32.powf(exp as f32 / 20.0);
-                    for (t, &c) in tmp[sfb[band]..end].iter_mut().zip(&ch.coeffs[sfb[band]..end]) {
+                    let exp =
+                        ch.quant_step - (ch.max_scale_factor - sf[band]) * ch.scale_factor_step;
+                    let quant = if (-256..=248).contains(&exp) {
+                        gains[(exp + 256) as usize]
+                    } else {
+                        10f32.powf(exp as f32 / 20.0)
+                    };
+                    for (t, &c) in tmp[sfb[band]..end]
+                        .iter_mut()
+                        .zip(&ch.coeffs[sfb[band]..end])
+                    {
                         *t = c * quant;
                     }
                 }
@@ -1134,7 +1220,7 @@ impl Decoder {
         if !self.transform || self.channels_for_cur_subframe != 2 {
             return;
         }
-        let sfb = self.sfb_offsets[self.table_idx];
+        let sfb = self.layout.sfb_offsets[self.table_idx];
         let [a, b] = &mut self.ch;
         for band in 0..self.num_bands {
             let range = sfb[band]..sfb[band + 1].min(self.subframe_len);

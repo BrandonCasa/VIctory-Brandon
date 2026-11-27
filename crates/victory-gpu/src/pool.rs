@@ -183,6 +183,7 @@ pub(crate) struct Piece {
 }
 
 struct Block<B> {
+    empty: bool,
     memory: B,
     free: Ranges,
     /// The end of the highest piece ever taken: above it the memory is as
@@ -196,6 +197,7 @@ struct Block<B> {
 }
 
 struct Pool<B> {
+    empty: usize,
     /// `None`: a block let go, its place to be used again.
     blocks: Vec<Option<Block<B>>>,
     /// Pieces given back, and when each may be used again.
@@ -210,7 +212,14 @@ struct Pool<B> {
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool {
+            empty: 0,
+            blocks: Vec::new(),
+            resting: VecDeque::new(),
+            spare: 0,
+            most,
+            retry_growth_at: 0,
+        }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -248,7 +257,7 @@ impl<B: Clone> Pool<B> {
         if found.is_none() && ripe.ahead > 0 {
             // The one that has been there the longest.
             let mut unripe: Vec<(u64, usize)> =
-                self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
+                self.blocks.iter().enumerate().filter_map(|(i, b)| b.as_ref().filter(|b| !ripe.is(b)).map(|b| (b.made, i))).collect();
             unripe.sort_unstable();
             found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
         }
@@ -260,6 +269,9 @@ impl<B: Clone> Pool<B> {
                 (i, self.blocks[i].as_mut()?.free.take(len, align)?)
             }
         };
+        if std::mem::take(&mut self.blocks[i].as_mut()?.empty) {
+            self.empty -= 1;
+        }
         if ripe.ahead > 0 {
             if !ripe.is(self.blocks[i].as_ref()?) {
                 let n = UNRIPE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -267,8 +279,7 @@ impl<B: Clone> Pool<B> {
                     tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
                 }
             }
-            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
-            if empty < ripe.ahead
+            if self.empty < ripe.ahead
                 && let Some(memory) = self.grow(now, &mut make)
             {
                 self.add(memory, ripe.started);
@@ -302,7 +313,15 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.empty += 1;
+        self.blocks[i] = Some(Block {
+            empty: true,
+            memory,
+            free: Ranges::new(BLOCK),
+            used_to: 0,
+            made,
+            since: crate::host::now_ms(),
+        });
         i
     }
 
@@ -326,7 +345,11 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
-                any |= block.free.whole(BLOCK);
+                if block.free.whole(BLOCK) && !block.empty {
+                    block.empty = true;
+                    self.empty += 1;
+                    any = true;
+                }
             }
         }
         // (Without a piece given back too, once there is less room.)
@@ -335,10 +358,11 @@ impl<B: Clone> Pool<B> {
             self.spare = most;
             let mut spare = 0;
             for block in &mut self.blocks {
-                if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
+                if block.as_ref().is_some_and(|b| b.empty) {
                     spare += 1;
                     if spare > most {
                         *block = None;
+                        self.empty -= 1;
                     }
                 }
             }

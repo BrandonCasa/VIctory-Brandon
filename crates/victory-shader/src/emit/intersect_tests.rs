@@ -193,6 +193,7 @@ pub(super) fn build_compute_shader(
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        indexed_forms: 0,
         root_indexed_views: res.root_indexed_views.clone(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

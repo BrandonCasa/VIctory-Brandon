@@ -671,7 +671,9 @@ impl Work for Job {
                         let st = if *ov_state == u32::MAX { ov.state.load(Relaxed) } else { *ov_state };
                         (&ov.texture, st)
                     });
-                    super::show_planes(&texture.texture, state, over, shown);
+                    if !super::show_planes(&texture.texture, state, over, shown) {
+                        tracing::error!(frame = shown.frame, "queued presentation failed");
+                    }
                 }
                 QUEUED.fetch_sub(1, Relaxed);
             }

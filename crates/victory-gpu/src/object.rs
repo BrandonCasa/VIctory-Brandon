@@ -370,7 +370,12 @@ pub(crate) const fn missing_table<const KIND: usize, const N: usize>() -> [*cons
     table
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+pub(crate) fn release_owned(object: This) {
+    slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+}
+
+#[cfg(any(test, windows))]
 pub(crate) fn slot<F: Copy>(object: This, offset: usize) -> F {
     // SAFETY: `object` is ours and its table has the slot.
     let f = unsafe { *(*object).functions.add(offset / 8) };

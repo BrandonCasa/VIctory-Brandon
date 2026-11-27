@@ -605,24 +605,85 @@ impl Layout {
     /// another texture right behind them. All of the layout where slices
     /// follow each other (each holds its whole chain).
     pub fn bytes_from(&self, first: u32) -> u64 {
-        let whole = first == 0
-            || self.slices != 1
-            || self.thick
-            || self.desc.dimension == Dimension::Tex3d
-            || self.desc.samples != 1
-            || first >= self.desc.mips;
-        if whole {
+        if first == 0 || first >= self.desc.mips || !self.has_prefix_levels() {
             return self.size;
         }
         self.mips[first as usize..]
             .iter()
-            .map(|m| match m.tail {
-                Some(_) => self.alignment,
-                None => m.offset + u64::from(m.pitch) * u64::from(m.rows) * u64::from(self.desc.element_bytes),
-            })
+            .map(|m| self.mip_end(m))
             .max()
             .unwrap_or(self.size)
-            .min(self.size)
+    }
+
+    fn has_prefix_levels(&self) -> bool {
+        self.slices == 1
+            && !self.thick
+            && self.desc.dimension != Dimension::Tex3d
+            && self.desc.samples == 1
+    }
+
+    fn mip_end(&self, m: &Mip) -> u64 {
+        match m.tail {
+            Some(_) => self.alignment,
+            None => {
+                m.offset
+                    + u64::from(m.pitch) * u64::from(m.rows) * u64::from(self.desc.element_bytes)
+            }
+        }
+        .min(self.size)
+    }
+
+    /// Storage slabs touched by one logical mip and array slice. Tail mips
+    /// conservatively share their tile. A volume mip can visit several
+    /// disjoint slabs with other mip levels between them.
+    pub fn subresource_runs(
+        &self,
+        mip: u32,
+        slice: u32,
+    ) -> Option<impl Iterator<Item = std::ops::Range<usize>> + Clone + '_> {
+        let m = self.mips.get(mip as usize)?;
+        let volume = self.desc.dimension == Dimension::Tex3d;
+        if (volume && slice != 0) || slice >= self.slices {
+            return None;
+        }
+        let slab_depth = if self.thick { self.block[2] } else { 1 };
+        let slabs = if volume {
+            m.depth.div_ceil(slab_depth)
+        } else {
+            1
+        };
+        let bytes = if m.tail.is_some() {
+            self.alignment
+        } else {
+            u64::from(m.pitch)
+                * u64::from(m.rows)
+                * u64::from(self.desc.element_bytes)
+                * u64::from(slab_depth)
+                * u64::from(self.desc.samples)
+        };
+        let first = u64::from(slice) * self.slice_size + m.offset;
+        let end = first
+            .checked_add(u64::from(slabs - 1) * self.slice_size)?
+            .checked_add(bytes)?;
+        if end > self.size || usize::try_from(end).is_err() {
+            return None;
+        }
+        Some((0..slabs).map(move |slab| {
+            let start = first + u64::from(slab) * self.slice_size;
+            start as usize..(start + bytes) as usize
+        }))
+    }
+
+    /// Suffix extents, smallest mip first, each visited once.
+    pub fn suffix_extents(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
+        self.mips.iter().enumerate().rev().scan(0, |end, (i, m)| {
+            *end = if i == 0 || !self.has_prefix_levels() {
+                self.size
+            } else {
+                (*end).max(self.mip_end(m))
+            };
+            Some((i as u32, *end))
+        })
     }
 
     /// Copies one subresource out of tiled memory (the whole texture,
@@ -639,7 +700,7 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk::<true>(tiled, linear, mip, slice, row_pitch, depth_pitch)
+        self.walk::<true>(tiled, linear, mip, slice, row_pitch, depth_pitch, None)
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -652,7 +713,15 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk::<false>(linear, tiled, mip, slice, row_pitch, depth_pitch)
+        self.walk::<false>(linear, tiled, mip, slice, row_pitch, depth_pitch, None)
+    }
+
+    /// Reuse the column plan when several array slices of one layout are converted.
+    pub fn conversion(&self) -> Conversion<'_> {
+        Conversion {
+            layout: self,
+            columns: std::collections::HashMap::new(),
+        }
     }
 
     /// Copies contiguous runs in one direction between the two layouts.
@@ -665,6 +734,7 @@ impl Layout {
         slice: u32,
         row_pitch: usize,
         depth_pitch: usize,
+        cache: Option<&mut std::collections::HashMap<u32, Columns>>,
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
         let depth = m.depth;
@@ -710,6 +780,7 @@ impl Layout {
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
         // the same contiguous runs repeat on every row, including mip tails.
+        let make = || {
         let mut runs = Vec::new();
         if !linear {
             let mut first_linear = 0;
@@ -727,11 +798,23 @@ impl Layout {
         }
         // A mip can end partway through the last run. Check the other runs
         // once so each row can copy them as fixed-size chunks.
-        let (body, last) = runs.split_at(runs.len().saturating_sub(1));
+        let body = &runs[..runs.len().saturating_sub(1)];
         let chunk_size = body.first().map(|run| run.2).filter(|&size| {
             body.iter()
                 .all(|&(offset, _, len)| len == size && offset.is_multiple_of(size))
         });
+            Columns { runs, chunk_size }
+        };
+        let single;
+        let columns: &Columns = match cache {
+            Some(cache) if !linear && self.slices > 1 => cache.entry(mip).or_insert_with(make),
+            _ => {
+                single = make();
+                &single
+            }
+        };
+        let (body, last) = columns.runs.split_at(columns.runs.len().saturating_sub(1));
+        let chunk_size = columns.chunk_size;
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
@@ -759,6 +842,59 @@ impl Layout {
             }
         }
         Ok(())
+    }
+}
+
+struct Columns {
+    runs: Vec<(usize, usize, usize)>,
+    chunk_size: Option<usize>,
+}
+
+pub struct Conversion<'a> {
+    layout: &'a Layout,
+    columns: std::collections::HashMap<u32, Columns>,
+}
+
+impl Conversion<'_> {
+    pub fn detile(
+        &mut self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        self.layout.walk::<true>(
+            tiled,
+            linear,
+            mip,
+            slice,
+            row_pitch,
+            depth_pitch,
+            Some(&mut self.columns),
+        )
+    }
+
+    /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
+    pub fn tile(
+        &mut self,
+        tiled: &mut [u8],
+        mip: u32,
+        slice: u32,
+        linear: &[u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        self.layout.walk::<false>(
+            linear,
+            tiled,
+            mip,
+            slice,
+            row_pitch,
+            depth_pitch,
+            Some(&mut self.columns),
+        )
     }
 }
 

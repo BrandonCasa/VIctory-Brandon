@@ -85,6 +85,7 @@ impl HostPolicy {
             let ours = victory_gpu::titlewrite::import(name, address);
             // Renderer port #2: records copied into the view heap are marked.
             let ours = victory_gpu::port_descriptors::import(name, ours);
+            let ours = crate::modules::audio::overlap_import(name, ours);
             if ours != address {
                 return Some(ours);
             }

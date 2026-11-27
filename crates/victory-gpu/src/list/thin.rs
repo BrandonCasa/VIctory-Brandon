@@ -45,7 +45,7 @@ const CHUNK: usize = 1024;
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        wanted() && crate::host::host().is_some() && crate::queue::line_on() && {
+        crate::host::host().is_some() && {
             start();
             true
         }
@@ -55,7 +55,7 @@ pub(crate) fn on() -> bool {
 /// Whether it is asked for.
 pub(crate) fn wanted() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_THIN").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THIN").is_none_or(|v| v != "0"))
 }
 
 /// What a title list keeps: the recording being written and the words of it
@@ -100,10 +100,27 @@ impl Front {
         if self.closed || self.recording.is_none() {
             return;
         }
+        if op == RESET || op == Plain::SET_PIPELINE as u64 {
+            let pipeline = args[0] as This;
+            self.retain(pipeline);
+            if !pipeline.is_null() {
+                crate::pipeline::prefetch(pipeline);
+            }
+        }
         self.words.push(op | (args.len() as u64) << 16);
         self.words.extend_from_slice(args);
-        if self.words.len() >= CHUNK {
+        if !wanted() || self.words.len() >= CHUNK {
             self.hand_over();
+        }
+    }
+
+    fn retain(&self, object: This) {
+        if !self.closed
+            && !object.is_null()
+            && let Some(recording) = &self.recording
+            && held(&recording.objects.0).insert(object as usize)
+        {
+            crate::object::add_ref(object);
         }
     }
 
@@ -125,7 +142,7 @@ impl Front {
         }
         let len = (self.words.len() - at - 1) as u64;
         self.words[at] = op | len << 16;
-        if self.words.len() >= CHUNK {
+        if !wanted() || self.words.len() >= CHUNK {
             self.hand_over();
         }
     }
@@ -144,8 +161,11 @@ impl Front {
             !std::mem::replace(&mut inner.scheduled, true)
         };
         if schedule {
-            held(&READY).push_back(recording.clone());
-            WORK.notify_one();
+            if wanted() {
+                recording.clone().resume();
+            } else {
+                recording.run();
+            }
         }
     }
 
@@ -178,7 +198,19 @@ fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// One recording of a title list: what was written of it and not translated
 /// yet, and the list of ours it goes to.
+#[derive(Default)]
+pub(super) struct Objects(Mutex<std::collections::HashSet<usize>>);
+
+impl Drop for Objects {
+    fn drop(&mut self) {
+        for p in self.0.get_mut().unwrap_or_else(|e| e.into_inner()).drain() {
+            crate::object::release_owned(p as This);
+        }
+    }
+}
+
 pub(crate) struct Recording {
+    objects: Arc<Objects>,
     kind: u32,
     inner: Mutex<Inner>,
     /// Translated to its end.
@@ -190,6 +222,7 @@ pub(crate) struct Recording {
 #[derive(Default)]
 struct Inner {
     chunks: VecDeque<Vec<u64>>,
+    cursor: usize,
     /// Streams translated (commands may name places in them until the end).
     kept: Vec<Vec<u64>>,
     /// It is among [`READY`] or being translated.
@@ -205,6 +238,7 @@ struct Inner {
 impl Recording {
     fn new(kind: u32) -> Self {
         Recording {
+            objects: Default::default(),
             kind,
             inner: Mutex::default(),
             done: AtomicBool::new(false),
@@ -231,9 +265,14 @@ impl Recording {
     }
 
     /// Translates what there is.
-    fn run(&self) {
+    pub(crate) fn resume(self: Arc<Self>) {
+        held(&READY).push_back(self);
+        WORK.notify_one();
+    }
+
+    fn run(self: &Arc<Self>) {
         loop {
-            let (chunk, back) = {
+            let (chunk, back, cursor) = {
                 let mut inner = held(&self.inner);
                 let Some(chunk) = inner.chunks.pop_front() else {
                     inner.scheduled = false;
@@ -245,16 +284,28 @@ impl Recording {
                 if inner.back == 0 {
                     inner.back = back_list(self.kind) as usize;
                 }
-                (chunk, inner.back as This)
+                (chunk, inner.back as This, std::mem::take(&mut inner.cursor))
             };
             let began = std::time::Instant::now();
-            let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
+            let (calls, closed, pending) =
+                translate(back, &chunk, cursor, || self.abandoned.load(Acquire));
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);
+            if let Some((cursor, pipeline)) = pending {
+                inner.cursor = cursor;
+                inner.chunks.push_front(chunk);
+                if pipeline.park(self) {
+                    return;
+                }
+                continue;
+            }
             inner.kept.push(chunk);
             if closed {
                 inner.closed = true;
+                if let Some(list) = unsafe { (inner.back as *mut List).as_mut() } {
+                    list.objects = Some(self.objects.clone());
+                }
                 let kept = std::mem::take(&mut inner.kept);
                 self.done.store(true, Release);
                 self.moved.notify_all();
@@ -277,6 +328,9 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
+            let list = unsafe { &mut *(inner.back as *mut List) };
+            list.cached = None;
+            list.objects = None;
             held(&BACKS).push(inner.back);
         }
     }
@@ -398,6 +452,7 @@ pub(crate) fn for_external(this: This) -> Option<This> {
 
 /// An argument as a word.
 trait Word: Copy {
+    fn retain(self, _: &Front) {}
     fn word(self) -> u64;
     fn unword(w: u64) -> Self;
 }
@@ -409,7 +464,18 @@ macro_rules! words {
         fn unword(w: u64) -> Self { w as $t }
     })* };
 }
-words!(u8, u32, i32, u64, This);
+words!(u8, u32, i32, u64);
+impl Word for This {
+    fn word(self) -> u64 {
+        self as u64
+    }
+    fn unword(raw: u64) -> Self {
+        raw as This
+    }
+    fn retain(self, front: &Front) {
+        front.retain(self);
+    }
+}
 impl Word for f32 {
     #[inline]
     fn word(self) -> u64 {
@@ -429,7 +495,9 @@ macro_rules! plain {
         #[repr(u64)]
         enum Plain { $($op),* , END }
         $(extern "system" fn $name(this: This $(, $a: $t)*) {
-            front(this).put(Plain::$op as u64, &[$(Word::word($a)),*]);
+            let front = front(this);
+            $($a.retain(front);)*
+            front.put(Plain::$op as u64, &[$(Word::word($a)),*]);
         })*
         /// Whether `op` was one of them; done on `list`.
         #[inline]
@@ -499,6 +567,28 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+const BUILDER_RANGES: u64 = after(17);
+
+pub(crate) fn builder_ranges(list: This, ranges: &[[u64; 3]]) {
+    if list.is_null() {
+        return;
+    }
+    if front(list).recording.is_some() {
+        front(list).put(BUILDER_RANGES, ranges.as_flattened());
+    } else {
+        builder_scope(list, ranges);
+    }
+}
+
+fn builder_scope(list: This, ranges: &[[u64; 3]]) {
+    if !ranges.is_empty() {
+        super::cut(list, None);
+    }
+    super::with_state(list, |host, state| state.set_builder_ranges(host, ranges));
+    if ranges.is_empty() {
+        super::cut(list, None);
+    }
+}
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -522,6 +612,15 @@ fn at_or<T>(w: &[u64], from: usize) -> *const T {
 
 /// A view's record as it is now (zeros for no view), so that its slot may be
 /// written again: the copy stands for the handle.
+fn retained_record(this: This, handle: u64) -> [u64; RECORD] {
+    if let Some(view) =
+        crate::descriptor::rtv_record(handle).or_else(|| crate::descriptor::dsv_record(handle))
+    {
+        front(this).retain(view.resource);
+    }
+    record(handle)
+}
+
 fn record(handle: u64) -> [u64; RECORD] {
     let mut words = [0u64; RECORD];
     if handle != 0 {
@@ -573,6 +672,14 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 }
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     if !barriers.is_null() {
+        for b in unsafe { std::slice::from_raw_parts(barriers, count as usize) } {
+            if b.kind <= 2 {
+                front(this).retain(b.first);
+            }
+            if b.kind == 1 {
+                front(this).retain(b.second as This);
+            }
+        }
         front(this).put_with(BARRIER, &[u64::from(count)], &[bytes_of(barriers, count as usize)]);
     }
     0
@@ -594,6 +701,7 @@ extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
 }
 extern "system" fn heaps(this: This, count: u32, items: *const This) {
     let count = if items.is_null() { 0 } else { count };
+    if count != 0 { for &heap in unsafe { std::slice::from_raw_parts(items,count as usize) } { front(this).retain(heap); } }
     front(this).put_with(HEAPS, &[u64::from(count)], &[bytes_of(items, count as usize)]);
 }
 fn constants(this: This, op: u64, slot: u32, count: u32, values: *const u32, offset: u32) {
@@ -633,9 +741,9 @@ extern "system" fn targets(this: This, count: u32, handles: *const u64, one_rang
         // of views of 128 bytes.
         let handle = unsafe { if one_range != 0 { *handles + 128 * i as u64 } else { *handles.add(i) } };
         present |= u64::from(handle != 0) << i;
-        records[i * RECORD..(i + 1) * RECORD].copy_from_slice(&record(handle));
+        records[i * RECORD..(i + 1) * RECORD].copy_from_slice(&retained_record(this, handle));
     }
-    records[count * RECORD..(count + 1) * RECORD].copy_from_slice(&record(depth));
+    records[count * RECORD..(count + 1) * RECORD].copy_from_slice(&retained_record(this, depth));
     let records = &records[..(count + 1) * RECORD];
     front(this).put_with(
         TARGETS,
@@ -648,7 +756,7 @@ extern "system" fn clear_rtv(this: This, handle: u64, color: *const [f32; 4], co
         return;
     }
     let count = if rects.is_null() { 0 } else { count };
-    let view = record(handle);
+    let view = retained_record(this, handle);
     front(this).put_with(
         CLEAR_RTV,
         &[u64::from(count)],
@@ -668,7 +776,7 @@ extern "system" fn clear_dsv(
         return;
     }
     let count = if rects.is_null() { 0 } else { count };
-    let view = record(handle);
+    let view = retained_record(this, handle);
     front(this).put_with(
         CLEAR_DSV,
         &[u64::from(count), u64::from(flags) | u64::from(stencil) << 32, Word::word(depth)],
@@ -687,6 +795,8 @@ extern "system" fn copy_texture_region(
     if dst.is_null() || src.is_null() {
         return;
     }
+    front(this).retain(unsafe { (*src).resource });
+    front(this).retain(unsafe { (*dst).resource });
     let boxed = !source_box.is_null();
     front(this).put_with(
         COPY_TEXTURE,
@@ -710,12 +820,44 @@ extern "system" fn copy_texture_region_x(
 
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
-fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
-    let (mut i, mut calls, mut closed) = (0, 0, false);
+fn translate(
+    list: This,
+    stream: &[u64],
+    cursor: usize,
+    left: impl Fn() -> bool,
+) -> (
+    u64,
+    bool,
+    Option<(usize, Arc<crate::pipeline::make::Pending>)>,
+) {
+    let (mut i, mut calls, mut closed) = (cursor, 0, false);
     let mut skip = left();
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
         let w = &stream[i + 1..i + 1 + len];
+        if !skip {
+            let draw = op == Plain::DRAW as u64
+                || op == Plain::DRAW_INDEXED as u64
+                || op == Plain::EXECUTE_INDIRECT as u64
+                    && crate::signature::layout(w[0] as This)
+                        .is_some_and(|(_, args)| matches!(args, [[0 | 1, ..]]));
+            if draw
+                || [
+                    Plain::DISPATCH as u64,
+                    Plain::DISPATCH_X as u64,
+                    Plain::DISPATCH_MESH as u64,
+                    Plain::DISPATCH_MESH_X as u64,
+                    Plain::EXECUTE_INDIRECT as u64,
+                ]
+                .contains(&op)
+            {
+                let mut pending = None;
+                super::with_state(list, |_, state| pending = state.dependency(draw));
+                if let Some(p) = pending {
+                    return (calls, closed, Some((i, p)));
+                }
+            }
+        }
         i += 1 + len;
         calls += 1;
         if calls % 64 == 0 {
@@ -737,6 +879,7 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         }
         let n = w.first().map_or(0, |&n| n as usize);
         match op {
+            BUILDER_RANGES => builder_scope(list, w.as_chunks::<3>().0),
             RESET => {
                 // (Only whether there is an allocator is looked at.)
                 let allocator: This = std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast();
@@ -812,7 +955,7 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             _ => {}
         }
     }
-    (calls, closed)
+    (calls, closed, None)
 }
 
 /// The table of a list whose calls are written down: that of the others with

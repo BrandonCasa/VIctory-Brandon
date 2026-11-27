@@ -169,7 +169,7 @@ fn resolve(repl: &[Option<V>], mut v: V) -> V {
 }
 
 /// Replaces every value `op` reads by `f` of it.
-fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
+pub(super) fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
     match op {
         Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
             *a = f(*a);

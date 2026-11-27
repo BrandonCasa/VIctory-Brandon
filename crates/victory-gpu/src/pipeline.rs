@@ -136,6 +136,9 @@ pub(crate) struct Translated {
     pub(crate) threads: Option<[u32; 3]>,
     pub(crate) used: Vec<victory_shader::UsedResource>,
     pub(crate) tables: crate::draw::TablePlan,
+    pub(crate) layout: Arc<[u32]>,
+    pub(crate) address_keys: Vec<(u8, u32)>,
+    pub(crate) address_ordinals: Vec<Option<usize>>,
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
@@ -232,7 +235,53 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         .map(|p| p.used)
         .unwrap_or_default();
     let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+    let mut address_keys = Vec::new();
+    let address_ordinals = host
+        .user_data
+        .iter()
+        .map(|u| {
+            let victory_shader::RootType::Other(kind) = u.root else {
+                return None;
+            };
+            let low = victory_shader::emit::USER_VIEW_ADDRESS;
+            if kind != low && kind != low + 1 {
+                return None;
+            }
+            let key = (u.slot, u.dword);
+            Some(
+                address_keys
+                    .iter()
+                    .position(|k| *k == key)
+                    .unwrap_or_else(|| {
+                        address_keys.push(key);
+                        address_keys.len() - 1
+                    }),
+            )
+        })
+        .collect();
+    let mut layout = vec![host.user_data_dwords()];
+    for slots in [&host.root_cbvs, &host.root_srvs, &host.root_uavs] {
+        layout.push(slots.len() as u32);
+        layout.extend(slots.iter().copied().map(u32::from));
+    }
+    for s in &host.static_samplers {
+        layout.extend([
+            s.filter,
+            s.address[0],
+            s.address[1],
+            s.address[2],
+            s.mip_lod_bias.to_bits(),
+            s.max_anisotropy,
+            s.comparison,
+            s.border,
+            s.min_lod.to_bits(),
+            s.max_lod.to_bits(),
+        ]);
+    }
     Ok(Translated {
+        layout: layout.into(),
+        address_keys,
+        address_ordinals,
         host,
         threads,
         used,
@@ -333,22 +382,39 @@ pub(crate) fn builder_rests(why: &'static str) {
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn builder_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_enabled() {
         return false;
     }
+    let pipelines = {
+        let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+        if b.off == b.pipelines.len() || crate::frame::current() < b.rests {
+            return false;
+        }
+        if b.whole {
+            return true;
+        }
+        b.pipelines.clone()
+    };
+    let missing: Vec<_> = pipelines
+        .iter()
+        .filter(|p| !make::now(p))
+        .map(|p| make::hashes(p))
+        .collect();
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    if b.off == b.pipelines.len() || crate::frame::current() < b.rests {
-        return false;
+    if b.pipelines.len() != pipelines.len() {
+        drop(b);
+        return builder_runs();
     }
-    if b.whole {
-        return true;
-    }
-    let missing: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::hashes(p)).collect();
     if !missing.is_empty() {
         b.off = b.pipelines.len();
         tracing::warn!(
@@ -426,6 +492,8 @@ struct Pipeline {
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    #[cfg(windows)]
+    topology_variant: OnceLock<Option<Arc<make::Pending>>>,
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
@@ -465,6 +533,94 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// Select the PSO for the topology actually recorded on this list. The other
+/// variant owns an independent input layout and its own driver library key.
+#[cfg(windows)]
+pub(crate) fn draw_pipeline<'a>(this: This, rectangle: bool) -> Option<&'a host::HostPipeline> {
+    make::ready(draw_recipe(this, rectangle)?)
+}
+
+#[cfg(windows)]
+fn draw_recipe<'a>(this: This, rectangle: bool) -> Option<&'a Arc<make::Pending>> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    let Some(g) = &p.host.graphics else {
+        return Some(&p.host);
+    };
+    const RECTANGLE_TYPE: i32 = 19;
+    if (g.topology.0 == RECTANGLE_TYPE) == rectangle {
+        return Some(&p.host);
+    }
+    let alternate = p.topology_variant.get_or_init(|| {
+        let mut bytes = Vec::new();
+        g.put(&mut bytes);
+        let mut g = host::GraphicsState::get(&bytes)?;
+        g.topology.0 = if rectangle { RECTANGLE_TYPE } else { 3 };
+        Some(canonical_pending(&p.shaders, Some(Box::new(g))))
+    });
+    alternate.as_ref()
+}
+
+#[cfg(windows)]
+pub(crate) fn dependency(this: This, rectangle: Option<bool>) -> Option<Arc<make::Pending>> {
+    if this.is_null() {
+        return None;
+    }
+    let p = match rectangle {
+        Some(r) => draw_recipe(this, r)?,
+        None => &pipeline(this).host,
+    };
+    make::requested(p).then(|| p.clone())
+}
+
+#[cfg(windows)]
+pub(crate) fn prefetch(this: This) {
+    if !this.is_null() {
+        make::prefetch(&pipeline(this).host)
+    }
+}
+
+#[cfg(windows)]
+fn canonical_pending(
+    shaders: &[Arc<Shader>],
+    graphics: Option<Box<host::GraphicsState>>,
+) -> Arc<make::Pending> {
+    type Recipe = (Vec<usize>, Option<Vec<u8>>);
+    #[derive(Default)]
+    struct Cache {
+        live: HashMap<Recipe, std::sync::Weak<make::Pending>>,
+        retained: std::collections::VecDeque<Arc<make::Pending>>,
+    }
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let key = (
+        shaders.iter().map(|s| Arc::as_ptr(s) as usize).collect(),
+        graphics.as_ref().map(|g| {
+            let mut bytes = Vec::new();
+            g.put(&mut bytes);
+            bytes
+        }),
+    );
+    let mut cache = CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = cache.live.get(&key).and_then(|p| p.upgrade()) {
+        return p;
+    }
+    let pending = Arc::new(make::Pending::new(shaders.to_vec(), graphics));
+    if cache.retained.len() == 512 {
+        cache.retained.pop_front();
+    }
+    if cache.live.len() > 2 * cache.retained.len().max(512) && cache.live.len() % 256 == 0 {
+        cache.live.retain(|_, p| p.strong_count() != 0);
+    }
+    cache.live.insert(key, Arc::downgrade(&pending));
+    cache.retained.push_back(pending.clone());
+    pending
 }
 
 /// Host pipelines queued and not made yet.
@@ -575,9 +731,11 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = canonical_pending(&shaders, graphics);
     #[cfg(windows)]
-    known::note(host.key(), &shaders, host.graphics.as_deref());
+    if known::on() {
+        known::note(host.key(), &shaders, host.graphics.as_deref());
+    }
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
@@ -586,14 +744,18 @@ fn hand_out(
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-        b.pipelines.push(host.clone());
-        b.whole = false;
+        if !b.pipelines.iter().any(|p| Arc::ptr_eq(p, &host)) {
+            b.pipelines.push(host.clone());
+            b.whole = false;
+        }
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        topology_variant: OnceLock::new(),
         #[cfg(windows)]
         builder,
         shaders,
@@ -642,6 +804,62 @@ pub(crate) extern "system" fn create_compute(
         iid,
         out,
     )
+}
+
+#[cfg(windows)]
+thread_local! {
+    static COMPUTE_LOOKUP: std::cell::Cell<Option<(u64, *const ComputeHead)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(windows)]
+static TITLE_LOOKUP: OnceLock<usize> = OnceLock::new();
+
+/// Bridge for the identified retail compute wrapper, installed before title execution.
+#[cfg(windows)]
+pub fn cached_compute_wrapper(original: usize) -> Option<usize> {
+    (*TITLE_LOOKUP.get_or_init(|| original) == original)
+        .then_some(scoped_compute_lookup as *const () as usize)
+}
+
+#[cfg(windows)]
+extern "system" fn scoped_compute_lookup(
+    cache: usize,
+    key: u64,
+    root: This,
+    desc: *const ComputeHead,
+) -> This {
+    let lookup: extern "system" fn(usize, u64, This) -> This =
+        unsafe { std::mem::transmute(*TITLE_LOOKUP.get().unwrap()) };
+    COMPUTE_LOOKUP.with(|scope| {
+        let previous = scope.replace(Some((key, desc)));
+        let result = lookup(cache, key, root);
+        scope.set(previous);
+        result
+    })
+}
+
+pub(crate) extern "system" fn create_cached_compute_x(
+    this: This,
+    packed: *const u8,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    unsafe { *out = std::ptr::null() };
+    #[cfg(windows)]
+    if !packed.is_null() && !iid.is_null() && PIPELINE_IIDS.contains(unsafe { &*iid })
+        && let Some((key, desc)) = COMPUTE_LOOKUP.get()
+        && let Some(desc) = unsafe { desc.as_ref() }
+        && !desc.stage.code.is_null() && desc.stage.size > 0
+        // The lookup compares node+10h to its key and passes node+18h to this method.
+        && unsafe { packed.sub(8).cast::<u64>().read_unaligned() } == key
+        && unsafe { packed.cast::<This>().read_unaligned() } == desc.root
+    {
+        return create_compute(this, desc, iid, out);
+    }
+    0x80004001u32 as HRESULT
 }
 
 /// Device method 0x1f0: the plain compute description plus console
@@ -703,54 +921,113 @@ pub(crate) extern "system" fn create_stream(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
-    let Some(desc) = (unsafe { desc.as_ref() }) else {
+    let Some(recipe) = stream_recipe(desc) else {
         return E_INVALIDARG;
     };
-    if desc.stream.is_null() {
-        return E_INVALIDARG;
+    recipe.create(iid, out)
+}
+
+struct StreamRecipe {
+    shaders: Vec<Arc<Shader>>,
+    #[cfg(windows)]
+    graphics: Box<host::GraphicsState>,
+    #[cfg(windows)]
+    cache_root: Option<blake3::Hash>,
+}
+
+impl StreamRecipe {
+    fn create(self, iid: *const Iid, out: *mut This) -> HRESULT {
+        hand_out(
+            self.shaders,
+            #[cfg(windows)]
+            Some(self.graphics),
+            iid,
+            out,
+        )
     }
+}
+
+fn stream_recipe(desc: *const StreamDesc) -> Option<StreamRecipe> {
+    let desc = unsafe { desc.as_ref()? };
+    if desc.stream.is_null() || desc.size > 1 << 20 {
+        return None;
+    }
+    #[cfg(windows)]
+    let bytes = {
+        let mut bytes = vec![0; desc.size];
+        if !crate::host::read_into(desc.stream, &mut bytes) {
+            return None;
+        }
+        bytes
+    };
+    #[cfg(not(windows))]
+    let bytes = unsafe { std::slice::from_raw_parts(desc.stream, desc.size) };
     let mut shaders = Vec::new();
     #[cfg(windows)]
-    let mut graphics = host::GraphicsState::default();
+    let mut graphics = Box::new(host::GraphicsState::default());
+    #[cfg(windows)]
+    let (mut root, mut represented) = (None, true);
     let mut at = 0;
-    while at + 8 <= desc.size {
-        // SAFETY: inside the stream the title passes.
-        let kind = unsafe { desc.stream.add(at).cast::<u32>().read_unaligned() };
+    while at < bytes.len() {
+        let kind = u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?);
         let Some((size, stage)) = subobject(kind) else {
-            tracing::warn!(
-                kind,
-                at,
-                "pipeline subobject of unknown size; the rest is ignored"
-            );
+            // Preserve ordinary creation's prefix fallback. It cannot be used
+            // to certify equivalence with a packed seed.
+            #[cfg(windows)]
+            {
+                represented = false;
+            }
             break;
         };
+        let sub = bytes.get(at..at + size)?;
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            let code = unsafe { sub.as_ptr().add(8).cast::<Bytecode>().read_unaligned() };
+            if code.size != 0 {
+                if code.code.is_null() || code.size > 64 << 20 {
+                    return None;
+                }
+                #[cfg(windows)]
+                {
+                    let mut container = vec![0; code.size];
+                    if !crate::host::read_into(code.code, &mut container) {
+                        return None;
+                    }
+                    shaders.push(shader(stage, &container));
+                }
+                #[cfg(not(windows))]
+                shaders.extend(copy(stage, &code));
+            }
         }
         #[cfg(windows)]
-        // SAFETY: a whole subobject of this kind lies at `at`.
-        unsafe {
-            graphics.read(kind, desc.stream.add(at))
-        };
+        {
+            if kind == 0 {
+                root = crate::root::digest(unsafe {
+                    sub.as_ptr().add(8).cast::<This>().read_unaligned()
+                });
+            }
+            if matches!(kind, 7 | 22) || matches!(kind, 18 | 20) && sub[4..8] != [0; 4] {
+                represented = false;
+            }
+            if !unsafe { graphics.read(kind, sub.as_ptr()) } {
+                return None;
+            }
+        }
         at += size;
     }
-    hand_out(
+    Some(StreamRecipe {
         shaders,
         #[cfg(windows)]
-        Some(Box::new(graphics)),
-        iid,
-        out,
-    )
+        graphics,
+        #[cfg(windows)]
+        cache_root: if represented { root } else { None },
+    })
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &PIPELINE_IIDS).then_some(this);
     object::answer(PIPELINE, iid, found, out)
 }
-extern "system" fn release(this: This) -> u32 {
+pub(crate) extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Pipeline>(this)
 }
 
@@ -770,7 +1047,9 @@ pub mod known;
 #[cfg(windows)]
 mod library;
 #[cfg(windows)]
-mod make;
+pub(crate) mod make;
+#[cfg(windows)]
+pub mod title_cache;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

@@ -181,12 +181,64 @@ pub fn run(
         }
     };
     for (name, dll) in &dlls {
+        if name.eq_ignore_ascii_case("XboxBvhBuilder.dll") {
+            const PREBUILD: &str = "?GetRaytracingAccelerationStructurePrebuildInfo@XboxBvhBuilder@@QEAAXPEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS@@PEBUD3D12XBOX_XDXR_STREAM_DESC@@PEAUD3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO@@@Z";
+            if let Some(address) = dll.export(PREBUILD) {
+                victory_hle::bvh::export(PREBUILD, address);
+            }
+        }
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    struct TitleImports<'a>(&'a dyn victory_loader::ImportResolver);
+    impl victory_loader::ImportResolver for TitleImports<'_> {
+        fn resolve(
+            &self,
+            dll: &str,
+            symbol: &victory_pe::ImportSymbol,
+        ) -> victory_loader::Resolution {
+            use victory_loader::{Provenance, Resolution};
+            match self.0.resolve(dll, symbol) {
+                Resolution::Found {
+                    address,
+                    provenance: Provenance::Title,
+                } if dll.eq_ignore_ascii_case("Bink2Scarlett.dll")
+                    || dll.eq_ignore_ascii_case("XboxBvhBuilder.dll") =>
+                {
+                    let address = match symbol {
+                        victory_pe::ImportSymbol::Name { name, .. }
+                            if dll.eq_ignore_ascii_case("XboxBvhBuilder.dll") =>
+                        {
+                            victory_hle::bvh::export(name, address)
+                        }
+                        victory_pe::ImportSymbol::Name { name, .. } => {
+                            victory_hle::bink::export(name, address)
+                        }
+                        _ => address,
+                    };
+                    Resolution::Found {
+                        address,
+                        provenance: Provenance::Title,
+                    }
+                }
+                resolved => resolved,
+            }
+        }
+    }
+    show(
+        &exe_name,
+        image.bind_imports(&TitleImports(&with_dlls), policy)?,
+    );
     if execute {
         let size = image.info().size_of_image as usize;
+        let (seed, stream) = victory_hle::title_cache::wrappers(hash.as_str());
+        unsafe { victory_loader::compute_lookup::graphics(image.base(), size, seed, stream) };
+        if let Some(wrapper) = victory_hle::cached_compute_wrapper(
+            image.base() + victory_loader::compute_lookup::TARGET,
+        ) {
+            // The loader checks the retail caller's instructions before changing its lookup.
+            unsafe { victory_loader::compute_lookup::install(image.base(), size, wrapper) };
+        }
         // SAFETY: the image stays mapped, and nothing of it has run yet.
         unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
     }

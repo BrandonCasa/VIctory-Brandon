@@ -55,8 +55,9 @@ uint load(uint source, uint at) {
 }
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex, uint3 group : SV_GroupID) {
     uint count = jobs.Load(0);
+    if (group.x * 64u >= count) return;
     bool active = id.x < count;
     uint4 job = uint4(0, 0, 0, 0);
     uint record[5] = {0, 0, 0, 0, 0};

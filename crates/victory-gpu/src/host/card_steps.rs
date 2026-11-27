@@ -119,7 +119,7 @@ const MOST: usize = 12288;
 pub(super) enum FillTo {
     /// A descriptor slot that shows the fill's memory, and nothing else does
     /// (title heap, slot): it is made to show our buffer instead.
-    Slot(usize, u32),
+    Slot(Arc<crate::descriptor::host::HostHeap>, u32),
     /// A buffer the card can write, filled from its beginning.
     Buffer(ID3D12Resource),
 }
@@ -135,7 +135,7 @@ pub(super) struct Writer {
 }
 
 /// What `items` of the line write.
-pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
+pub(super) fn writers<'a>(items: impl IntoIterator<Item = &'a Late>) -> Vec<Writer> {
     let mut out = Vec::new();
     for item in items {
         match item {
@@ -347,35 +347,94 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
             _ => {}
         }
     }
-    let mut out: Vec<(usize, u32)> = Vec::with_capacity(order.len());
-    // The copies among them, which alone put others behind them or have to
-    // stand behind others.
-    let mut copies: Vec<usize> = Vec::new();
+    // No copy writes across a fill-only batch.
+    if order.iter().all(|&i| !matches!(does[i], Does::Copy { .. })) {
+        return Ok(order.into_iter().map(|i| (i, 0)).collect());
+    }
+    let mut endpoints = Vec::with_capacity(order.len() * 4);
     for &i in &order {
+        if let Some((r, w)) = reads_writes(&does[i]) {
+            for (a, b) in [r, w] {
+                if a < b {
+                    endpoints.extend([a, b]);
+                }
+            }
+        }
+    }
+    endpoints.sort_unstable();
+    endpoints.dedup();
+    let segment = |(a, b): (usize, usize)| {
+        if a >= b {
+            return 0..0;
+        }
+        endpoints.binary_search(&a).unwrap()..endpoints.binary_search(&b).unwrap()
+    };
+    let (mut reads, mut writes) = (
+        LevelTree::new(endpoints.len()),
+        LevelTree::new(endpoints.len()),
+    );
+    let mut out = Vec::with_capacity(order.len());
+    for i in order {
         let Some((r, w)) = reads_writes(&does[i]) else {
             continue;
         };
-        let writes = w.0 < w.1;
-        let mut level = 0;
-        // Behind what writes what this reads or writes, and, if this
-        // writes, behind what reads it.
-        let ahead: Box<dyn Iterator<Item = usize>> =
-            if writes { Box::new(0..out.len()) } else { Box::new(copies.iter().copied()) };
-        for k in ahead {
-            let (j, at): (usize, u32) = out[k];
-            let Some((jr, jw)) = reads_writes(&does[j]) else {
-                continue;
-            };
-            if at >= level && (meet(jw, r) || meet(jw, w) || meet(jr, w)) {
-                level = at + 1;
-            }
-        }
-        if writes {
-            copies.push(out.len());
-        }
+        let (r, w) = (segment(r), segment(w));
+        let level = writes
+            .visit(r.clone(), 0)
+            .max(writes.visit(w.clone(), 0))
+            .max(reads.visit(w.clone(), 0));
+        reads.visit(r, level + 1);
+        writes.visit(w, level + 1);
         out.push((i, level));
     }
     Ok(out)
+}
+
+/// Range maximum tree over the half-open intervals between sorted addresses.
+/// Each node remembers its full-cover updates and the largest update below it.
+struct LevelTree {
+    n: usize,
+    nodes: Vec<(u32, u32)>,
+}
+
+impl LevelTree {
+    fn new(n: usize) -> Self {
+        let n = n.max(1).next_power_of_two();
+        Self {
+            n,
+            nodes: vec![(0, 0); n * 2],
+        }
+    }
+
+    fn visit(&mut self, span: std::ops::Range<usize>, value: u32) -> u32 {
+        if span.is_empty() {
+            return 0;
+        }
+        self.visit_at(1, 0, self.n, span.start, span.end, value)
+    }
+
+    fn visit_at(
+        &mut self,
+        i: usize,
+        a: usize,
+        b: usize,
+        from: usize,
+        to: usize,
+        value: u32,
+    ) -> u32 {
+        if to <= a || b <= from {
+            return 0;
+        }
+        let (own, max) = self.nodes[i];
+        self.nodes[i].1 = max.max(value);
+        if from <= a && b <= to {
+            self.nodes[i].0 = own.max(value);
+            return max;
+        }
+        let mid = a + (b - a) / 2;
+        own.max(self.visit_at(2 * i, a, mid, from, to, value))
+            .max(self.visit_at(2 * i + 1, mid, b, from, to, value))
+    }
 }
 
 /// Whether a refresh of `does` brings a host copy other than `shadow` up to
@@ -417,8 +476,9 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
     let mut steps = Vec::new();
-    for list in runs {
-        for (i, step) in list.deferred().copies.iter().enumerate() {
+    for (run, list) in runs.iter().enumerate() {
+        let deferred = list.deferred();
+        for (i, step) in deferred.copies.iter().enumerate() {
             does.push(match step {
                 &Step::Copy(dst, src, len) => Does::Copy {
                     dst,
@@ -432,8 +492,8 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     asked: read_blocked(written, *src, *len),
                     to: to.is_some(),
                 },
-                Step::Texture(staging) => {
-                    let (at, len) = staging.memory();
+                Step::Texture(index) => {
+                    let (at, len) = deferred.texture_uploads[*index].memory();
                     Does::Read {
                         from: at,
                         to: at + len,
@@ -446,11 +506,11 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     from: *at,
                     to: *at + *len,
                 },
-                Step::Run(_) => Does::Run,
+                Step::Run(_) | Step::Builder(_) => Does::Run,
                 Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
                 Step::GpuWrite(..) | Step::Host(..) => continue,
             });
-            steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
+            steps.push((run, i));
         }
     }
     (does, steps)
@@ -477,9 +537,8 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
         return None;
     }
     let (placed, reader) = behind?;
-    let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0);
-    let cut = place(placed)? + 1;
-    (place(reader)? >= cut).then_some(cut)
+    let cut = steps[placed].0 + 1;
+    (steps[reader].0 >= cut).then_some(cut)
 }
 
 /// Whether every page of `[from, to)` can be read (through the kernel:
@@ -502,16 +561,6 @@ fn mapped(from: usize, to: usize, known: &mut HashMap<usize, ()>) -> bool {
 /// A table by addresses and numbers of ours.
 type HashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<AddressHash>>;
 
-/// Where the bytes of the fill that is `step` (its list by address, its place
-/// in it) go.
-fn fill_to(runs: &[&HostList], step: (usize, usize)) -> Option<FillTo> {
-    let list = runs.iter().find(|l| std::ptr::from_ref::<HostList>(l) as usize == step.0)?;
-    match list.deferred().copies.get(step.1)? {
-        Step::Fill(_, _, _, to) => to.clone(),
-        _ => None,
-    }
-}
-
 /// A step done on the card.
 struct Op {
     from: (Arc<Shadow>, usize),
@@ -526,7 +575,7 @@ enum To {
     /// A host copy, and the title address.
     Copy(Arc<Shadow>, usize),
     /// A descriptor slot (title heap, slot).
-    Slot(usize, u32),
+    Slot(Arc<crate::descriptor::host::HostHeap>, u32),
     /// A buffer's beginning.
     Buffer(ID3D12Resource),
 }
@@ -709,6 +758,15 @@ impl Host {
         let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
         let mut room = HashMap::default();
         let mut end = 0u64;
+        let mut destinations = HashMap::default();
+        for group in chosen.chunk_by(|a, b| steps[a.0].0 == steps[b.0].0) {
+            let deferred = runs[steps[group[0].0].0].deferred();
+            for &(i, _) in group {
+                if let Step::Fill(_, _, _, Some(to)) = &deferred.copies[steps[i].1] {
+                    destinations.insert(i, to.clone());
+                }
+            }
+        }
         for &(i, level) in &chosen {
             let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
                 continue;
@@ -763,7 +821,7 @@ impl Host {
                     held.clear();
                     To::Copy(to, dst)
                 }
-                _ => match fill_to(runs, steps[i]) {
+                _ => match destinations.remove(&i) {
                     Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
                     Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
                     None => continue,
@@ -809,10 +867,27 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
         let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
+        let mut grouped = Vec::new();
+        if levels != 0 {
+            grouped.resize_with(levels as usize + 1, Vec::new);
+            for (i, op) in ops.iter().enumerate() {
+                grouped[op.level as usize].push(i);
+            }
+        }
         for level in 0..=levels {
             let mut reads = Vec::new();
             let mut writes = Vec::new();
-            for op in ops.iter().filter(|op| op.level == level) {
+            let count = if levels == 0 {
+                ops.len()
+            } else {
+                grouped[level as usize].len()
+            };
+            for i in 0..count {
+                let op = &ops[if levels == 0 {
+                    i
+                } else {
+                    grouped[level as usize][i]
+                }];
                 let len = op.len as u64;
                 let read = (&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len);
                 // (Each place once.)
@@ -835,16 +910,19 @@ impl Host {
         // several threads, a slot always on the same one, in the steps'
         // order.)
         let parts = if ops.len() < 256 { 1 } else { 8 };
-        crate::land::each_under(parts, &|part| {
-            for op in &ops {
-                if let To::Slot(heap, index) = &op.to
-                    && *index as usize / 4 % parts == part
-                {
-                    // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
-                }
+        let mut slots: [Vec<_>; 8] = Default::default();
+        for op in &ops {
+            if let To::Slot(heap, index) = &op.to {
+                slots[*index as usize / 4 % parts].push((heap, *index, gpu + op.at, op.len as u32));
             }
-        });
+        }
+        if slots.iter().any(|s| !s.is_empty()) {
+            crate::land::each_under(parts, &|part| {
+                for &(heap, index, address, len) in &slots[part] {
+                    heap.constant_at(index, &own.between, address, len);
+                }
+            });
+        }
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
         DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
@@ -854,7 +932,10 @@ impl Host {
         spent.end();
         Ok(Some(Taken {
             own,
-            steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
+            steps: chosen
+                .iter()
+                .map(|&(i, _)| (std::ptr::from_ref(runs[steps[i].0]) as usize, steps[i].1))
+                .collect(),
             copied,
         }))
     }

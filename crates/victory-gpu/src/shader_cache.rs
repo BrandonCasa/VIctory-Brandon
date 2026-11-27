@@ -238,6 +238,15 @@ fn cached_by(
             .map_err(|e| format!("{e:#}"))?;
         if let Some((shader, made_by)) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let ran = converter.ran.load(Ordering::Relaxed);
+            if !shader.supports_wave_limit(victory_shader::emit::host_settings()[0]) {
+                if ran {
+                    return Err(
+                        "translated compute shader requires an unsupported wave width".to_owned(),
+                    );
+                }
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
             if !ran && made_by != source.as_bytes() {
                 STALE.fetch_add(1, Ordering::Relaxed);
                 if refresh && old.is_none() {
@@ -357,6 +366,7 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, u32::from(s.indexed_forms));
     word(&mut out, s.root_indexed_views.len() as u32);
     for view in &s.root_indexed_views {
         for value in [
@@ -428,6 +438,7 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
+    let indexed_forms = u8::try_from(r.word()?).ok()?;
     let n = r.word()? as usize;
     let mut root_indexed_views = Vec::with_capacity(n.min(256));
     for _ in 0..n {
@@ -449,6 +460,7 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        indexed_forms,
         root_indexed_views,
         },
         made_by,
@@ -479,6 +491,7 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![1],
+            indexed_forms: 0,
             root_indexed_views: vec![RootIndexedView {
                 table_slot: 1,
                 constant_slot: 2,

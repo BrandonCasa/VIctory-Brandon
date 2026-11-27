@@ -3326,6 +3326,7 @@ pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 4] = [const { std::syn
 /// takes the guards' lock, then, alone, the lock of the ranges kept for
 /// the texture pass.
 pub fn title_memory_written(at: usize, len: usize, pages: bool) {
+    crate::bink::changed(at, len);
     use std::sync::atomic::Ordering::Relaxed;
     if len == 0 {
         return;
@@ -3622,6 +3623,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::bink::changed(at, len);
     crate::texback::remapped(at, len);
     open(&title_memory_changed(at, len), at, at.saturating_add(len));
 }

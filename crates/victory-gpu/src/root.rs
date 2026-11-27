@@ -217,6 +217,30 @@ struct RootSignature {
     blob: Vec<u8>,
 }
 
+#[cfg(windows)]
+static DIGESTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, blake3::Hash>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(windows)]
+impl Drop for RootSignature {
+    fn drop(&mut self) {
+        DIGESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(std::ptr::from_ref(self) as usize));
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn digest(this: This) -> Option<blake3::Hash> {
+    DIGESTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(this as usize))
+        .copied()
+}
+
 /// Device method.
 pub(crate) extern "system" fn create(
     _: This,
@@ -236,6 +260,11 @@ pub(crate) extern "system" fn create(
         object: Object::new(&FUNCTIONS),
         blob,
     });
+    #[cfg(windows)]
+    DIGESTS.lock().unwrap_or_else(|e| e.into_inner()).insert(
+        std::ptr::from_ref(root.as_ref()) as usize,
+        blake3::hash(&root.blob),
+    );
     object::hand_out(ROOT_SIGNATURE, root, iid, &ROOT_SIGNATURE_IIDS, out)
 }
 

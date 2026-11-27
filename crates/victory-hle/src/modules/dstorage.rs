@@ -28,6 +28,7 @@ use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration as Delay, Instant as Clock};
 
 use victory_formats::bcpack::{self, Tables};
 
@@ -239,7 +240,12 @@ extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     }) << 20;
     tracing::info!(size, floor, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size).max(floor);
+        let mut lanes = scheduler.lock();
+        let limit = u64::from(size).max(floor);
+        if limit > lanes.staging && std::mem::take(&mut lanes.starved) {
+            scheduler.work.notify_all();
+        }
+        lanes.staging = limit;
     }
     S_OK
 }
@@ -541,6 +547,8 @@ const COST: [u64; 3] = [100, 10, 1];
 const STAGING: u64 = 32 << 20;
 
 struct Lanes {
+    suspended: BTreeMap<(Clock, u64), Running>,
+    suspended_bytes: usize,
     lanes: HashMap<u64, Lane>,
     next_id: u64,
     /// Submission order over all queues.
@@ -609,6 +617,8 @@ fn scheduler() -> Option<&'static Scheduler> {
             Some(Scheduler {
                 lanes: Mutex::new(Lanes {
                     lanes: HashMap::new(),
+                    suspended: BTreeMap::new(),
+                    suspended_bytes: 0,
                     next_id: 0,
                     next_seq: 0,
                     staged: 0,
@@ -771,20 +781,123 @@ pub(crate) mod stream_log {
     }
 }
 
-/// A worker: runs the next read of the most deserving queue.
+enum Resume {
+    Read {
+        deadline: Option<Clock>,
+    },
+    Scatter {
+        pages: Vec<usize>,
+        offset: usize,
+        data: Vec<u8>,
+        attempt: u32,
+    },
+}
+
+impl Resume {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Read { .. } => 0,
+            Self::Scatter { pages, data, .. } => {
+                pages.capacity() * size_of::<usize>() + data.capacity()
+            }
+        }
+    }
+
+    fn run(self, request: &Request, input: &mut Vec<u8>) -> Result<(), Failure> {
+        match self {
+            Self::Read { deadline } => execute_with(request, input, deadline),
+            Self::Scatter {
+                pages,
+                offset,
+                data,
+                attempt,
+            } => scatter(pages, offset, data, attempt, None),
+        }
+    }
+}
+
+enum Failure {
+    Error(HRESULT),
+    Later(Clock, Resume),
+}
+
+impl From<HRESULT> for Failure {
+    fn from(hr: HRESULT) -> Self {
+        Self::Error(hr)
+    }
+}
+
+struct Running {
+    job: Job,
+    started: Clock,
+    traced: Option<Traced>,
+    resume: Resume,
+}
+
 fn work(scheduler: &'static Scheduler) {
+    let mut input = Vec::new();
     let mut lanes = scheduler.lock();
-    loop {
-        let Some(job) = lanes.start() else {
-            lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
+    'worker: loop {
+        let (job, started, traced, mut resume) = if let Some((&(due, _), _)) =
+            lanes.suspended.first_key_value()
+            && due <= Clock::now()
+        {
+            let (_, r) = lanes.suspended.pop_first().unwrap();
+            lanes.suspended_bytes -= r.resume.bytes();
+            drop(lanes);
+            (r.job, r.started, r.traced, r.resume)
+        } else if let Some(job) = lanes.start() {
+            drop(lanes);
+            let started = Clock::now();
+            let traced = Traced::start(&job);
+            (job, started, traced, Resume::Read { deadline: None })
+        } else {
+            lanes = if let Some((&(due, _), _)) = lanes.suspended.first_key_value() {
+                scheduler
+                    .work
+                    .wait_timeout(lanes, due.saturating_duration_since(Clock::now()))
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0
+            } else {
+                scheduler
+                    .work
+                    .wait(lanes)
+                    .unwrap_or_else(|e| e.into_inner())
+            };
             continue;
         };
-        drop(lanes);
-        let started = std::time::Instant::now();
-        let traced = Traced::start(&job);
-        let reading = victory_gpu::timeline::span("streaming: a request");
-        let result = execute(&job.request);
-        reading.end();
+        let result = loop {
+            let reading = victory_gpu::timeline::span("streaming: a request");
+            let step = resume.run(&job.request, &mut input);
+            reading.end();
+            match step {
+                Ok(()) => break Ok(()),
+                Err(Failure::Error(hr)) => break Err(hr),
+                Err(Failure::Later(due, pending)) => {
+                    lanes = scheduler.lock();
+                    let charge = pending.bytes();
+                    if lanes.suspended.len() < 128
+                        && charge <= (64usize << 20).saturating_sub(lanes.suspended_bytes)
+                    {
+                        lanes.suspended_bytes += charge;
+                        lanes.suspended.insert(
+                            (due, job.seq),
+                            Running {
+                                job,
+                                started,
+                                traced,
+                                resume: pending,
+                            },
+                        );
+                        scheduler.work.notify_one();
+                        continue 'worker;
+                    }
+                    drop(lanes);
+                    std::thread::sleep(due.saturating_duration_since(Clock::now()));
+                    resume = pending;
+                }
+            }
+        };
         walls_request(&job.request, &result, started);
         stream_log::request(&job, started, &result);
         if let Some(traced) = traced {
@@ -793,7 +906,7 @@ fn work(scheduler: &'static Scheduler) {
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
-        if std::mem::take(&mut lanes.starved) {
+        if job.staging > 0 && std::mem::take(&mut lanes.starved) {
             scheduler.work.notify_all();
         }
         scheduler.finished.notify_all();
@@ -838,27 +951,38 @@ impl Lanes {
     /// its lane that has started the fewest bytes, if the staging buffer
     /// has room for it (or nothing else holds any).
     fn start(&mut self) -> Option<Job> {
-        let busy = || self.lanes.iter().filter(|(_, l)| !l.reads.is_empty());
-        let (_, class) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?;
-        let (_, _, id) = busy()
-            .filter(|(_, l)| l.class == class)
-            .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
-            .min()?;
-        let lane = self.lanes.get_mut(&id)?;
-        let &(seq, Read { request, note }) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
-        if self.staged > 0 && self.staged + staging > self.staging {
+        let heads = || {
+            self.lanes.iter().filter_map(|(&id, lane)| {
+                let (seq, read) = lane.reads.front()?;
+                Some((
+                    (self.clock[lane.class], lane.class, lane.clock, *seq, id),
+                    staging_bytes(&read.request),
+                ))
+            })
+        };
+        let ((now, mut class, mut lane_now, _, mut id), mut staging) = heads().min()?;
+        if staging != 0 && self.staged > 0 && self.staged + staging > self.staging {
+            let alternative = heads().filter(|(_, charge)| *charge == 0).min();
+            let baseline = alternative.and_then(|((_, c, _, _, _), _)| {
+                heads()
+                    .filter(|((_, cl, _, _, _), _)| *cl == c)
+                    .map(|((_, _, t, _, _), _)| t)
+                    .min()
+            });
             self.starved = true;
             self.refused += 1;
-            return None;
+            let ((_, c, _, _, alternative), _) = alternative?;
+            (class, lane_now, id, staging) = (c, baseline?, alternative, 0);
         }
+        let lane = self.lanes.get_mut(&id)?;
+        let &(seq, Read { request, note }) = lane.reads.front()?;
         lane.reads.pop_front();
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
-        self.now = self.clock[class];
+        self.now = now;
         self.clock[class] += size * COST[class];
-        self.lane_now[class] = lane.clock;
+        self.lane_now[class] = lane_now;
         lane.clock += size;
         Some(Job {
             lane: id,
@@ -1288,22 +1412,6 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     queue(this, Command::Status(Status { array, index, enqueued }));
 }
 
-/// Whether a queue submits itself once half of it is enqueued
-/// (`VICTORY_DSTORAGE_HALF=1`), as DirectStorage for the PC does and as ours
-/// did. The title's batches (up to 4,095 requests, in queues of 4,159) hold
-/// more than half now and then, and it maps the pages they go to and fills
-/// in their page lists in its own submit, after it has enqueued them all
-/// (image +0xe88f0: the batch's mapping list first, at +0xf2c470, which
-/// writes the page lists at +0x55aa6a0; then the status entry; then our
-/// submit). So 2,079 requests, three or four times a load, ran on lists of
-/// page 0, or, worse, of the pages the addresses had shown before: their
-/// data went into whatever those pages belonged to by then, and the pages it
-/// was for stayed as they were.
-fn half_submits() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_HALF").is_some_and(|v| v == "1"))
-}
-
 /// Adds a command to the queue; blocks while the queue is full. A queue
 /// that is full of commands nobody submitted submits itself, since nothing
 /// else could make room.
@@ -1341,13 +1449,9 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if half_submits() && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
-        lanes.submit(id, true);
-        scheduler.work.notify_all();
-    }
 }
 
-/// The title's submit, where its page lists become valid ([`half_submits`]):
+/// The title's submit, where its page lists become valid:
 /// the pages are mapped just before, also those under addresses without a
 /// list (memory only the CPU sees).
 extern "system" fn submit(this: QueueRef) {
@@ -1373,7 +1477,27 @@ extern "system" fn close(this: QueueRef) {
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
+#[cfg(test)]
 fn execute(request: &Request) -> Result<(), HRESULT> {
+    let mut input = Vec::new();
+    let mut step = Resume::Read { deadline: None };
+    loop {
+        match step.run(request, &mut input) {
+            Ok(()) => return Ok(()),
+            Err(Failure::Error(hr)) => return Err(hr),
+            Err(Failure::Later(due, pending)) => {
+                std::thread::sleep(due.saturating_duration_since(Clock::now()));
+                step = pending;
+            }
+        }
+    }
+}
+
+fn execute_with(
+    request: &Request,
+    scratch: &mut Vec<u8>,
+    deadline: Option<Clock>,
+) -> Result<(), Failure> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -1389,24 +1513,44 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         );
         hr
     };
-    if options & !(ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE) != 0 {
-        return Err(fail(E_NOTIMPL, "unsupported options"));
+    let swizzle = (options >> 5) & 0xffff;
+    let segments: &[usize] = match swizzle {
+        0 => &[],
+        1 => &[4, 4, 8],
+        2 => &[4, 4, 24],
+        3 => &[4, 12, 4, 4, 8],
+        4 => &[4, 12, 4, 12],
+        _ => return Err(fail(E_NOTIMPL, "unknown swizzle mode").into()),
+    };
+    if options & !(ZLIB | BCPACK | (0xffff << 5) | PAGE_DESTINATION | MEMORY_SOURCE) != 0
+        || (swizzle != 0 && options & (ZLIB | BCPACK) != ZLIB)
+    {
+        return Err(fail(E_NOTIMPL, "unsupported options").into());
     }
     if request.source.is_null() || request.destination.is_null() {
-        return Err(fail(E_INVALIDARG, "no source or destination"));
+        return Err(fail(E_INVALIDARG, "no source or destination").into());
     }
     let bc = ((options & BCPACK) >> 1) as u8;
     let size = request.destination_size as usize;
     if options & (ZLIB | BCPACK) == 0 {
         if request.source_size > request.destination_size {
-            return Err(fail(E_INVALIDARG, "source larger than destination"));
+            return Err(fail(E_INVALIDARG, "source larger than destination").into());
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        let destination = accept(request, size, deadline)?;
+        return into_destination(request, destination, size, |out, _| {
+            read_into(request, out)
+                .map(|()| size)
+                .map_err(|hr| fail(hr, "copying"))
+        });
     }
-    let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let destination = accept(request, size, deadline)?;
+    let tables = if bc != 0 {
+        Some(bcpack_tables()?)
+    } else {
+        None
+    };
+    let source = read_source(request, scratch).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
@@ -1416,10 +1560,36 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+    if !segments.is_empty() {
+        let mut shuffled = vec![0; size];
+        let n = inflate(&source, &mut shuffled).map_err(|hr| fail(hr, "zlib"))?;
+        let group_bytes = segments.iter().sum::<usize>() * 1024;
+        if !n.is_multiple_of(group_bytes) {
+            return Err(fail(INVALID_DATA, "incomplete texture shuffle group").into());
+        }
+        return into_destination(request, destination, n, |out, _| {
+            let mut source = &shuffled[..n];
+            let mut offset = 0;
+            for &kib in segments {
+                let width = kib * 1024;
+                for group in out.chunks_exact_mut(group_bytes) {
+                    let (bytes, rest) = source.split_at(width);
+                    group[offset..offset + width].copy_from_slice(bytes);
+                    source = rest;
+                }
+                offset += width;
+            }
+            Ok(n)
+        });
+    }
+    into_destination(request, destination, size, |out, private| match tables {
+        Some(tables) => (if private {
+            bcpack::decode_private
+        } else {
+            bcpack::decode
+        })(bc, &source, out, tables)
+        .map(|()| out.len())
+        .map_err(|e| fail(INVALID_DATA, &e.to_string())),
         None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
     })?;
     tracing::trace!(
@@ -1520,12 +1690,20 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 
 /// A compressed request's source: borrowed from memory, or read from the
 /// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+fn read_source<'a>(request: &Request, scratch: &'a mut Vec<u8>) -> Result<Cow<'a, [u8]>, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
         return Ok(Cow::Borrowed(bytes));
+    }
+    if size <= 2 << 20 {
+        if scratch.len() < size {
+            scratch.reserve_exact(size - scratch.len());
+            scratch.resize(size, 0);
+        }
+        read_into(request, &mut scratch[..size])?;
+        return Ok(Cow::Borrowed(&scratch[..size]));
     }
     let mut bytes = vec![0; size];
     read_into(request, &mut bytes)?;
@@ -1593,10 +1771,16 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 /// allocation, and otherwise go through a buffer.
 fn into_destination(
     request: &Request,
+    destination: Option<Accepted>,
     len: usize,
-    mut fill: impl FnMut(&mut [u8]) -> Result<usize, HRESULT>,
-) -> Result<(), HRESULT> {
-    if request.options & PAGE_DESTINATION == 0 {
+    mut fill: impl FnMut(&mut [u8], bool) -> Result<usize, HRESULT>,
+) -> Result<(), Failure> {
+    let Some(Accepted {
+        pages,
+        offset,
+        pins,
+    }) = destination
+    else {
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first, and until the
         // bytes are there.
@@ -1604,95 +1788,66 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        let filled = fill(out).map(drop);
+        let filled = fill(out, false);
+        let written = filled.as_ref().copied().unwrap_or(len);
         drop(writing);
         // Again now that the bytes are there: a texture looked at in between
         // was uploaded without them (`xmem::pages_written`).
         if super::xmem::stream_notice() {
-            victory_gpu::kernel_will_write(request.destination as usize, len);
+            victory_gpu::kernel_will_write(request.destination as usize, written);
         } else {
-            victory_gpu::title_memory_written(request.destination as usize, len, false);
+            victory_gpu::title_memory_written(request.destination as usize, written, false);
         }
-        return filled;
-    }
-    let offset = (request.page_offset & 0xffff) as usize;
-    let list = request.destination.cast();
-    let mut pages = page_list(list, offset, len);
-    // The title sees its destination through the pages its list names: if
-    // it names others by the time the data is written, they get it as well.
-    // (Said aloud: by the title's protocol a submitted request's list stays
-    // as it is.)
-    for _ in 0..3 {
-        into_pages(&pages, offset, len, &mut fill)?;
-        let now = read_list(list, offset, len);
-        if now == pages || !super::xmem::pages_known(&now, offset, len) {
-            break;
-        }
-        tracing::warn!(
-            list = format_args!("{list:p}"),
-            offset,
-            len,
-            first = pages.first(),
-            first_now = now.first(),
-            "dstorage: a destination's page list changed during the write; written to its new pages too"
-        );
-        pages = now;
-    }
-    Ok(())
-}
-
-/// Runs `fill` on `len` bytes of `pages`, from `offset` into the first.
-fn into_pages(
-    pages: &[usize],
-    offset: usize,
-    len: usize,
-    mut fill: impl FnMut(&mut [u8]) -> Result<usize, HRESULT>,
-) -> Result<(), HRESULT> {
-    // Consecutive pages of one allocation (the usual case): written in
-    // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        let filled = fill(window.bytes()).map(drop);
-        super::xmem::pages_written(pages, offset, len);
-        return filled;
+        return filled.map(drop).map_err(Failure::from);
+    };
+    if let Some(pins) = &pins
+        && let Some(mut window) = pins.direct()
+    {
+        let filled = fill(&mut window.bytes()[..len], false);
+        pins.written(filled.as_ref().copied().unwrap_or(len));
+        return filled.map(drop).map_err(Failure::from);
     }
     let mut data = vec![0; len];
-    let n = fill(&mut data)?;
-    // A page the title has just made, or a view the host refuses for a moment (commit
-    // or address space short while a load maps many at once), can come right a little
-    // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
-    // about 1.5 s in all).
-    static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let n = fill(&mut data, true)?;
+    data.truncate(n);
+    scatter(pages, offset, data, 0, pins)
+}
+
+fn scatter(
+    pages: Vec<usize>,
+    offset: usize,
+    data: Vec<u8>,
+    attempt: u32,
+    pins: Option<super::xmem::PinnedPages>,
+) -> Result<(), Failure> {
+    let n = data.len();
+    let backing = pins.or_else(|| super::xmem::pin_pages(&pages, offset, n));
+    if let Some(backing) = backing
+        && backing.scatter(&data)
+    {
+        backing.written(n);
+        return Ok(());
+    }
+    static RETRIES: OnceLock<u32> = OnceLock::new();
     let retries = *RETRIES.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
+        std::env::var("VICTORY_DSTORAGE_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12)
     });
-    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
-    let mut tries = 0;
-    while !written && tries < retries {
-        std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
-        tries += 1;
-        written = super::xmem::write_physical(pages, offset, &data[..n]);
+    if attempt >= retries {
+        return Err(E_INVALIDARG.into());
     }
-    if written {
-        super::xmem::pages_written(pages, offset, n);
-        if tries > 0 {
-            tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
-        }
-        Ok(())
-    } else {
-        let known = super::xmem::pages_known(pages, offset, len);
-        tracing::warn!(known, last_error = std::io::Error::last_os_error().raw_os_error(), "dstorage: retries used up");
-        // Said aloud: the title never reads a request's result
-        // (it only polls for completion), so a destination left unwritten
-        // is a model or texture that silently holds whatever its pages
-        // held before.
-        tracing::warn!(
+    let due = Clock::now() + Delay::from_millis((2u64 << attempt.min(6)).min(128));
+    Err(Failure::Later(
+        due,
+        Resume::Scatter {
+            pages,
             offset,
-            len,
-            pages = pages.len(),
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
-        );
-        Err(E_INVALIDARG)
-    }
+            data,
+            attempt: attempt + 1,
+        },
+    ))
 }
 
 /// The page numbers `list` holds now, one per 64 KiB of destination.
@@ -1711,29 +1866,41 @@ fn read_list(list: *const usize, offset: usize, len: usize) -> Vec<usize> {
 /// here. It is only ever overwritten: an address the title unmapped keeps
 /// the number of the page it had, which the title maps elsewhere soon after,
 /// so a number the title owns says nothing about whether it is the right
-/// one ([`half_submits`]). Page 0 does (an address never mapped yet): a list
+/// one. Page 0 does (an address never mapped yet): a list
 /// with a page the title does not own is read again for a while, up to
 /// 1.5 s; what it holds then is used as it is.
-fn page_list(list: *const usize, offset: usize, len: usize) -> Vec<usize> {
-    let mut pages = read_list(list, offset, len);
-    if super::xmem::pages_known(&pages, offset, len) {
-        return pages;
+struct Accepted {
+    pages: Vec<usize>,
+    offset: usize,
+    pins: Option<super::xmem::PinnedPages>,
+}
+
+fn accept(
+    request: &Request,
+    len: usize,
+    deadline: Option<Clock>,
+) -> Result<Option<Accepted>, Failure> {
+    if request.options & PAGE_DESTINATION == 0 {
+        return Ok(None);
     }
-    // Timed from here: what took long before was the lock on the page table
-    // (which the title's mapping calls hold), not the list.
-    let started = std::time::Instant::now();
-    let mut known = false;
-    while !known && started.elapsed().as_millis() < 1500 {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        pages = read_list(list, offset, len);
-        known = super::xmem::pages_known(&pages, offset, len);
+    let offset = (request.page_offset & 0xffff) as usize;
+    let pages = read_list(request.destination.cast(), offset, len);
+    let pins = super::xmem::pin_pages(&pages, offset, len);
+    let now = Clock::now();
+    let deadline = deadline.unwrap_or(now + Delay::from_millis(1500));
+    if pins.is_none() && now < deadline {
+        return Err(Failure::Later(
+            deadline.min(now + Delay::from_millis(1)),
+            Resume::Read {
+                deadline: Some(deadline),
+            },
+        ));
     }
-    tracing::warn!(
-        ms = started.elapsed().as_millis() as u64,
-        known,
-        "dstorage: a destination's page list was not filled in yet"
-    );
-    pages
+    Ok(Some(Accepted {
+        pages,
+        offset,
+        pins,
+    }))
 }
 
 /// Slots by the 2020 order, which the argument shapes at
@@ -2063,7 +2230,7 @@ mod tests {
     }
 
     #[test]
-    fn a_list_that_changes_during_the_write_has_its_new_pages_written() {
+    fn a_list_that_changes_during_the_write_only_writes_the_accepted_pages() {
         use crate::modules::xmem;
         let mut pages = [0usize; 4];
         let mut n = 4;
@@ -2076,18 +2243,38 @@ mod tests {
             let len = PAGE + 100;
             let r = request(PAGE_DESTINATION, at.cast(), len, std::ptr::null(), 0, len);
             let mut runs = 0;
-            let written = into_destination(&r, len, |out| {
+            let destination = accept(&r, len, None).ok().unwrap();
+            let written = into_destination(&r, destination, len, |out, _| {
                 runs += 1;
                 out.fill(0xa5);
                 // SAFETY: our own list.
                 unsafe { at.cast::<[usize; 2]>().write_volatile(new) };
                 Ok(out.len())
             });
-            assert_eq!((written, runs), (Ok(()), 2));
-            assert!(xmem::page_window(&new[..1], 0, PAGE).unwrap().bytes().iter().all(|&b| b == 0xa5));
-            assert!(xmem::page_window(&new[1..], 0, 100).unwrap().bytes().iter().all(|&b| b == 0xa5));
+            assert!(written.is_ok());
+            assert_eq!(runs, 1);
+            assert!(
+                xmem::page_window(&old[..1], 0, PAGE)
+                    .unwrap()
+                    .bytes()
+                    .iter()
+                    .all(|&b| b == 0xa5)
+            );
+            assert!(
+                xmem::page_window(&old[1..], 0, 100)
+                    .unwrap()
+                    .bytes()
+                    .iter()
+                    .all(|&b| b == 0xa5)
+            );
             for page in new {
-                xmem::page_window(&[page], 0, PAGE).unwrap().bytes().fill(0);
+                assert!(
+                    xmem::page_window(&[page], 0, PAGE)
+                        .unwrap()
+                        .bytes()
+                        .iter()
+                        .all(|&b| b == 0)
+                );
             }
         }
     }
@@ -2206,6 +2393,8 @@ mod tests {
     fn lanes(staging: u64) -> Lanes {
         Lanes {
             lanes: HashMap::new(),
+            suspended: BTreeMap::new(),
+            suspended_bytes: 0,
             next_id: 0,
             next_seq: 0,
             staged: 0,

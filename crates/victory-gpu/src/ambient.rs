@@ -99,7 +99,7 @@ fn set() -> Set {
 
 /// Whether the stand-in is on: set, and the title's rays find nothing.
 pub(crate) fn on() -> bool {
-    set() != Set::Off && !crate::pipeline::builder_runs()
+    set() != Set::Off && !crate::pipeline::builder_enabled()
 }
 
 /// The most the air scatters, as a multiple of the light around

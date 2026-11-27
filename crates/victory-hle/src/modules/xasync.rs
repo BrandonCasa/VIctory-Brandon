@@ -86,9 +86,38 @@ impl Task {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Call {
+    Guest(Task),
+    Terminated(usize, TerminatedCallback),
+}
+
+struct Ticket {
+    owner: Arc<Queue>,
+    port: u32,
+    call: Call,
+}
+
+impl Ticket {
+    fn run(self) {
+        let canceled = lock(&self.owner.state).closed[WORK as usize];
+        self.finish(canceled);
+    }
+
+    fn finish(self, canceled: bool) {
+        match self.call {
+            Call::Guest(task) => task.run(canceled),
+            Call::Terminated(context, callback) => callback(context as *mut c_void),
+        }
+        let mut state = lock(&self.owner.state);
+        state.outstanding[self.port as usize] -= 1;
+        self.owner.changed.notify_all();
+    }
+}
+
 struct Port {
     mode: Mode,
-    tasks: Mutex<VecDeque<Task>>,
+    tasks: Mutex<VecDeque<Ticket>>,
     ready: Condvar,
 }
 
@@ -106,7 +135,7 @@ impl Port {
             std::thread::spawn(move || {
                 loop {
                     match worker.take(1000, || false) {
-                        Some(task) => task.run(false),
+                        Some(task) => task.run(),
                         None if Arc::strong_count(&worker) == 1 => break,
                         None => {}
                     }
@@ -116,21 +145,29 @@ impl Port {
         port
     }
 
-    fn submit(&self, task: Task) {
+    /// Called under the submitting queue lock. Immediate calls return to
+    /// that caller already claimed so guest code always runs outside locks.
+    fn publish(&self, task: Ticket) -> Option<Ticket> {
         match self.mode {
-            Mode::Immediate => task.run(false),
-            Mode::ThreadPool => POOL.submit(task),
+            Mode::Immediate => return Some(task),
+            Mode::ThreadPool => POOL.submit(move || task.run()),
             Mode::Manual | Mode::Serialized => {
                 lock(&self.tasks).push_back(task);
                 self.ready.notify_one();
             }
         }
+        None
+    }
+
+    fn wake_dispatchers(&self) {
+        let _fifo = lock(&self.tasks);
+        self.ready.notify_all();
     }
 
     /// The next queued task, waiting up to `timeout_ms`, or until `ended`
     /// (checked whenever the port is woken) says no task will come.
-    fn take(&self, timeout_ms: u32, ended: impl Fn() -> bool) -> Option<Task> {
-        let waiting = |t: &mut VecDeque<Task>| t.is_empty() && !ended();
+    fn take(&self, timeout_ms: u32, ended: impl Fn() -> bool) -> Option<Ticket> {
+        let waiting = |t: &mut VecDeque<Ticket>| t.is_empty() && !ended();
         let tasks = lock(&self.tasks);
         let mut tasks = if timeout_ms == INFINITE {
             self.ready
@@ -152,7 +189,7 @@ impl Port {
 /// that blocks on another never starves it. Workers stay for reuse.
 struct Pool {
     /// Queued tasks and the number of idle workers.
-    state: Mutex<(VecDeque<Task>, usize)>,
+    state: Mutex<(VecDeque<Box<dyn FnOnce() + Send>>, usize)>,
     ready: Condvar,
 }
 
@@ -162,9 +199,9 @@ static POOL: Pool = Pool {
 };
 
 impl Pool {
-    fn submit(&'static self, task: Task) {
+    fn submit(&'static self, work: impl FnOnce() + Send + 'static) {
         let mut state = lock(&self.state);
-        state.0.push_back(task);
+        state.0.push_back(Box::new(work));
         if state.0.len() > state.1 {
             std::thread::spawn(move || self.work());
         } else {
@@ -183,7 +220,7 @@ impl Pool {
             let task = state.0.pop_front();
             drop(state);
             if let Some(task) = task {
-                task.run(false);
+                task();
             }
             state = lock(&self.state);
         }
@@ -195,10 +232,55 @@ impl Pool {
 pub struct Queue {
     ports: [Arc<Port>; 2],
     monitors: Mutex<Vec<(u64, usize, usize)>>,
-    terminated: AtomicBool,
-    /// Delayed callbacks still waiting out their delay, in submission
-    /// order: terminating the queue cancels them with the queued ones.
-    delayed: Mutex<BTreeMap<u64, Task>>,
+    state: Mutex<QueueState>,
+    changed: Condvar,
+    drained: [AtomicBool; 2],
+}
+
+#[derive(Default)]
+struct QueueState {
+    closed: [bool; 2],
+    outstanding: [usize; 2],
+    delayed: BTreeMap<u64, (std::time::Instant, u32, Task)>,
+    finished: bool,
+}
+
+struct Timer {
+    due: Mutex<BTreeMap<(std::time::Instant, u64), Arc<Queue>>>,
+    changed: Condvar,
+}
+
+static TIMER: LazyLock<Timer> = LazyLock::new(|| {
+    std::thread::spawn(|| TIMER.work());
+    Timer {
+        due: Mutex::default(),
+        changed: Condvar::new(),
+    }
+});
+
+impl Timer {
+    fn work(&self) {
+        let mut due = lock(&self.due);
+        loop {
+            let Some((&(at, id), _)) = due.first_key_value() else {
+                due = self.changed.wait(due).unwrap_or_else(|e| e.into_inner());
+                continue;
+            };
+            let now = std::time::Instant::now();
+            if at > now {
+                due = self
+                    .changed
+                    .wait_timeout(due, at - now)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+                continue;
+            }
+            let queue = due.remove(&(at, id)).unwrap();
+            drop(due);
+            queue.expire(id);
+            due = lock(&self.due);
+        }
+    }
 }
 
 impl Queue {
@@ -206,53 +288,130 @@ impl Queue {
         Arc::new(Queue {
             ports,
             monitors: Mutex::default(),
-            terminated: AtomicBool::new(false),
-            delayed: Mutex::default(),
+            state: Mutex::default(),
+            changed: Condvar::new(),
+            drained: [const { AtomicBool::new(false) }; 2],
         })
     }
 
     fn submit(self: &Arc<Self>, port: u32, delay_ms: u32, task: Task) -> HRESULT {
-        static NEXT_DELAYED: AtomicU64 = AtomicU64::new(0);
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         if port > COMPLETION {
             return E_INVALIDARG;
         }
-        if self.terminated.load(Ordering::Acquire) {
+        let mut state = lock(&self.state);
+        if state.closed[port as usize] {
             return E_ABORT;
         }
-        if delay_ms == 0 {
-            self.deliver(port, task);
-            return S_OK;
-        }
-        let id = NEXT_DELAYED.fetch_add(1, Ordering::Relaxed);
-        {
-            // Checked again under the lock termination drains: the callback
-            // is either canceled with the others or refused.
-            let mut delayed = lock(&self.delayed);
-            if self.terminated.load(Ordering::Acquire) {
-                return E_ABORT;
+        state.outstanding[port as usize] += 1;
+        if delay_ms != 0 {
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let at = std::time::Instant::now() + Duration::from_millis(delay_ms.into());
+            state.delayed.insert(id, (at, port, task));
+            lock(&TIMER.due).insert((at, id), self.clone());
+            TIMER.changed.notify_one();
+        } else {
+            let immediate = self.publish(port, Call::Guest(task));
+            let canceled = state.closed[0];
+            drop(state);
+            if let Some(task) = immediate {
+                task.finish(canceled);
             }
-            delayed.insert(id, task);
+            self.notify(port);
         }
-        let queue = self.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(delay_ms.into()));
-            // Gone if the queue was terminated meanwhile, which canceled it.
-            let task = lock(&queue.delayed).remove(&id);
-            if let Some(task) = task {
-                queue.deliver(port, task);
-            }
-        });
         S_OK
     }
 
-    fn deliver(self: &Arc<Self>, port: u32, task: Task) {
-        self.ports[port as usize].submit(task);
+    fn publish(self: &Arc<Self>, port: u32, call: Call) -> Option<Ticket> {
+        self.ports[port as usize].publish(Ticket {
+            owner: self.clone(),
+            port,
+            call,
+        })
+    }
+
+    fn expire(self: &Arc<Self>, id: u64) {
+        let mut state = lock(&self.state);
+        let Some((_, port, task)) = state.delayed.remove(&id) else {
+            return;
+        };
+        let immediate = self.publish(port, Call::Guest(task));
+        let owner = self.clone();
+        // Manual and serialized publication has already occurred in deadline
+        // order. A blocking immediate callback or monitor cannot hold the timer.
+        drop(state);
+        POOL.submit(move || {
+            if let Some(task) = immediate {
+                task.run();
+            }
+            owner.notify(port);
+        });
+    }
+
+    fn close_port(self: &Arc<Self>, port: u32) {
+        let mut state = lock(&self.state);
+        state.closed[port as usize] = true;
+        let delayed: Vec<_> = state
+            .delayed
+            .extract_if(.., |_, entry| entry.1 == port)
+            .collect();
+        let mut immediate = Vec::new();
+        for (id, (at, _, task)) in &delayed {
+            lock(&TIMER.due).remove(&(*at, *id));
+            if let Some(task) = self.publish(port, Call::Guest(*task)) {
+                immediate.push(task);
+            }
+        }
+        drop(state);
+        if !delayed.is_empty() {
+            TIMER.changed.notify_one();
+            for task in immediate {
+                task.finish(true);
+            }
+            self.notify(port);
+        }
+    }
+
+    fn wait_port(&self, port: u32) {
+        let state = lock(&self.state);
+        drop(
+            self.changed
+                .wait_while(state, |s| s.outstanding[port as usize] != 0)
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+    }
+
+    fn terminate(self: &Arc<Self>, context: usize, callback: Option<TerminatedCallback>) {
+        self.close_port(WORK);
+        self.wait_port(WORK);
+        self.drained[0].store(true, Ordering::Release);
+        self.ports[0].wake_dispatchers();
+        self.close_port(COMPLETION);
+        self.wait_port(COMPLETION);
+        if let Some(callback) = callback {
+            let mut state = lock(&self.state);
+            state.outstanding[1] += 1;
+            let immediate = self.publish(COMPLETION, Call::Terminated(context, callback));
+            drop(state);
+            if let Some(task) = immediate {
+                task.finish(false);
+            }
+            self.notify(COMPLETION);
+            self.wait_port(COMPLETION);
+        }
+        self.drained[1].store(true, Ordering::Release);
+        self.ports[1].wake_dispatchers();
+        lock(&self.state).finished = true;
+        self.changed.notify_all();
+    }
+
+    fn notify(&self, port: u32) {
         // Copied out: a monitor may unregister itself.
         let monitors = lock(&self.monitors).clone();
         for (_, context, callback) in monitors {
             // SAFETY: stored from a `MonitorCallback` in `register_monitor`.
             let callback: MonitorCallback = unsafe { std::mem::transmute(callback) };
-            callback(context as *mut c_void, Arc::as_ptr(self), port);
+            callback(context as *mut c_void, self, port);
         }
     }
 }
@@ -360,15 +519,18 @@ pub fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> b
     let Some(queue) = queue(handle) else {
         return false;
     };
-    let Some(port) = queue.ports.get(port as usize) else {
+    let logical = port as usize;
+    let Some(port) = queue.ports.get(logical) else {
         return false;
     };
     if port.mode != Mode::Manual {
         return false;
     }
-    match port.take(timeout_ms, || queue.terminated.load(Ordering::Acquire)) {
+    match port.take(timeout_ms, || {
+        queue.drained[logical].load(Ordering::Acquire)
+    }) {
         Some(task) => {
-            task.run(false);
+            task.run();
             true
         }
         None => false,
@@ -392,30 +554,32 @@ pub fn XTaskQueueSubmitDelayedCallback(
 /// `canceled`), refuses new work, then calls `callback`.
 pub fn XTaskQueueTerminate(
     handle: *const Queue,
-    _wait: bool,
+    wait: bool,
     context: *mut c_void,
     callback: Option<TerminatedCallback>,
 ) -> HRESULT {
     let Some(queue) = queue(handle) else {
         return E_INVALIDARG;
     };
-    queue.terminated.store(true, Ordering::Release);
-    for port in &queue.ports {
-        let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
-        // Dispatches waiting on this queue end: nothing more will come.
-        // (Those of other queues on the port see theirs is open and wait
-        // on.) After the lock above, so none misses both flag and wake.
-        port.ready.notify_all();
-        for task in pending {
-            task.run(true);
+    let mut state = lock(&queue.state);
+    if state.closed[0] {
+        if wait {
+            drop(
+                queue
+                    .changed
+                    .wait_while(state, |s| !s.finished)
+                    .unwrap_or_else(|e| e.into_inner()),
+            );
         }
+        return S_OK;
     }
-    let delayed = std::mem::take(&mut *lock(&queue.delayed));
-    for task in delayed.into_values() {
-        task.run(true);
-    }
-    if let Some(callback) = callback {
-        callback(context);
+    state.closed[0] = true;
+    drop(state);
+    let context = context as usize;
+    if wait {
+        queue.terminate(context, callback);
+    } else {
+        POOL.submit(move || queue.terminate(context, callback));
     }
     S_OK
 }
@@ -1629,9 +1793,11 @@ mod tests {
             S_OK
         );
         assert_eq!(
-            XTaskQueueTerminate(q, true, std::ptr::null_mut(), Some(terminated)),
+            XTaskQueueTerminate(q, false, std::ptr::null_mut(), Some(terminated)),
             S_OK
         );
+        while XTaskQueueDispatch(q, WORK, INFINITE) {}
+        while XTaskQueueDispatch(q, COMPLETION, INFINITE) {}
         assert!(canceled && TERMINATED.load(Ordering::SeqCst));
         assert_eq!(
             XTaskQueueSubmitDelayedCallback(q, WORK, 0, flag, Some(note)),

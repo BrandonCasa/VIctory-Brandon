@@ -355,7 +355,12 @@ impl Tiled {
     /// whether a level named is still without tiles (no room, or no heap
     /// could be had): the caller has the upload recorded again later, or
     /// the level would stay empty until the title writes the texture.
-    pub(crate) fn uploaded(&self, texture: &ID3D12Resource, held: u32, room: bool) -> (bool, bool) {
+    pub(crate) fn uploaded(
+        &self,
+        texture: &ID3D12Resource,
+        held: u32,
+        room: impl FnOnce() -> bool,
+    ) -> (bool, bool) {
         match host() {
             Some(host) => self.uploaded_on(host.queue(), &host.device, texture, held, room),
             None => (false, false),
@@ -369,10 +374,24 @@ impl Tiled {
         device: &ID3D12Device,
         texture: &ID3D12Resource,
         held: u32,
-        room: bool,
+        room: impl FnOnce() -> bool,
     ) -> (bool, bool) {
         let held = held & self.every_level();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let card = self.card.load(Ordering::Relaxed);
+        let packed = u32::MAX
+            .checked_shl(self.standard.len() as u32)
+            .unwrap_or(0);
+        let mandatory = card | if card & packed != 0 { packed } else { 0 };
+        let optional = self.without_locked(&given, held) & !mandatory;
+        let room = if optional != 0 {
+            drop(given);
+            let result = room();
+            given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+            result
+        } else {
+            false
+        };
         self.held.store(held, Ordering::Relaxed);
         let card = self.card.load(Ordering::Relaxed);
         let named = held | card;
@@ -1380,14 +1399,16 @@ void look() {
         };
         // No room: nothing is given, the held levels are said to wait,
         // nothing is shown, every level reads zeros.
-        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), false);
+        let (changed, waiting) =
+            tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), || false);
         rig.check("an upload without room");
         assert!(!changed && waiting, "without room: changed {changed}, waiting {waiting}");
         assert_eq!(tiled.given_bytes(), 0, "without room no tile is given");
         assert_eq!(tiled.first_shown(), None);
         read_as_given(rig, "without room");
         // Asked again with room: the same levels get theirs.
-        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), true);
+        let (changed, waiting) =
+            tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), || true);
         rig.check("the upload again, with room");
         assert!(changed && !waiting, "with room: changed {changed}, waiting {waiting}");
         assert!(tiled.has_tiles(3) && !tiled.has_tiles(2));
@@ -1396,7 +1417,8 @@ void look() {
         // More levels held and no room again: the ones that have tiles
         // are brought up to date, the new ones wait, the view stays.
         let before = tiled.given_bytes();
-        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), false);
+        let (changed, waiting) =
+            tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), || false);
         rig.check("more levels held, without room");
         assert!(!changed && waiting, "more levels without room: changed {changed}, waiting {waiting}");
         assert_eq!(tiled.given_bytes(), before);
@@ -1411,7 +1433,8 @@ void look() {
         assert_eq!(tiled.first_shown(), Some(0));
         assert_eq!(tiled.claim(1 << 0), 0, "a level with tiles is not claimed again");
         // With room everything held gets its tiles.
-        let (_, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), true);
+        let (_, waiting) =
+            tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), || true);
         rig.check("the last upload, with room");
         assert!(!waiting && tiled.whole());
         read_as_given(rig, "everything given");
@@ -1579,7 +1602,8 @@ void look() {
         // Even if level 0 later becomes allocatable, an upload with `room == false`
         // that does not hold level 0 must not treat level 0 as card-owned.
         tiled.standard[0] = 1;
-        let (changed, waiting) = tiled.uploaded_on(host.queue(), &host.device, &tex, 1 << 1, false);
+        let (changed, waiting) =
+            tiled.uploaded_on(host.queue(), &host.device, &tex, 1 << 1, || false);
         assert!(!changed && waiting);
         assert!(!tiled.has_tiles(0));
         assert_eq!(tiled.given_bytes(), 0);

@@ -685,7 +685,7 @@ impl<'a> Lanes<'a> {
             if let Exit::Branch { .. } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
-                self.when[b] = Some(self.branch(last));
+                self.when[b] = Some(self.branch(b, last));
                 self.wave_any[b] = self.wave_kind(last);
             }
         }
@@ -1334,7 +1334,7 @@ impl<'a> Lanes<'a> {
         }
     }
 
-    fn branch(&mut self, inst: &Inst) -> Bool {
+    fn branch(&mut self, block: usize, inst: &Inst) -> Bool {
         let exec = self.exec(inst);
         match inst.name() {
             "s_cbranch_execz" => self.b.not(exec),
@@ -1344,7 +1344,13 @@ impl<'a> Lanes<'a> {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
                 };
-                let any = self.b.and(vcc, exec);
+                // A wave-wide VCC branch reads the complete scalar pair,
+                // even if an intervening instruction narrowed EXEC.
+                let any = if self.wide.contains(&block) {
+                    vcc
+                } else {
+                    self.b.and(vcc, exec)
+                };
                 if n.ends_with("nz") {
                     any
                 } else {

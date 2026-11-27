@@ -393,6 +393,7 @@ const PAGE: usize = 64 << 10;
 struct Section {
     handle: HANDLE,
     pages: usize,
+    pins: Mutex<Vec<(usize, usize)>>,
     /// A view of the whole section, kept ([`Section::window`]); 0 if the
     /// host gave none.
     window: std::sync::OnceLock<usize>,
@@ -688,6 +689,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         handle,
         pages: n,
         window: std::sync::OnceLock::new(),
+        pins: Mutex::new(Vec::new()),
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
     });
     let mut table = page_table_mut();
@@ -757,7 +759,10 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        if !commit(at.Value as usize, len) {
+        if !slice
+            .section
+            .commit_shown(slice.index, at.Value as usize, len)
+        {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
         }
@@ -784,30 +789,198 @@ impl Drop for View {
 /// each), as runs of consecutive slices of one section: each run's first
 /// slice and its length in pages. One look at the page table. `None`
 /// if a page is unknown or `pages` ends early.
-fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)>> {
-    let end = offset.checked_add(len)?;
-    let pages = pages.get(offset / PAGE..end.div_ceil(PAGE))?;
-    let table = page_table();
-    let mut runs: Vec<(Slice, usize)> = Vec::new();
-    for page in pages {
-        let Some(slice) = table.pages.get(page) else {
-            tracing::warn!(page, offset, len, "a physical page the title does not own (any more)");
-            return None;
-        };
-        match runs.last_mut() {
-            Some((first, n))
-                if Arc::ptr_eq(&first.section, &slice.section)
-                    && slice.index == first.index + *n =>
-            {
-                *n += 1;
-            }
-            _ => runs.push((slice.clone(), 1)),
+enum Runs {
+    Empty,
+    One((Slice, usize)),
+    Many(Vec<(Slice, usize)>),
+}
+
+impl Runs {
+    fn as_slice(&self) -> &[(Slice, usize)] {
+        match self {
+            Self::Empty => &[],
+            Self::One(run) => std::slice::from_ref(run),
+            Self::Many(runs) => runs,
         }
     }
-    Some(runs)
+
+    fn push(&mut self, slice: &Slice) {
+        let last = match self {
+            Self::Empty => None,
+            Self::One(run) => Some(run),
+            Self::Many(runs) => runs.last_mut(),
+        };
+        if let Some((first, n)) = last
+            && Arc::ptr_eq(&first.section, &slice.section)
+            && first.index + *n == slice.index
+        {
+            *n += 1;
+            return;
+        }
+        let next = (slice.clone(), 1);
+        match std::mem::replace(self, Self::Empty) {
+            Self::Empty => *self = Self::One(next),
+            Self::One(first) => *self = Self::Many(vec![first, next]),
+            Self::Many(mut v) => {
+                v.push(next);
+                *self = Self::Many(v);
+            }
+        }
+    }
+}
+
+pub(crate) struct PinnedPages {
+    runs: Runs,
+    within: usize,
+    len: usize,
+}
+
+pub(crate) fn pin_pages(pages: &[usize], offset: usize, len: usize) -> Option<PinnedPages> {
+    let end = offset.checked_add(len)?;
+    let table = page_table();
+    let mut runs = Runs::Empty;
+    if len != 0 {
+        for id in pages.get(offset / PAGE..end.div_ceil(PAGE))? {
+            runs.push(table.pages.get(id)?);
+        }
+    }
+    for (slice, count) in runs.as_slice() {
+        slice
+            .section
+            .pins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((slice.index, slice.index + count));
+    }
+    Some(PinnedPages {
+        runs,
+        within: offset % PAGE,
+        len,
+    })
+}
+
+impl Drop for PinnedPages {
+    fn drop(&mut self) {
+        for (slice, n) in self.runs.as_slice() {
+            let mut pins = slice.section.pins.lock().unwrap_or_else(|e| e.into_inner());
+            let i = pins
+                .iter()
+                .position(|p| *p == (slice.index, slice.index + n))
+                .unwrap();
+            pins.swap_remove(i);
+        }
+    }
+}
+
+impl PinnedPages {
+    pub(crate) fn direct(&self) -> Option<PageWindow> {
+        let [(slice, count)] = self.runs.as_slice() else {
+            return None;
+        };
+        PageWindow::map(slice, *count, self.within, self.len)
+    }
+
+    pub(crate) fn scatter(&self, data: &[u8]) -> bool {
+        if data.len() > self.len {
+            return false;
+        }
+        let mut views = Vec::new();
+        let mut within = self.within;
+        let mut remaining = data.len();
+        for (slice, count) in self.runs.as_slice() {
+            if remaining == 0 {
+                break;
+            }
+            let n = remaining.min(count * PAGE - within);
+            let Some(view) = PageWindow::map(slice, (within + n).div_ceil(PAGE), within, n) else {
+                return false;
+            };
+            views.push(view);
+            remaining -= n;
+            within = 0;
+        }
+        let mut tail = data;
+        for view in &mut views {
+            let out = view.bytes();
+            let (bytes, rest) = tail.split_at(out.len());
+            out.copy_from_slice(bytes);
+            tail = rest;
+        }
+        true
+    }
+
+    pub(crate) fn written(&self, len: usize) {
+        let _mapping = victory_gpu::title_memory_reading();
+        let mut pieces = Vec::new();
+        let mut remaining = len.min(self.len);
+        let mut within = self.within;
+        {
+            let shown = SHOWN.read().unwrap_or_else(|e| e.into_inner());
+            for (slice, count) in self.runs.as_slice() {
+                if remaining == 0 {
+                    break;
+                }
+                let n = remaining.min(count * PAGE - within);
+                let lo = slice.index * PAGE + within;
+                let hi = lo + n;
+                let section = Arc::as_ptr(&slice.section) as usize;
+                let mut intersect = |at, start, end| {
+                    let first = lo.max(start);
+                    let last = hi.min(end);
+                    if first < last {
+                        pieces.push((at + (first - start), last - first));
+                    }
+                };
+                for &(base, length, of, index) in &shown.long {
+                    if of == section {
+                        intersect(base, index * PAGE, index * PAGE + length);
+                    }
+                }
+                for index in lo / PAGE..hi.div_ceil(PAGE) {
+                    if let Some(aliases) = shown.pages.get(&(section, index)) {
+                        for &base in aliases {
+                            intersect(base, index * PAGE, (index + 1) * PAGE);
+                        }
+                    }
+                }
+                within = 0;
+                remaining -= n;
+            }
+        }
+        pieces.sort_unstable();
+        let mut pending = None;
+        for (at, bytes) in pieces {
+            match &mut pending {
+                Some((base, len)) if *base + *len == at => *len += bytes,
+                _ => {
+                    if let Some((base, len)) = pending {
+                        notify_alias(base, len);
+                    }
+                    pending = Some((at, bytes));
+                }
+            }
+        }
+        if let Some((at, bytes)) = pending {
+            notify_alias(at, bytes);
+        }
+    }
+}
+
+fn notify_alias(at: usize, bytes: usize) {
+    if stream_notice() {
+        victory_gpu::kernel_will_write(at, bytes);
+    } else {
+        victory_gpu::title_memory_written(at, bytes, true);
+    }
+}
+
+#[cfg(test)]
+fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)>> {
+    Some(pin_pages(pages, offset, len)?.runs.as_slice().to_vec())
 }
 
 /// Whether the title owns every page under bytes `[offset, offset + len)`.
+#[cfg(test)]
 pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
     let table = page_table();
     pages
@@ -835,26 +1008,9 @@ pub(crate) fn pages_shown(pages: &[usize], offset: usize, len: usize) -> Vec<(us
 /// One view per run of consecutive pages, not one per page: each view
 /// costs a map, a commit and an unmap (which flushes every core's TLB).
 /// False if a page is unknown or the host fails.
-pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
-    let Some(runs) = runs(pages, offset, data.len()) else {
-        return false;
-    };
-    let (mut within, mut done) = (offset % PAGE, 0);
-    for (slice, n) in &runs {
-        let k = (n * PAGE - within).min(data.len() - done);
-        if let Some(at) = slice.section.window(slice.index, *n) {
-            // SAFETY: committed bytes of the section's view, which `runs`
-            // holds; the title's other uses of them race as on the console.
-            unsafe { std::ptr::copy_nonoverlapping(data[done..].as_ptr(), (at + within) as *mut u8, k) };
-        } else {
-            let Some(mut view) = View::map(slice, *n) else {
-                return false;
-            };
-            view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
-        }
-        (within, done) = (0, done + k);
-    }
-    true
+#[cfg(test)]
+fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
+    pin_pages(pages, offset, data.len()).is_some_and(|pins| pins.scatter(data))
 }
 
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
@@ -890,20 +1046,19 @@ impl PageWindow {
 /// `None` otherwise (pages of several allocations, out of order, or
 /// unknown, or a host failure), which `write_physical` then handles or
 /// reports.
+#[cfg(test)]
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
-    let runs = runs(pages, offset, len)?;
-    let [(slice, n)] = runs.as_slice() else {
-        return None;
-    };
-    let view = match slice.section.window(slice.index, *n) {
-        Some(at) => Window::Kept(at, slice.section.clone()),
-        None => Window::Own(View::map(slice, *n)?),
-    };
-    Some(PageWindow {
-        view,
-        within: offset % PAGE,
-        len,
-    })
+    pin_pages(pages, offset, len)?.direct()
+}
+
+impl PageWindow {
+    fn map(slice: &Slice, count: usize, within: usize, len: usize) -> Option<Self> {
+        let view = match slice.section.window(slice.index, count) {
+            Some(at) => Window::Kept(at, slice.section.clone()),
+            None => Window::Own(View::map(slice, count)?),
+        };
+        Some(Self { view, within, len })
+    }
 }
 
 /// The title addresses that show bytes `[offset, offset + len)` of `pages`
@@ -913,6 +1068,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
 /// addresses sees it. Empty if no view shows them. Byte for byte, not by
 /// whole pages: the title packs several small textures into one page and
 /// fills each with a request of its own.
+#[cfg(test)]
 pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, usize)> {
     let Some(end) = offset.checked_add(len) else {
         return Vec::new();
@@ -954,6 +1110,7 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
 /// is copied again. Call when the bytes are there.
 /// `VICTORY_STREAM_NOTICE=0`: not told; what is then done is
 /// `VICTORY_PAGE_WRITES`' to say (`victory_gpu::title_memory_written`).
+#[cfg(test)]
 pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
     if len == 0 {
         return;
@@ -1138,7 +1295,13 @@ fn arrange(base: usize, pages: &[usize]) {
         }
         return;
     }
-    let fresh = |index: usize| section.committed[index / 64].load(Ordering::Acquire) >> (index % 64) & 1 == 0;
+    let pins = section.pins.lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = |index: usize| {
+        section.committed[index / 64].load(Ordering::Acquire) >> (index % 64) & 1 == 0
+            && !pins
+                .iter()
+                .any(|&(start, end)| (start..end).contains(&index))
+    };
     // Which number has which slice of the section.
     let mut owner: HashMap<usize, usize> = table
         .pages

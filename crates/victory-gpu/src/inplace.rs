@@ -276,6 +276,9 @@ pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size:
 struct Views {
     /// By address: bytes, the section's handle, the offset in it.
     views: BTreeMap<usize, (usize, usize, u64)>,
+    // A handle and offset may be reused after unmapping.
+    generations: BTreeMap<usize, u64>,
+    next_generation: u64,
     /// By section and byte offset of a 64 KiB page: the address of that
     /// page in every view that shows it. A write through one view of a
     /// page is a write of the bytes every other view shows
@@ -294,6 +297,8 @@ struct Views {
 /// runtime maps or unmaps.
 static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     views: BTreeMap::new(),
+    generations: BTreeMap::new(),
+    next_generation: 1,
     pages: BTreeMap::new(),
     pages_twice: 0,
     sections: Vec::new(),
@@ -340,6 +345,9 @@ pub fn title_memory_section_gone(section: usize) {
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     {
         let mut v = views_mut();
+        let generation = v.next_generation;
+        v.next_generation = generation.wrapping_add(1);
+        v.generations.insert(at, generation);
         v.views.insert(at, (len, section, offset));
         for k in 0..len.div_ceil(K64) {
             let shown = v.pages.entry((section, offset + (k * K64) as u64)).or_default();
@@ -366,6 +374,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
     for base in gone {
+        v.generations.remove(&base);
         let Some((bytes, section, offset)) = v.views.remove(&base) else {
             continue;
         };
@@ -407,6 +416,90 @@ pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize
         }
     }
     out
+}
+
+/// All virtual starts that currently show the same contiguous physical extent.
+pub(crate) fn aliases(at: usize, len: usize) -> Vec<usize> {
+    if len == 0 || at.checked_add(len).is_none() {
+        return Vec::new();
+    }
+    let v = views();
+    let mapping = |address: usize| {
+        let (&base, &(size, section, offset)) = v.views.range(..=address).next_back()?;
+        let consumed = address - base;
+        (consumed < size).then(|| (section, offset + consumed as u64, size - consumed))
+    };
+    let Some((section, offset, _)) = mapping(at) else {
+        return Vec::new();
+    };
+    let within = (offset % K64 as u64) as usize;
+    v.pages
+        .get(&(section, offset - within as u64))
+        .into_iter()
+        .flatten()
+        .filter_map(|&page| {
+            let other = page.checked_add(within)?;
+            if other == at || other.checked_add(len).is_none() {
+                return None;
+            }
+            let mut checked = 0;
+            while checked < len {
+                let (a, ao, n) = mapping(at + checked)?;
+                let (b, bo, m) = mapping(other + checked)?;
+                if (a, ao) != (b, bo) {
+                    return None;
+                }
+                checked += n.min(m).min(len - checked);
+            }
+            Some(other)
+        })
+        .collect()
+}
+
+/// Notify every virtual view of a completed write, including partial
+/// overlaps and physical pages with many mappings.
+pub(crate) fn notify_texture_write(at: usize, len: usize) {
+    let Some(end) = at.checked_add(len) else {
+        return;
+    };
+    if at >= end {
+        return;
+    }
+    let mut ranges = vec![(at, end)];
+    {
+        let v = views();
+        for page in at / K64..end.div_ceil(K64) {
+            let base = page * K64;
+            let Some((&from, &(bytes, section, offset))) = v.views.range(..=base).next_back()
+            else {
+                continue;
+            };
+            if base - from >= bytes {
+                continue;
+            }
+            let within = at.saturating_sub(base);
+            let last = (end - base).min(K64);
+            if let Some(aliases) = v.pages.get(&(section, offset + (base - from) as u64)) {
+                ranges.extend(
+                    aliases
+                        .iter()
+                        .filter(|&&other| other != base)
+                        .map(|&other| (other + within, other + last)),
+                );
+            }
+        }
+    }
+    ranges.sort_unstable();
+    let mut range = ranges[0];
+    for (lo, hi) in ranges.into_iter().skip(1) {
+        if lo <= range.1 {
+            range.1 = range.1.max(hi);
+        } else {
+            crate::descriptor::host::page_written(range.0, range.1 - range.0);
+            range = (lo, hi);
+        }
+    }
+    crate::descriptor::host::page_written(range.0, range.1 - range.0);
 }
 
 /// The address of the 64 KiB page shown at `page` in every title view that
@@ -480,6 +573,32 @@ pub(crate) fn shown_bytes(at: usize, len: usize) -> Option<u64> {
 /// What of `[at, at + len)` views of physical pages show, in order, pieces
 /// that touch as one: (address, bytes). Empty: nothing, or memory of another
 /// kind.
+pub(crate) fn backing(at: usize, len: usize) -> Vec<(usize, usize, usize, u64, u64)> {
+    let end = at.saturating_add(len);
+    let v = views();
+    let first = v.views.range(..=at).next_back();
+    first
+        .into_iter()
+        .chain(
+            v.views
+                .range(at.saturating_add(1)..end.max(at.saturating_add(1))),
+        )
+        .filter_map(|(&base, &(bytes, section, offset))| {
+            let from = base.max(at);
+            let to = base.saturating_add(bytes).min(end);
+            (from < to).then(|| {
+                (
+                    from,
+                    to,
+                    section,
+                    offset + (from - base) as u64,
+                    v.generations[&base],
+                )
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn shown_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
     let end = at.saturating_add(len);
     let v = views();

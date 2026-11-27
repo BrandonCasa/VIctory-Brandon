@@ -56,7 +56,7 @@ pub(crate) struct Heap {
     /// descriptor order when a draw first uses them (decision 0007, step
     /// 3); slots written before wait in `pending`.
     #[cfg(windows)]
-    host: std::sync::OnceLock<Option<host::HostHeap>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<host::HostHeap>>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
     /// Changed pages of a placed shader-visible heap. Some titles copy
@@ -81,6 +81,11 @@ impl Heap {
     /// costs over 100 MB of commit, which its boot needs for its page pool.
     #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
+        self.host_owner().map(std::sync::Arc::as_ref)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn host_owner(&self) -> Option<&std::sync::Arc<host::HostHeap>> {
         if let Some(h) = self.host.get() {
             return h.as_ref();
         }
@@ -94,7 +99,7 @@ impl Heap {
         self.host
             .get_or_init(|| {
                 let step = u64::from(increment(self.desc.kind)?);
-                let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
+                let h = std::sync::Arc::new(host::HostHeap::new(self.samplers(), self.desc.count)?);
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
@@ -394,8 +399,7 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
-        // Capped host heaps have no counterparts for the title slots reserved
-        // for per-draw tables; raw writes there must not be mirrored.
+        // Scan the complete logical view heap, including sparsely mapped high slots.
         let mirrored_count = heap.desc.count.min(host.count());
         // The records of some frames ago that no draw read through a table
         // since: a shader may pick them by index.
@@ -405,7 +409,7 @@ pub(crate) fn sync_heaps() {
         let phase = crate::timeline::span("the heaps' records: those that waited");
         crate::land::each_view(true, before.len().div_ceil(records_a_job), &|n| {
             for &index in before.chunks(records_a_job).nth(n).unwrap_or_default() {
-                if host.copied_tabled(index, frame) {
+                if !victory_shader::emit::mapped_views() && host.copied_tabled(index, frame) {
                     of_tables.fetch_add(1, Relaxed);
                 } else {
                     host.mirror(index, start + u64::from(index) * step, false);
@@ -545,7 +549,8 @@ pub(crate) fn sync_heaps() {
                     if !samplers && word(0) == VIEW_TAG {
                         // A draw's own table: the draw makes what it
                         // reads of it (`draw.rs` `tables`).
-                        if host.copied_tabled(index, frame) {
+                        if !victory_shader::emit::mapped_views() && host.copied_tabled(index, frame)
+                        {
                             out.tabled += 1;
                             continue;
                         }
@@ -553,7 +558,10 @@ pub(crate) fn sync_heaps() {
                         // slot from this anyway, they wait for a draw
                         // or a pass: noted some frames on, unless a
                         // draw's table turns out to hold them.
-                        if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() {
+                        if !victory_shader::emit::mapped_views()
+                            && matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED)
+                            && host.copied_waits()
+                        {
                             out.wait.push(index);
                             continue;
                         }
@@ -561,7 +569,10 @@ pub(crate) fn sync_heaps() {
                     // No view, in a slot that shows none: nothing to make or
                     // unmake (32,000 of 41,000 a frame on the water, run
                     // b2-water).
-                    if word(0) != VIEW_TAG && host.shows_none(index) {
+                    if word(0) != VIEW_TAG
+                        && host.shows_none(index)
+                        && !victory_shader::emit::mapped_views()
+                    {
                         out.nothing += 1;
                         continue;
                     }
@@ -852,19 +863,6 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
     heaps.iter().any(|&(_, _, h)| h == heap).then(|| f(unsafe { &*(heap as *const Heap) }))
 }
 
-/// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
-#[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(first, n);
-    }
-}
-
 /// Runs `f` with the host heap of the title's largest view heap, if there is
 /// one (nothing is waited for).
 #[cfg(windows)]
@@ -878,26 +876,6 @@ pub(crate) fn with_view_heap<T>(f: impl FnOnce(&host::HostHeap) -> T) -> Option<
         .filter_map(|heap| heap.host.get()?.as_ref())
         .max_by_key(|host| host.count())?;
     Some(f(host))
-}
-
-/// Makes dynamic slot `index` of the host heap behind the title heap at
-/// `heap`, if that heap still exists, the constant buffer view of `size`
-/// bytes of `buffer` at `gpu`.
-#[cfg(windows)]
-pub(crate) fn constant_slot(
-    heap: usize,
-    index: u32,
-    buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    gpu: u64,
-    size: u32,
-) {
-    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.constant_at(index, buffer, gpu, size);
-    }
 }
 
 #[cfg(windows)]
@@ -1517,11 +1495,10 @@ pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
 pub(crate) fn view(handle: u64) -> Option<View> {
-    if handle == 0 {
-        return None;
-    }
-    // SAFETY: the handle is a descriptor slot the title passes back.
-    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    recorded_view(record_at(handle)?)
+}
+
+pub(crate) fn recorded_view([tag, i, generation]: [u32; 3]) -> Option<View> {
     if tag != VIEW_TAG {
         return None;
     }

@@ -126,6 +126,10 @@ struct List {
     /// list is cut at its waits for memory values ([`cut`]).
     #[cfg(windows)]
     earlier: Vec<Part>,
+    #[cfg(windows)]
+    cached: Option<std::sync::Arc<[(Vec<ValueWait>, Detached)]>>,
+    #[cfg(windows)]
+    objects: Option<std::sync::Arc<thin::Objects>>,
     /// The waits recorded before the first work of `host`: the queue stands
     /// at them before it runs `host`.
     #[cfg(windows)]
@@ -156,25 +160,11 @@ pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    if list.take_texture_boundary() {
+        cut(this, None);
+    }
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
-}
-
-/// The submission of `lists` has run: each gives its descriptor tables'
-/// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
-/// keeps them: its state goes with its last part.
-#[cfg(windows)]
-pub(crate) fn tables_done(lists: &[This]) {
-    for &this in lists {
-        if this.is_null() {
-            continue;
-        }
-        // SAFETY: the title passes our lists.
-        let list = unsafe { &*this.cast::<List>() };
-        if list.earlier.is_empty() {
-            list.state.lock().unwrap_or_else(|e| e.into_inner()).tables_done();
-        }
-    }
 }
 
 /// The host list behind a title list, if there is a host GPU.
@@ -192,8 +182,15 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
 /// With it go the upload memory and the dynamic descriptor slots its
 /// commands name, kept until it has run.
 #[cfg(windows)]
+#[derive(Clone)]
 pub(crate) struct Detached {
-    host: crate::host::HostList,
+    host: std::sync::Arc<crate::host::HostList>,
+    contents: std::sync::Arc<Contents>,
+}
+
+#[cfg(windows)]
+struct Contents {
+    _objects: Option<std::sync::Arc<thin::Objects>>,
     _uploads: Vec<Upload>,
     _state: crate::draw::State,
 }
@@ -208,7 +205,9 @@ impl Detached {
     /// has completed, without waiting for the full `bury_lag` (64 submissions)
     /// allocator delay: preventing dynamic slot exhaustion at ~10k draws/frame.
     pub(crate) fn release_tables(&mut self) {
-        self._state.tables_done();
+        if let Some(contents) = std::sync::Arc::get_mut(&mut self.contents) {
+            contents._state.tables_done();
+        }
     }
 }
 
@@ -276,10 +275,10 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
-    for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
+    for (i, Detached { host, contents }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
-        drop(_state);
-        drop(_uploads);
+        drop(contents);
+        let Ok(host) = std::sync::Arc::try_unwrap(host) else {continue};
         if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
             continue;
         }
@@ -313,7 +312,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
 /// console, never earlier, and nothing can wait for itself that way (a
 /// part has no wait after its first work).
 #[cfg(windows)]
-fn cut(this: This, wait: ValueWait) {
+fn cut(this: This, wait: Option<ValueWait>) {
     if this.is_null() {
         return;
     }
@@ -324,7 +323,7 @@ fn cut(this: This, wait: ValueWait) {
         return;
     };
     if current.untouched() {
-        list.gate.push(wait);
+        list.gate.extend(wait);
         return;
     }
     let Some(fresh) = fresh_list() else {
@@ -332,7 +331,8 @@ fn cut(this: This, wait: ValueWait) {
         // it was recorded in.
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!("no host list for the part after a wait: the wait moves to the part's start"));
-        list.gate.push(wait);
+        if wait.is_none() { current.refused_pipeline(0); }
+        list.gate.extend(wait);
         return;
     };
     current.close();
@@ -341,7 +341,7 @@ fn cut(this: This, wait: ValueWait) {
         tracing::info!(parts = list.earlier.len() + 2, "a list is cut at a wait for a memory value");
     }
     if let Some(done) = list.host.replace(fresh) {
-        let waits = std::mem::replace(&mut list.gate, vec![wait]);
+        let waits = std::mem::replace(&mut list.gate, wait.into_iter().collect());
         list.earlier.push(Part { waits, host: done });
     }
     // What the title set so far, on the new host list.
@@ -362,8 +362,9 @@ pub(crate) fn cut_list(this: This) -> bool {
     }
     // SAFETY: one of our lists, closed and submitted: nothing records
     // into it.
+    let _closed = FREEZE.lock().unwrap_or_else(|e| e.into_inner());
     let list = unsafe { &*this.cast::<List>() };
-    !list.earlier.is_empty() || !list.gate.is_empty()
+    !list.earlier.is_empty() || !list.gate.is_empty() || list.cached.is_some()
 }
 
 /// What a queue is given for submitted lists that were cut at their waits:
@@ -372,140 +373,81 @@ pub(crate) fn cut_list(this: This) -> bool {
 #[cfg(windows)]
 pub(crate) type Parts = Vec<(Vec<ValueWait>, Vec<Detached>, Vec<usize>)>;
 
-/// Takes the host sides of the submitted `lists`, part by part ([`cut`]),
-/// and leaves each list a new, closed host list for its next reset, as
-/// [`detach`] does. What comes back is in the order the queue runs it: a
-/// new entry starts at every part that has waits; host lists without
-/// waits join the entry before them. The list's upload memory and draw
-/// state (its dynamic descriptor slots) go with its last part, which runs
-/// last.
-/// shortcut: a list the submission names a second time runs again only if
-/// it has one part and that part is in the entry being filled; otherwise
-/// the second naming is dropped (logged once).
+/// Freeze native commands once for this guest generation. The title can
+/// submit it again, including after one of its previous flights retires.
+#[cfg(windows)]
+static FREEZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(windows)]
+fn freeze(this: This) -> Option<std::sync::Arc<[(Vec<ValueWait>, Detached)]>> {
+    let _closed = FREEZE.lock().unwrap_or_else(|e| e.into_inner());
+    let list = unsafe { this.cast_mut().cast::<List>().as_mut()? };
+    if list.cached.is_none() {
+        let fresh = fresh_list()?;
+        fresh.close();
+        let last = list.host.replace(fresh)?;
+        let contents = std::sync::Arc::new(Contents {
+            _objects: list.objects.clone(),
+            _state: std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner())),
+            _uploads: std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner())),
+        });
+        let mut pieces = Vec::with_capacity(list.earlier.len() + 1);
+        for part in std::mem::take(&mut list.earlier).into_iter().chain([Part {
+            waits: std::mem::take(&mut list.gate),
+            host: last,
+        }]) {
+            pieces.push((
+                part.waits,
+                Detached {
+                    host: std::sync::Arc::new(part.host),
+                    contents: contents.clone(),
+                },
+            ));
+        }
+        list.cached = Some(pieces.into());
+    }
+    list.cached.clone()
+}
+
+/// Repeated occurrences retain their waits and execute every native part.
 #[cfg(windows)]
 pub(crate) fn detach_parts(lists: &[This]) -> Parts {
-    let mut parts: Parts = vec![(Vec::new(), Vec::new(), Vec::new())];
-    // The lists taken: where its one host list is (entry, place), or none
-    // for a list of several parts.
-    let mut seen: Vec<(This, Option<(usize, usize)>)> = Vec::new();
-    for &this in lists {
-        if this.is_null() {
-            continue;
-        }
-        if let Some(&(_, at)) = seen.iter().find(|(t, _)| *t == this) {
-            match at {
-                Some((entry, place)) if entry + 1 == parts.len() => parts[entry].2.push(place),
-                _ => {
-                    static ONCE: std::sync::Once = std::sync::Once::new();
-                    ONCE.call_once(|| {
-                        tracing::warn!("a list named twice by a submission that waits for memory values runs once")
-                    });
-                }
-            }
-            continue;
-        }
-        let Some(fresh) = fresh_list() else {
-            continue;
+    let mut parts: Parts = Vec::new();
+    let mut index = std::collections::HashMap::new();
+    for &list in lists.iter().filter(|p| !p.is_null()) {
+        let Some(pieces) = freeze(list) else {
+            crate::host::refuse_frame(format_args!("could not retain command list {list:p}"));
+            return Vec::new();
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
-        // SAFETY: one of our lists, closed and submitted: nothing records
-        // into it until the title resets it.
-        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
-            continue;
-        };
-        let earlier = std::mem::take(&mut list.earlier);
-        let gate = std::mem::take(&mut list.gate);
-        let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
-        let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
-        let single = earlier.is_empty() && gate.is_empty();
-        let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
-            .into_iter()
-            .map(|part| {
-                (
-                    part.waits,
-                    Detached {
-                        host: part.host,
-                        _uploads: Vec::new(),
-                        _state: Default::default(),
-                    },
-                )
-            })
-            .collect();
-        pieces.push((
-            gate,
-            Detached {
-                host,
-                _uploads: uploads,
-                _state: state,
-            },
-        ));
-        let mut last = None;
-        for (waits, detached) in pieces {
-            if !waits.is_empty() {
-                parts.push((waits, Vec::new(), Vec::new()));
+        for (waits, piece) in pieces.iter() {
+            if parts.is_empty() || !waits.is_empty() {
+                parts.push((waits.clone(), Vec::new(), Vec::new()));
+                index.clear();
             }
-            let entry = parts.len() - 1;
-            let (_, taken, order) = &mut parts[entry];
-            let place = taken.len();
-            order.push(place);
-            taken.push(detached);
-            last = Some((entry, place));
+            let (_, kept, order) = parts.last_mut().unwrap();
+            let i = *index
+                .entry(std::sync::Arc::as_ptr(&piece.host))
+                .or_insert_with(|| {
+                    let i = kept.len();
+                    kept.push(piece.clone());
+                    i
+                });
+            order.push(i);
         }
-        seen.push((this, if single { last } else { None }));
     }
-    // (The first entry is empty if the first list begins with a wait.)
-    parts.retain(|(_, taken, _)| !taken.is_empty());
     parts
 }
 
-/// Takes the host sides of submitted lists (each once, however often the
-/// submission names it) and leaves each list a new, closed host list for
-/// its next reset: what was taken, and which of them run in what order.
 #[cfg(windows)]
 pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
-    let mut taken: Vec<(This, Detached)> = Vec::new();
+    let mut kept = Vec::new();
     let mut order = Vec::new();
-    for &this in lists {
-        if this.is_null() {
-            continue;
-        }
-        if let Some(i) = taken.iter().position(|(t, _)| *t == this) {
-            order.push(i);
-            continue;
-        }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
-        let list = this.cast_mut().cast::<List>();
-        // SAFETY: one of our lists, closed and submitted: nothing records
-        // into it until the title resets it.
-        let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
-                continue;
-            };
-            let uploads =
-                std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
-            let state =
-                std::mem::take(&mut *(*list).state.lock().unwrap_or_else(|e| e.into_inner()));
-            (host, uploads, state)
-        };
-        order.push(taken.len());
-        taken.push((
-            this,
-            Detached {
-                host,
-                _uploads: uploads,
-                _state: state,
-            },
-        ));
+    for (_, pieces, indices) in detach_parts(lists) {
+        let base = kept.len();
+        order.extend(indices.into_iter().map(|i| base + i));
+        kept.extend(pieces);
     }
-    (taken.into_iter().map(|(_, d)| d).collect(), order)
+    (kept, order)
 }
 
 pub(crate) extern "system" fn create_allocator(
@@ -623,6 +565,10 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         #[cfg(windows)]
         earlier: Vec::new(),
         #[cfg(windows)]
+        cached: None,
+        #[cfg(windows)]
+        objects: None,
+        #[cfg(windows)]
         gate: Vec::new(),
         #[cfg(windows)]
         thin: Default::default(),
@@ -659,6 +605,9 @@ extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
+        if host.refused() {
+            return 0x80004005u32 as HRESULT;
+        }
     }
     S_OK
 }
@@ -683,6 +632,8 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         // SAFETY: the title passes one of our lists, and neither records
         // into it nor submits it during its reset.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        list.cached = None;
+        list.objects = None;
         list.earlier.clear();
         list.gate.clear();
     }
@@ -883,6 +834,18 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+#[cfg(windows)]
+fn texture_copy_finished(this: This, list: &crate::host::HostList, resource: This) {
+    if crate::resource::title_fills(resource) {
+        list.texture_written(resource);
+        if list.take_texture_boundary() {
+            cut(this, None);
+        }
+    } else {
+        crate::texture::host_written(resource);
+    }
+}
+
 /// Whether one of two resources is a target in a stand-in format and the
 /// other is not ([`crate::resource::target_format`]): their texels differ
 /// in size, so the host cannot copy between them (logged once).
@@ -929,7 +892,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             let same = windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from);
             // A source the title fills itself is uploaded first (upstream
             // PR #671): a copy read whatever the host texture held.
-            if crate::texture::title_written(from) {
+            if crate::resource::title_fills(src) {
                 crate::texture::upload(list, src, from);
             }
             // Depth textures shaders also write: what they wrote, first.
@@ -938,7 +901,6 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // A destination made level by level gets its levels' memory
             // ahead of this list (`crate::tiles`).
             crate::texture::card_writes(list, dst, to, None);
-            crate::texture::host_written(dst);
             if same {
                 SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 static ONCE: std::sync::Once = std::sync::Once::new();
@@ -957,6 +919,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
+            texture_copy_finished(this, list, dst);
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -1092,7 +1055,7 @@ extern "system" fn copy_texture_region(
                 && dst.kind != FOOTPRINT
                 && src.footprint.offset as u32 == dst.footprint.offset as u32;
             list.twin_use(src.resource, false, false);
-            if crate::texture::title_written(texture) {
+            if crate::resource::title_fills(src.resource) {
                 crate::texture::upload(list, src.resource, texture);
             }
             if !same {
@@ -1103,45 +1066,15 @@ extern "system" fn copy_texture_region(
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
         list.twin_use(dst.resource, false, true);
-        // The first copy into a texture of the title's: what it does not
-        // write is zeros, as in a texture that was an allocation of its own
-        // (`VICTORY_COPY_OVER_TITLE=title`: what title memory holds, which
-        // may be another texture's: specks on the waitress's forehead were
-        // left in run n04). (The host
-        // copy is cut from a block and held whatever lay there, and no
-        // upload is made once a copy wrote it: the atlas the title copies
-        // its baked decorations into, a 2048x2048 BC3 texture of which a
-        // bake writes 256x256 at most, was drawn over a character's face
-        // with other textures' bytes wherever nothing was baked, runs n01 and
-        // textures-1.)
-        static OVER: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-        let over = *OVER.get_or_init(|| match std::env::var("VICTORY_COPY_OVER_TITLE").as_deref() {
-            Ok("0") => 0,
-            Ok("title") => 1,
-            _ => 2,
-        });
-        if over != 0 && crate::texture::title_written(to) && !crate::texture::host_wrote(dst.resource as usize) {
-            // One a list uploaded, or a draw sampled, holds the title's.
-            if over == 2 && !list.used(dst.resource as usize) && !crate::texture::is_staged(dst.resource) {
-                if let Some(host) = crate::host::host() {
-                    ensure_state(list, dst.resource, COPY_DEST);
-                    let _ = list.first_use(dst.resource as usize);
-                    crate::texture::zeros(list, host, to);
-                }
-            } else {
-                crate::texture::upload(list, dst.resource, to);
-            }
-            // (Done before the title's copy writes over it.)
-            if list.used(dst.resource as usize) {
-                ensure_state(list, dst.resource, COPY_SOURCE);
-            }
+        // A region copy preserves the rest of the destination allocation.
+        if !same && crate::resource::title_fills(dst.resource) {
+            crate::texture::upload(list, dst.resource, to);
         }
         // A destination made level by level gets the level's memory ahead
         // of this list (`crate::tiles`): the title's bake copies each level
         // of its result into a block-compressed texture of that kind, and
         // a copy into a level without memory is dropped.
         crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
-        crate::texture::host_written(dst.resource);
         if same {
             SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
@@ -1186,6 +1119,7 @@ extern "system" fn copy_texture_region(
                 host_box,
             )
         };
+        texture_copy_finished(this, list, dst.resource);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
@@ -1227,7 +1161,7 @@ fn read_back(
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
     list.twin_use(src.resource, false, false);
-    if crate::texture::title_written(texture) {
+    if crate::resource::title_fills(src.resource) {
         crate::texture::upload(list, src.resource, texture);
     }
     ensure_state(list, src.resource, COPY_SOURCE);
@@ -1302,7 +1236,6 @@ extern "system" fn resolve(
         crate::texture::card_writes(list, dst, to, Some(dst_sub));
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_written(dst);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
@@ -1333,6 +1266,7 @@ extern "system" fn resolve(
                 );
             }
         }
+        texture_copy_finished(this, list, dst);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_sub, src, src_sub, format);
@@ -1473,10 +1407,26 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 /// `DispatchX(x, y, z, flags)`: a dispatch with console flags, of which the
 /// host follows one: the counts are threads, not groups (`draw.rs`
 /// `THREAD_DIMENSIONS`; the ray-tracing structure builder dispatches this way).
+#[cfg(windows)]
+fn builder_boundary(this: This) {
+    if !crate::pipeline::builder_enabled() {
+        return;
+    }
+    let mut boundary = false;
+    with_state(this, |_, state| boundary = state.needs_memory_boundary());
+    if boundary {
+        cut(this, None);
+        with_state(this, |host, state| state.enter_builder(host));
+    }
+}
+
 extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     count_dispatch();
     #[cfg(windows)]
-    with_state(this, |list, s| s.dispatch(list, x, y, z, flags));
+    {
+        builder_boundary(this);
+        with_state(this, |list, s| s.dispatch(list, x, y, z, flags));
+    }
     #[cfg(not(windows))]
     let _ = (this, x, y, z, flags);
 }
@@ -1784,18 +1734,21 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        super::builder_boundary(this);
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
+        super::builder_boundary(this);
         with_state(this, |list, s| s.dispatch(list, x, y, z, 0));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
+        super::builder_boundary(this);
         if y * z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
@@ -1813,6 +1766,7 @@ mod state {
         _payload: u64,
     ) {
         super::count_draw();
+        super::builder_boundary(this);
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
@@ -1829,6 +1783,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        super::builder_boundary(this);
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
@@ -1895,6 +1850,8 @@ extern "system" fn execute_indirect(
 ) {
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
+        #[cfg(windows)]
+        with_state(this, |host, state| state.refuse_builder(host));
         return;
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
@@ -1907,6 +1864,7 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        builder_boundary(this);
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
@@ -1921,6 +1879,8 @@ extern "system" fn execute_indirect(
     if ran {
         return;
     }
+    #[cfg(windows)]
+    with_state(this, |host, state| state.refuse_builder(host));
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -2120,7 +2080,7 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
     // The list is cut here, and the wait stands before what follows.
     #[cfg(windows)]
     if crate::queue::cuts() {
-        cut(this, wait);
+        cut(this, Some(wait));
         return;
     }
     VALUE_WAITS

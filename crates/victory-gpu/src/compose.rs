@@ -13,11 +13,40 @@ use windows::core::{PCSTR, s};
 
 use crate::host::Host;
 
+#[derive(Clone, Copy)]
+pub(crate) struct Geometry {
+    pub(crate) source: Option<[i32; 4]>,
+    pub(crate) destination: [f32; 4],
+    pub(crate) color: u32,
+    pub(crate) serial: u64,
+}
+
+impl Default for Geometry {
+    fn default() -> Self {
+        Self {
+            source: None,
+            destination: [0., 0., 1., 1.],
+            color: 0,
+            serial: 0,
+        }
+    }
+}
+
+impl Geometry {
+    pub(crate) fn full(&self, desc: &D3D12_RESOURCE_DESC) -> bool {
+        self.source
+            .is_none_or(|r| r == [0, 0, desc.Width as i32, desc.Height as i32])
+            && self.destination == [0., 0., 1., 1.]
+            && self.color == 0
+    }
+}
+
 const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), RootConstants(num32BitConstants=24, b0), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
 Texture2D<float4> scene : register(t0);
 Texture2D<float4> over : register(t1);
 SamplerState smooth_ : register(s0);
+cbuffer Params : register(b0) { float4 crop[2]; float4 dest[2]; float4 settings[2]; };
 struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
 [RootSignature(RS)]
 V vs(uint id : SV_VertexID) {
@@ -28,8 +57,17 @@ V vs(uint id : SV_VertexID) {
 }
 [RootSignature(RS)]
 float4 ps(V v) : SV_Target {
-    float4 s = scene.SampleLevel(smooth_, v.uv, 0);
-    float4 o = over.SampleLevel(smooth_, v.uv, 0);
+    float4 samples[2];
+    [unroll] for (uint i = 0; i < 2; ++i) {
+        float2 uv = (v.uv - dest[i].xy) / max(dest[i].zw - dest[i].xy, 1.e-10);
+        float2 tex = clamp(lerp(crop[i].xy, crop[i].zw, uv),
+                           crop[i].xy + settings[i].xy, crop[i].zw - settings[i].xy);
+        float4 c = i == 0 ? scene.SampleLevel(smooth_, tex, 0) : over.SampleLevel(smooth_, tex, 0);
+        if (settings[i].z == 1) c.rgb = pow(max(c.rgb, 0), 1.0/2.2);
+        if (settings[i].z == 2) c.rgb = saturate((c.rgb * 255 - 16) / 219);
+        samples[i] = settings[i].w && all(uv >= 0) && all(uv < 1) ? c : 0;
+    }
+    float4 s = samples[0], o = samples[1];
     return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
 }
 "#;
@@ -47,6 +85,9 @@ pub(crate) struct Composer {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
     views: Vec<ID3D12DescriptorHeap>,
+    keys: Vec<[Option<(u64, i32)>; 2]>,
+    rtvs: Option<ID3D12DescriptorHeap>,
+    rtv_ready: Vec<bool>,
     step: u32,
 }
 // SAFETY: D3D12 objects are free-threaded.
@@ -119,6 +160,15 @@ impl Composer {
                 root,
                 pso,
                 views: Vec::new(),
+                keys: Vec::new(),
+                rtvs: device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                        NumDescriptors: super::host::BUFFERS,
+                        ..Default::default()
+                    })
+                    .ok(),
+                rtv_ready: vec![false; super::host::BUFFERS as usize],
                 step: device
                     .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
             })
@@ -134,6 +184,9 @@ impl Composer {
         slot: usize,
         list: &ID3D12GraphicsCommandList,
         planes: [(&ID3D12Resource, DXGI_FORMAT); 2],
+        geometry: [Geometry; 2],
+        overlay: bool,
+        back_index: usize,
         back: &ID3D12Resource,
         (width, height): (u32, u32),
     ) -> windows::core::Result<()> {
@@ -148,6 +201,7 @@ impl Composer {
                     })?
             };
             self.views.push(heap);
+            self.keys.push([None; 2]);
         }
         let views = &self.views[slot];
         // SAFETY: an open list; the views are made in slots no frame in flight
@@ -157,7 +211,29 @@ impl Composer {
                 views.GetCPUDescriptorHandleForHeapStart(),
                 views.GetGPUDescriptorHandleForHeapStart(),
             );
+            let mut constants = [[0f32; 4]; 6];
             for (i, plane) in planes.iter().enumerate() {
+                let g = geometry[i];
+                let d = plane.0.GetDesc();
+                let (w, h) = (d.Width as f32, d.Height as f32);
+                let src = g.source.unwrap_or([0, 0, d.Width as i32, d.Height as i32]);
+                constants[i] = [
+                    src[0] as f32 / w,
+                    src[1] as f32 / h,
+                    src[2] as f32 / w,
+                    src[3] as f32 / h,
+                ];
+                constants[i + 2] = g.destination;
+                constants[i + 4] = [
+                    0.5 / w,
+                    0.5 / h,
+                    g.color as f32,
+                    if i == 0 || overlay { 1.0 } else { 0.0 },
+                ];
+                if g.serial != 0 && self.keys[slot][i] == Some((g.serial, plane.1.0)) {
+                    continue;
+                }
+                self.keys[slot][i] = Some((g.serial, plane.1.0));
                 let at = D3D12_CPU_DESCRIPTOR_HANDLE {
                     ptr: cpu.ptr + (i * self.step as usize),
                 };
@@ -175,12 +251,27 @@ impl Composer {
                 host.device
                     .CreateShaderResourceView(Some(plane.0), Some(&desc), at);
             }
-            let rtv = host.rtv(Some(back), None);
+            let rtv = if let Some(heap) = &self.rtvs {
+                let mut at = heap.GetCPUDescriptorHandleForHeapStart();
+                at.ptr += back_index
+                    * host
+                        .device
+                        .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
+                        as usize;
+                if !self.rtv_ready[back_index] {
+                    host.device.CreateRenderTargetView(back, None, at);
+                    self.rtv_ready[back_index] = true;
+                }
+                at
+            } else {
+                host.rtv(Some(back), None)
+            };
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
             list.SetDescriptorHeaps(&[Some(views.clone())]);
             list.SetGraphicsRootSignature(&self.root);
             list.SetPipelineState(&self.pso);
             list.SetGraphicsRootDescriptorTable(0, gpu);
+            list.SetGraphicsRoot32BitConstants(1, 24, constants.as_ptr().cast(), 0);
             list.IASetPrimitiveTopology(
                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             );
@@ -303,6 +394,9 @@ mod tests {
                     0,
                     cmds,
                     [(&base, format), (&overlay, format)],
+                    Default::default(),
+                    true,
+                    0,
                     &output,
                     (3, 1),
                 )

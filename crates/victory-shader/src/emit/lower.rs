@@ -49,6 +49,7 @@ enum Val {
 }
 
 pub(crate) struct Lowered {
+    pub indexed_forms: u8,
     pub dxil: Vec<u8>,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
@@ -260,6 +261,7 @@ fn half_shift(width: u32) -> u32 {
 }
 
 struct Lower<'a> {
+    indexed_forms: u8,
     s: Shader,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
@@ -446,6 +448,24 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
         }
     }
     Some(all)
+}
+
+/// Every control-flow decision is uniform across both halves of a single
+/// guest wave. Scalar branches remain scalar; masked branches vote across
+/// all 64 lanes, including on backedges.
+pub(super) fn lockstep_branches(st: &Structured) -> bool {
+    st.exits.iter().enumerate().all(|(b, exit)| match *exit {
+        LaneExit::Jump(_) | LaneExit::End => true,
+        LaneExit::Indirect => false,
+        LaneExit::Branch { when, .. } => {
+            st.wide.contains(&b)
+                || st
+                    .bools
+                    .support(when)
+                    .iter()
+                    .all(|atom| matches!(atom, Atom::Uniform(_)))
+        }
+    })
 }
 
 /// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
@@ -1063,7 +1083,11 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
 /// a wait for the group with a shared-memory fence; the fence alone with
 /// `VICTORY_GROUP_SYNC=0` ([`super::group_sync`]).
 fn meeting_mode() -> u32 {
-    if super::group_sync() == 0 { 8 } else { 1 | 8 }
+    if !COOPERATIVE.get() && super::group_sync() == 0 {
+        8
+    } else {
+        1 | 8
+    }
 }
 
 /// LDS accesses of a console wave run as two host waves, where some sit in blocks that only
@@ -1442,8 +1466,20 @@ thread_local! {
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
     /// See [`with_local_waves`].
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// See [`with_local_waves_any`].
+    /// Whole-group software scheduling for independent logical wave PCs.
+    static EXACT_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static COOPERATIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Lower a logical wave program inside the uniform group scheduler.
+pub(super) fn with_cooperative<R>(on: bool, exact: bool, f: impl FnOnce() -> R) -> R {
+    let old = COOPERATIVE.replace(on);
+    let prior = EXACT_WAVES.replace(exact);
+    let r = f();
+    EXACT_WAVES.set(prior);
+    COOPERATIVE.set(old);
+    r
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1948,6 +1984,9 @@ impl<'a> Lower<'a> {
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
             }
+            if COOPERATIVE.get() {
+                s.lds_dwords += 1;
+            }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
@@ -2058,6 +2097,7 @@ impl<'a> Lower<'a> {
             },
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
+            indexed_forms: 0,
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
             descriptors: x
@@ -2774,19 +2814,22 @@ impl<'a> Lower<'a> {
             self.rpo[b] = n;
         }
         for (n, &b) in order.iter().enumerate() {
-            self.block[b] = Some(if n == 0 {
+            self.block[b] = Some(if n == 0 && !COOPERATIVE.get() {
                 self.s.entry
             } else {
                 self.s.m.new_block()
             });
         }
-        // Loop headers count iterations (`LOOP_LIMIT`).
+        // Exact logical waves leave a loop only at its guest exit. An
+        // explicitly requested debug iteration cap still applies.
+        let limit_loops =
+            !EXACT_WAVES.get() || std::env::var_os("VICTORY_SHADER_LOOP_LIMIT").is_some();
         for &b in &order {
             let header = p.blocks[b]
                 .preds
                 .iter()
                 .any(|&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q]);
-            if header {
+            if header && limit_loops {
                 let blk = self.block[b].expect("reachable");
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
@@ -2795,6 +2838,12 @@ impl<'a> Lower<'a> {
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
+        if COOPERATIVE.get() {
+            self.s.m.terminate(
+                self.s.entry,
+                Term::Br(self.block[order[0]].expect("reachable")),
+            );
+        }
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
@@ -2849,6 +2898,29 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if COOPERATIVE.get() && self.s.wave_size == Some(32) {
+            if self.s.entry != 0 || self.s.lds_dwords > 8192 {
+                return Err(unsupported(
+                    0,
+                    "insufficient shared memory for logical waves",
+                ));
+            }
+            let lds = self.s.lds();
+            let index = self.s.m.i32(self.s.lds_dwords - 1);
+            let flag = self.s.m.element(0, lds, index);
+            let flat = self.s.op(
+                0,
+                "flattenedThreadIdInGroup.i32",
+                Attr::ReadNone,
+                self.s.t.i32,
+                96,
+                &[],
+            );
+            self.s
+                .m
+                .schedule_waves(flat, flag)
+                .map_err(|why| unsupported(0, why))?;
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -2857,6 +2929,7 @@ impl<'a> Lower<'a> {
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         Ok(Lowered {
+            indexed_forms: self.indexed_forms,
             wave_size,
             cmp_samplers,
             root_cbvs,
@@ -4653,7 +4726,7 @@ impl<'a> Lower<'a> {
         let k = self.s.m.i32(slot);
         let ptr = self.s.m.element(e, lds, k);
         let zero = self.s.m.i32(0);
-        self.s.m.store(e, ptr, zero);
+        self.s.m.atomic(e, Rmw::Xchg, ptr, zero);
         self.group_sync(e);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
@@ -4737,7 +4810,8 @@ impl<'a> Lower<'a> {
         let index = self.s.m.bin(at, Bin::Add, pair, half);
         let lds = self.s.lds();
         let ptr = self.s.m.element(at, lds, index);
-        self.s.m.store(at, ptr, mine);
+        // All lanes of the half publish its same value to this exchange cell.
+        self.s.m.atomic(at, Rmw::Xchg, ptr, mine);
         self.group_sync(at);
         let one = self.s.m.i32(1);
         let k1 = self.s.m.bin(at, Bin::Add, pair, one);
@@ -5944,13 +6018,19 @@ impl<'a> Lower<'a> {
                     1 => !self.fence_only.contains(&b),
                     _ => true,
                 };
-                if !waits {
+                if !waits && !COOPERATIVE.get() {
                     mode &= !1;
                 }
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
-                self.s
+                let v = self
+                    .s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                if COOPERATIVE.get()
+                    && let V::Inst(i) = v
+                {
+                    self.s.m.guest_barriers.insert(i);
+                }
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
@@ -6806,14 +6886,19 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(Some(other));
             // (Renderer port 5: the twin of a constant buffer's slot is a
             // raw view of its bytes, read as one.)
-            let as_raw = super::shader::constants_raw() && super::shader::raw_views() != 0;
+            let as_raw = super::shader::mapped_views()
+                || super::shader::constants_raw() && super::shader::raw_views() != 0;
             let h = if as_raw {
                 self.handle(site, src, false, (11, 0))?
             } else {
                 self.handle(site, src, false, (13, 0x1_0000))?
             };
             let mut both = Vec::new();
-            let dwords = if as_raw { self.raw_dwords(h, addr, raw.len() as u32) } else { Vec::new() };
+            let dwords = if as_raw {
+                self.constant_dwords(src, h, addr, raw.len() as u32)?
+            } else {
+                Vec::new()
+            };
             for (k, &r) in raw.iter().enumerate() {
                 let b = self.cur;
                 let x = match dwords.get(k) {
@@ -6881,7 +6966,11 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(h) = self.constants_raw(site, src)? {
-            for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
+            for (k, x) in self
+                .constant_dwords(src, h, addr, count)?
+                .into_iter()
+                .enumerate()
+            {
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -7398,9 +7487,7 @@ impl<'a> Lower<'a> {
     /// Anything else (a descriptor built otherwise, or chosen between kinds of
     /// parameter) stays a constant buffer.
     fn constants_raw(&mut self, site: Site, src: &Source) -> Result<Option<V>, Why> {
-        if !super::shader::constants_raw() {
-            return Ok(None);
-        }
+        let mapped = super::shader::mapped_views();
         if let Source::Built { address, .. } = src {
             if self.root_copy.is_some() {
                 return Ok(None);
@@ -7414,7 +7501,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(None);
         }
-        if super::shader::raw_views() == 0 {
+        if !mapped && (!super::shader::constants_raw() || super::shader::raw_views() == 0) {
             return Ok(None);
         }
         let x = self.x;
@@ -7431,6 +7518,73 @@ impl<'a> Lower<'a> {
         }
         // (Raw, so `raw_twin` gives the twin's index.)
         Ok(Some(self.handle(site, src, false, (11, 0))?))
+    }
+
+    /// Exact dword reads through an indexed constant descriptor. Its raw
+    /// view can start before the guest interval and end after its last byte.
+    fn constant_dwords(&mut self, src: &Source, h: V, addr: V, count: u32) -> Result<Vec<V>, Why> {
+        if !matches!(src,Source::Built {..}) && !super::shader::mapped_views() {
+            return Ok(self.raw_dwords(h, addr, count));
+        }
+        let c = self.cur;
+        let [zero, three, four, bits, last] = [0, 3, 4, 31, !3u32].map(|n| self.s.m.i32(n));
+        let range = if let Source::Built { address, .. } = src {
+            let slot = self.x.native.layout[address.param].slot;
+            [super::shader::USER_VIEW_BIAS, super::shader::USER_CBV_BYTES]
+                .map(|kind| self.host_word(RootType::Other(kind), slot, 0))
+        } else {
+            let slot = match src {
+                Source::Phi { block, args } => self.descriptor_phi(*block, args, false, 8)?,
+                _ => self.lane_heap_index(src, false)?,
+            };
+            let index = self.s.m.bin(c, Bin::Shl, slot, three);
+            let bounds = self.s.m.i32(super::shader::VIEW_CONSTANT_BOUNDS);
+            let index = self.s.m.bin(c, Bin::Add, bounds, index);
+            let metadata = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
+            let range = self.raw_dwords(metadata, index, 2);
+            [range[0], range[1]]
+        };
+        let enough = self.s.m.cmp(c, pred::IUGE, range[1], four);
+        let end = self.s.m.bin(c, Bin::Sub, range[1], four);
+        let start = self.s.m.bin(c, Bin::Add, addr, range[0]);
+        let bytes = self.s.m.bin(c, Bin::And, start, three);
+        let shift = self.s.m.bin(c, Bin::Shl, bytes, three);
+        let aligned = self.s.m.cmp(c, pred::EQ, shift, zero);
+        let neg = self.s.m.bin(c, Bin::Sub, zero, shift);
+        let upper_shift = self.s.m.bin(c, Bin::And, neg, bits);
+        let base = self.s.m.bin(c, Bin::And, start, last);
+        // Root descriptors have no hardware bounds. Even the second word of
+        // an aligned load must stay inside its allocation before selection.
+        let total = self.s.m.bin(c, Bin::Add, range[0], range[1]);
+        let one = self.s.m.i32(1);
+        let top = self.s.m.bin(c, Bin::Sub, total, one);
+        let top = self.s.m.bin(c, Bin::And, top, last);
+        let limit = |l: &mut Self, byte| {
+            let inside = l.s.m.cmp(c, pred::IULE, byte, top);
+            l.s.m.select(c, inside, byte, zero)
+        };
+        let mut out = Vec::with_capacity(count as usize);
+        let first = limit(self, base);
+        let mut lo = self.raw_dwords(h, first, 1)[0];
+        for k in 0..count {
+            let offset = self.s.m.i32(4 * k);
+            let next = self.s.m.i32(4 * (k + 1));
+            let high_addr = self.s.m.bin(c, Bin::Add, base, next);
+            let high_addr = limit(self, high_addr);
+            let hi = self.raw_dwords(h, high_addr, 1)[0];
+            let a = self.s.m.bin(c, Bin::LShr, lo, shift);
+            let b = self.s.m.bin(c, Bin::Shl, hi, upper_shift);
+            let both = self.s.m.bin(c, Bin::Or, a, b);
+            let word = self.s.m.select(c, aligned, lo, both);
+            let byte = self.s.m.bin(c, Bin::Add, addr, offset);
+            let inside = self.s.m.cmp(c, pred::IULE, byte, end);
+            let nowrap = self.s.m.cmp(c, pred::IUGE, byte, addr);
+            let valid = self.s.m.bin(c, Bin::And, inside, nowrap);
+            let valid = self.s.m.bin(c, Bin::And, valid, enough);
+            out.push(self.s.m.select(c, valid, word, zero));
+            lo = hi;
+        }
+        Ok(out)
     }
 
     /// The dword at a computed byte address of a constant buffer.
@@ -7502,7 +7656,7 @@ impl<'a> Lower<'a> {
         let float = |l: &mut Self, f: V| l.as_int(f);
         let mut out = Vec::new();
         let mut at = 0;
-        for &w in bits {
+        for &w in bits.iter().take(channels as usize) {
             let word = words[(at / 32) as usize];
             let field = if w == 32 {
                 word
@@ -7872,6 +8026,26 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        if !sampler
+            && src.leaves().iter().any(|leaf| {
+                let (Source::Loaded { load, .. } | Source::Fetched { load, .. }) = leaf else {
+                    return false;
+                };
+                self.scalar
+                    .get(load)
+                    .and_then(|a| self.x.native.layout.get(a.param))
+                    .is_some_and(|p| p.root == RootType::ResourceHeap)
+            })
+        {
+            self.indexed_forms |= match props.0 & 0xff {
+                10..=12 if props.0 & 0x1000 != 0 => 4,
+                // A raw read may be the shader's constant-buffer path.
+                11 => 3,
+                10 | 12 => 2,
+                13 => 1,
+                _ => 8,
+            };
+        }
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props);
@@ -8348,7 +8522,8 @@ impl<'a> Lower<'a> {
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+        let slot = self.s.m.bin(c, Bin::LShr, at, shift);
+        self.physical_slot(a.param, slot, sampler)
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
@@ -8388,7 +8563,62 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+        let slot = self.s.m.bin(c, Bin::LShr, addr, shift);
+        self.physical_slot(a.param, slot, sampler)
+    }
+
+    /// The title sees a contiguous heap. Sparse title views and contiguous
+    /// list-owned tables occupy disjoint parts of a capped native heap.
+    fn physical_slot(&mut self, param: usize, slot: V, sampler: bool) -> Result<V, Why> {
+        use super::shader::{
+            FRESH_TABLE_SIZES, MAPPED_DYNAMIC, SLOT_STRIDES, VIEW_MAPPING, mapped_views,
+            view_heap_limit,
+        };
+        if sampler || !mapped_views() {
+            return Ok(slot);
+        }
+        let c = self.cur;
+        let h = self.s.root_srv_handle(SLOT_STRIDES);
+        let header = self.s.m.i32(VIEW_MAPPING);
+        let info = self.raw_dwords(h, header, 2);
+        let count = info[0];
+        let scratch = info[1];
+        let valid = self.s.m.cmp(c, pred::IULT, slot, count);
+        let zero = self.s.m.i32(0);
+        let checked = self.s.m.select(c, valid, slot, zero);
+        let two = self.s.m.i32(2);
+        let bytes = self.s.m.bin(c, Bin::Shl, checked, two);
+        let map = self.s.m.i32(VIEW_MAPPING + 8);
+        let address = self.s.m.bin(c, Bin::Add, map, bytes);
+        let mapped = self.raw_dwords(h, address, 1)[0];
+        let null = self.s.m.i32(view_heap_limit());
+        let title = self.s.m.select(c, valid, mapped, null);
+        if self.x.native.layout[param].root != RootType::Table {
+            return Ok(title);
+        }
+        // Only the originating root may designate the list-owned namespace.
+        // A computed index past the end of a title table cannot select it.
+        let Val::I32(root) = self.user(param, 0) else {
+            return Err("descriptor table without a root offset");
+        };
+        let five = self.s.m.i32(5);
+        let base = self.s.m.bin(c, Bin::LShr, root, five);
+        let fresh = self.s.m.cmp(c, pred::IUGE, base, count);
+        let relative = self.s.m.bin(c, Bin::Sub, slot, count);
+        let first = self.s.m.bin(c, Bin::Sub, base, count);
+        let cap = self.s.m.i32(MAPPED_DYNAMIC);
+        let admitted = self.s.m.cmp(c, pred::IULT, first, cap);
+        let first = self.s.m.select(c, admitted, first, zero);
+        let offset = self.s.m.bin(c, Bin::Shl, first, two);
+        let sizes = self.s.m.i32(FRESH_TABLE_SIZES);
+        let at = self.s.m.bin(c, Bin::Add, sizes, offset);
+        let len = self.raw_dwords(h, at, 1)[0];
+        let pos = self.s.m.bin(c, Bin::Sub, slot, base);
+        let inside = self.s.m.cmp(c, pred::IULT, pos, len);
+        let inside = self.s.m.bin(c, Bin::And, inside, admitted);
+        let physical = self.s.m.bin(c, Bin::Add, scratch, relative);
+        let fresh_slot = self.s.m.select(c, inside, physical, null);
+        Ok(self.s.m.select(c, fresh, fresh_slot, title))
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -9462,7 +9692,8 @@ impl<'a> Lower<'a> {
                 let me = self.console_lane();
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
-                int(self, r)
+                // WRITELANE names a lane independently of EXEC.
+                self.write_i(inst, r, None)
             }
             "v_readfirstlane_b32"
                 if inst
@@ -12397,7 +12628,7 @@ impl<'a> Lower<'a> {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
                 let x = match raw {
-                    Some(_) => self.raw_dwords(h, a, 1)[0],
+                    Some(_) => self.constant_dwords(src, h, a, 1)?[0],
                     None => self.cbuffer_dword(h, a),
                 };
                 self.write(inst, Reg::V(reg + k as u8), x, guard);

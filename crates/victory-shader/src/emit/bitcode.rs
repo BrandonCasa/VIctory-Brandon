@@ -8,6 +8,9 @@
 use std::collections::HashMap;
 
 pub mod census;
+pub mod census;
+mod cooperative;
+pub mod census;
 pub mod opt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -226,6 +229,7 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    pub(super) guest_barriers: std::collections::HashSet<u32>,
 }
 
 impl Module {

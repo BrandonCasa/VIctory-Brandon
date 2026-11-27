@@ -92,7 +92,7 @@ fn store() -> Option<&'static Store> {
             let folder = PathBuf::from(std::env::var_os("VICTORY_TEXTURE_STORE").filter(|v| !v.is_empty() && v != "0")?);
             std::fs::create_dir_all(&folder).ok()?;
             let mut index = HashMap::new();
-            if let Ok(text) = std::fs::read_to_string(folder.join("index.txt")) {
+            if let Ok(text) = std::fs::read_to_string(folder.join("index-v2.txt")) {
                 for (key, entry) in text.lines().filter_map(parse_line) {
                     // (A blob whose file is gone is no entry.)
                     index.insert(key, entry);
@@ -110,7 +110,7 @@ fn store() -> Option<&'static Store> {
                 .name("texture store".into())
                 .spawn(move || {
                     let Ok(mut index) =
-                        std::fs::OpenOptions::new().create(true).append(true).open(to.join("index.txt"))
+                        std::fs::OpenOptions::new().create(true).append(true).open(to.join("index-v2.txt"))
                     else {
                         return;
                     };
@@ -156,35 +156,76 @@ pub(crate) fn on() -> bool {
 /// The levels a key can be made from: those from which on the levels fill
 /// at least [`MIN_PREFIX`] bytes and are the start of the memory, with
 /// those bytes (`level`, bytes). Not level 0: that is the whole texture.
-pub(crate) fn key_levels(layout: &victory_formats::texture::Layout, mips: u32) -> Vec<(u32, u64)> {
-    if layout.slices != 1 {
-        return Vec::new();
+pub(crate) fn key_levels(
+    layout: &victory_formats::texture::Layout,
+    mips: u32,
+) -> impl Iterator<Item = (u32, u64)> + '_ {
+    layout.suffix_extents().filter(move |&(k, bytes)| {
+        k > 0
+            && k < mips
+            && k <= layout.first_tail_mip
+            && bytes >= MIN_PREFIX
+            && bytes < layout.size
+    })
+}
+
+fn layout_digest(layout: &victory_formats::texture::Layout, shape: Shape) -> blake3::Hasher {
+    let d = layout.desc;
+    let mut h = blake3::Hasher::new();
+    for n in shape.into_iter().chain([
+        d.dimension as u32,
+        d.width,
+        d.height,
+        d.depth,
+        d.mips,
+        d.element_bytes,
+        d.block,
+        d.samples,
+        d.swizzle.0,
+    ]) {
+        h.update(&n.to_le_bytes());
     }
-    (1..mips)
-        .filter(|&k| crate::resource::read_from(layout, k) == k)
-        .map(|k| (k, layout.bytes_from(k)))
-        .filter(|&(_, bytes)| bytes >= MIN_PREFIX && bytes < layout.size)
-        .collect()
+    h
+}
+
+fn qualified(mut h: blake3::Hasher, digest: u128) -> u128 {
+    h.update(&digest.to_le_bytes());
+    u128::from_le_bytes(h.finalize().as_bytes()[..16].try_into().unwrap())
 }
 
 /// A texture of `shape` was read whole: `tiled` is its memory (all levels),
 /// `parts` where the host lays out each of its levels (offset, row pitch,
 /// rows). Detiled and kept on the store's thread, unless that content is
 /// known.
-pub(crate) fn keep(shape: Shape, layout: &victory_formats::texture::Layout, tiled: &[u8], parts: Vec<(u64, u32, u32)>) {
+pub(crate) fn keep(
+    shape: Shape,
+    layout: &victory_formats::texture::Layout,
+    tiled: &[u8],
+    stable: Option<crate::texture::Digest>,
+    parts: Vec<(u64, u32, u32)>,
+) {
     let Some(store) = store() else {
         return;
     };
-    let blob = crate::texture::digest(tiled).0;
+    let snapshot = stable.is_none().then(|| tiled.to_vec());
+    let hash = stable.unwrap_or_else(|| crate::texture::digest(snapshot.as_deref().unwrap()));
+    let mut h = layout_digest(layout, shape);
+    for &(offset, pitch, rows) in &parts {
+        h.update(&offset.to_le_bytes());
+        h.update(&pitch.to_le_bytes());
+        h.update(&rows.to_le_bytes());
+    }
+    let blob = qualified(h, hash.0);
     if !store.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(blob) {
         return;
     }
-    let job = Job { shape, layout: layout.clone(), tiled: tiled.to_vec(), parts, blob };
+    let job = Job { whole:hash.0, shape, layout: layout.clone(), tiled: snapshot.unwrap_or_else(|| tiled.to_vec()), parts, blob };
     let _ = store.jobs.lock().unwrap_or_else(|e| e.into_inner()).send(job);
 }
 
 /// A texture to keep ([`keep`]).
 struct Job {
+    whole: u128,
     shape: Shape,
     layout: victory_formats::texture::Layout,
     tiled: Vec<u8>,
@@ -195,14 +236,31 @@ struct Job {
 /// [`keep`]'s work, on the store's thread: the levels detiled as the host
 /// lays them out, the keys, memory, and what goes to the folder.
 fn kept(store: &Store, job: Job) -> Option<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)>)> {
-    let Job { shape, layout, tiled, parts, blob } = job;
-    let keys = key_levels(&layout, shape[3]);
+    let Job {
+        whole,
+        shape,
+        layout,
+        tiled,
+        parts,
+        blob,
+    } = job;
+    let keys: Vec<_> = key_levels(&layout, shape[3]).collect();
     let &(top, _) = keys.iter().max_by_key(|(k, _)| *k)?;
     let end = parts.get(top as usize)?.0 as usize;
+    let mut prefixes = crate::texture::PrefixDigest::new();
+    let mut layout_key = layout_digest(&layout, shape);
+    layout_key.update(&whole.to_le_bytes());
     let made: Vec<Key> = keys
         .iter()
         .filter(|&&(_, bytes)| bytes as usize <= tiled.len())
-        .map(|&(level, bytes)| Key { shape, level, digest: crate::texture::digest(&tiled[..bytes as usize]).0 })
+        .map(|&(level, bytes)| Key {
+            shape,
+            level,
+            digest: qualified(
+                layout_key.clone(),
+                prefixes.prefix(&tiled[..bytes as usize]).0,
+            ),
+        })
         .collect();
     {
         let index = store.index.lock().unwrap_or_else(|e| e.into_inner());
@@ -236,10 +294,21 @@ fn kept(store: &Store, job: Job) -> Option<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)
 /// The larger levels of a texture of `shape` first viewed from `level`,
 /// whose memory from that level on holds `smaller`: levels `0..level` in
 /// the host's layout, if the store has them.
-pub(crate) fn find(shape: Shape, level: u32, smaller: &[u8]) -> Option<Arc<Vec<u8>>> {
+pub(crate) fn find(
+    layout: &victory_formats::texture::Layout,
+    shape: Shape,
+    level: u32,
+    tiled: &[u8],
+) -> Option<Arc<Vec<u8>>> {
     let store = store()?;
     STATS[2].fetch_add(1, Relaxed);
-    let key = Key { shape, level, digest: crate::texture::digest(smaller).0 };
+    if tiled.len() as u64 != layout.size {
+        return None;
+    }
+    let smaller = tiled.get(..usize::try_from(layout.bytes_from(level)).ok()?)?;
+    let mut identity = layout_digest(layout, shape);
+    identity.update(&crate::texture::digest(tiled).0.to_le_bytes());
+    let key = Key {shape,level,digest:qualified(identity,crate::texture::digest(smaller).0)};
     let entry = *store.index.lock().unwrap_or_else(|e| e.into_inner()).get(&key)?;
     if entry.levels != level {
         return None;

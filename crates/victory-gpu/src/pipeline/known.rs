@@ -42,7 +42,7 @@ const STAGES: [&str; 8] =
     ["vertex", "pixel", "domain", "hull", "geometry", "compute", "amplification", "mesh"];
 
 /// `VICTORY_PIPELINE_BOOK=1`: the pipelines the title creates are kept.
-fn on() -> bool {
+pub(super) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_BOOK").is_some_and(|v| v == "1"))
 }
@@ -65,7 +65,7 @@ static BOOK: OnceLock<Option<Recorder>> = OnceLock::new();
 
 fn book() -> Option<&'static Recorder> {
     BOOK.get_or_init(|| {
-        let dir = super::library::folder().filter(|_| on())?;
+        let dir = super::library::folder()?;
         std::fs::create_dir_all(&dir).ok()?;
         let mut keys = HashSet::new();
         let mut shaders = HashSet::new();
@@ -359,6 +359,33 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
 }
 
 #[allow(clippy::type_complexity)]
+pub(super) fn restored(key: &[u8; 16]) -> Option<(Vec<Arc<Shader>>, Option<Box<GraphicsState>>)> {
+    type Index = (HashMap<[u8; 16], Vec<u8>>, HashMap<[u8; 32], (u64, u32)>);
+    static INDEX: OnceLock<Index> = OnceLock::new();
+    let dir = super::library::folder()?;
+    let (entries, locations) = INDEX.get_or_init(|| {
+        let mut entries = HashMap::new();
+        let mut locations = HashMap::new();
+        walk_shaders(&dir, |_, hash, at, len| {
+            locations.insert(hash, (at, len));
+        });
+        walk_pipelines(&dir, |_, bytes| {
+            if let Some(id) = bytes.first_chunk::<16>() {
+                entries.insert(*id, bytes.to_vec());
+            }
+        });
+        (entries, locations)
+    });
+    let mut file = std::fs::File::open(dir.join(SHADERS)).ok()?;
+    parse(entries.get(key)?, &mut |hash| {
+        let &(at, len) = locations.get(hash)?;
+        let mut data = vec![0; len as usize];
+        file.seek(SeekFrom::Start(at)).ok()?;
+        file.read_exact(&mut data).ok()?;
+        (blake3::hash(&data).as_bytes() == hash).then_some(data)
+    })
+}
+
 fn parse(
     entry: &[u8],
     read: &mut impl FnMut(&[u8; 32]) -> Option<Vec<u8>>,
@@ -436,7 +463,7 @@ macro_rules! numbers {
 
 impl GraphicsState {
     /// The state as bytes.
-    fn put(&self, out: &mut Vec<u8>) {
+    pub(super) fn put(&self, out: &mut Vec<u8>) {
         out.push(u8::from(self.depth_bounds));
         for f in [self.rasterizer.DepthBiasClamp, self.rasterizer.SlopeScaledDepthBias] {
             out.extend(f.to_le_bytes());
@@ -477,7 +504,7 @@ impl GraphicsState {
         }
     }
 
-    fn get(bytes: &[u8]) -> Option<GraphicsState> {
+    pub(super) fn get(bytes: &[u8]) -> Option<GraphicsState> {
         let mut g = GraphicsState::default();
         let (&bounds, mut rest) = bytes.split_first()?;
         g.depth_bounds = bounds != 0;

@@ -96,6 +96,8 @@ pub(crate) struct Shadow {
     changes_only: std::sync::atomic::AtomicBool,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
+    /// Canonical allocation behind a byte-aligned read presentation.
+    source: Option<Arc<Shadow>>,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -1897,20 +1899,15 @@ mod wide_tests {
 /// in the piece, where to), the GPU's bytes are put in and `host` takes the
 /// result. The stretch's offset in the piece and its length if that changed
 /// title memory; none if nothing differs or title memory is not there.
-/// `runs` takes the runs of the stretch (offsets into `title`, lengths)
-/// whose bytes are the GPU's and differ from the title's as read: only
-/// those are to be written, so a title write that lands between the read
-/// and the write elsewhere in the stretch stays (upstream VIctory #2009).
-/// `mask` is scratch.
+/// Keep the original guest bytes. A mapped GPU-upload shadow also captures
+/// the merged interval in CPU memory so retries never reread it across PCIe.
 fn back_piece(
     host: &mut [u8],
     old: &[u8],
     title: &mut Vec<u8>,
-    mask: &mut Vec<u8>,
-    runs: &mut Vec<(usize, usize)>,
+    merged_copy: Option<&mut Vec<u8>>,
     read: impl FnOnce(usize, &mut [u8]) -> bool,
 ) -> Option<(usize, usize)> {
-    runs.clear();
     // From the first byte that differs to the last: title memory is read
     // and written there only (a shader that sets a few words of a piece
     // cost a read, a walk and a write of all 64 KiB of it).
@@ -1934,34 +1931,24 @@ fn back_piece(
     // data (one cleared a bit of a record the title had already replaced,
     // and copying it back broke the title's object: an access violation
     // through 0xffffffff00000000; PalmVIDev e0b70476, VIctory f39c6c2).
-    mask.clear();
-    mask.resize(n, 0);
-    let mut differs = 0u8;
-    for (((t, h), o), m) in title.iter_mut().zip(host.iter_mut()).zip(old).zip(mask.iter_mut()) {
-        let gpu = if (*h != *o) & (*t == *o) { 0xffu8 } else { 0 };
-        let merged = (*t & !gpu) | (*h & gpu);
-        *m = merged ^ *t;
-        differs |= *m;
-        *t = merged;
-        *h = merged;
-    }
-    if differs == 0 {
-        return None;
-    }
-    let mut i = 0;
-    while i < n {
-        while i < n && mask[i] == 0 {
-            i += 1;
+    let merge_byte = |h: &mut u8, t: u8, o: u8| {
+        let gpu = if (*h != o) & (t == o) { 0xff } else { 0 };
+        *h = (t & !gpu) | (*h & gpu);
+        *h ^ t
+    };
+    let mut differs = 0;
+    if let Some(out) = merged_copy {
+        out.resize(n, 0);
+        for (((h, &t), &o), dst) in host.iter_mut().zip(title.iter()).zip(old).zip(out) {
+            differs |= merge_byte(h, t, o);
+            *dst = *h;
         }
-        let start = i;
-        while i < n && mask[i] != 0 {
-            i += 1;
-        }
-        if i > start {
-            runs.push((start, i - start));
+    } else {
+        for ((h, &t), &o) in host.iter_mut().zip(title.iter()).zip(old) {
+            differs |= merge_byte(h, t, o);
         }
     }
-    Some((first, n))
+    (differs != 0).then_some((first, n))
 }
 
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
@@ -2393,32 +2380,49 @@ mod merge_tests {
         }
         let gpu = host.clone();
         let mut scratch = Vec::new();
-        let (mut mask, mut runs) = (Vec::new(), Vec::new());
+        let mut merged = Vec::new();
         let mut asked = None;
         let read = |first: usize, into: &mut [u8]| {
             asked = Some((first, into.len()));
             into.copy_from_slice(&title_memory[first..first + into.len()]);
             true
         };
-        assert_eq!(back_piece(&mut host, &old, &mut scratch, &mut mask, &mut runs, read), Some((5, 5)));
+        assert_eq!(
+            back_piece(&mut host, &old, &mut scratch, Some(&mut merged), read),
+            Some((5, 5))
+        );
         assert_eq!(asked, Some((5, 5)));
         let mut wanted = title_memory[5..10].to_vec();
         wanted[0] = gpu[5];
         wanted[4] = gpu[9];
-        assert_eq!(scratch, wanted);
+        assert_eq!(merged, wanted);
         assert_eq!(host[5..10], wanted);
         // Only the GPU's two bytes are written back (upstream #2009).
-        assert_eq!(runs, [(0, 1), (4, 1)]);
+        assert_eq!(scratch, title_memory[5..10]);
         // The copy outside the stretch is left as it was.
         assert!(host[..5] == gpu[..5] && host[10..] == gpu[10..]);
         assert!(scratch.capacity() < PIECE / 2, "scratch of {} bytes for a stretch of 5", scratch.capacity());
 
         // Nothing differs: title memory is not read.
         let mut same = old.clone();
-        assert_eq!(back_piece(&mut same, &old, &mut scratch, &mut mask, &mut runs, |_, _| unreachable!()), None);
+        assert_eq!(
+            back_piece(
+                &mut same,
+                &old,
+                &mut scratch,
+                Some(&mut merged),
+                |_, _| unreachable!()
+            ),
+            None
+        );
         // Title memory not there: nothing to write, the copy unchanged.
         let mut host = gpu.clone();
-        assert_eq!(back_piece(&mut host, &old, &mut scratch, &mut mask, &mut runs, |_, _| false), None);
+        assert_eq!(
+            back_piece(&mut host, &old, &mut scratch, Some(&mut merged), |_, _| {
+                false
+            }),
+            None
+        );
         assert!(host == gpu);
         // The GPU wrote what the title holds already: nothing to write.
         let mut title_memory = old.clone();
@@ -2429,10 +2433,22 @@ mod merge_tests {
             into.copy_from_slice(&title_memory[first..first + into.len()]);
             true
         };
-        assert_eq!(back_piece(&mut host, &old, &mut scratch, &mut mask, &mut runs, read), None);
+        assert_eq!(
+            back_piece(&mut host, &old, &mut scratch, Some(&mut merged), read),
+            None
+        );
         // A whole piece changed: the scratch grows to it.
         let mut host: Vec<u8> = old.iter().map(|b| !b).collect();
-        assert_eq!(back_piece(&mut host, &old, &mut scratch, &mut mask, &mut runs, |_, into| into.len() == PIECE), Some((0, PIECE)));
+        assert_eq!(
+            back_piece(
+                &mut host,
+                &old,
+                &mut scratch,
+                Some(&mut merged),
+                |_, into| into.len() == PIECE
+            ),
+            Some((0, PIECE))
+        );
         assert_eq!(scratch.len(), PIECE);
     }
 
@@ -2450,15 +2466,22 @@ mod merge_tests {
         let mut title_memory = old.clone();
         title_memory[3] = 44;
         title_memory[5] = 66; // the title alone
-        let (mut scratch, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut scratch, mut merged) = (Vec::new(), Vec::new());
         let read = |first: usize, into: &mut [u8]| {
             into.copy_from_slice(&title_memory[first..first + into.len()]);
             true
         };
-        assert_eq!(back_piece(&mut host, &old, &mut scratch, &mut mask, &mut runs, read), Some((1, 4)));
-        assert_eq!(scratch, [20, 3, 44, 50], "the title's byte where both changed");
+        assert_eq!(
+            back_piece(&mut host, &old, &mut scratch, Some(&mut merged), read),
+            Some((1, 4))
+        );
+        assert_eq!(
+            merged,
+            [20, 3, 44, 50],
+            "the title's byte where both changed"
+        );
         assert_eq!(host[1..5], [20, 3, 44, 50], "the copy takes the result");
-        assert_eq!(runs, [(0, 1), (3, 1)], "the GPU's bytes only");
+        assert_eq!(scratch, title_memory[1..5]);
     }
 
 
@@ -3180,6 +3203,29 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
+    pub(crate) fn is_read_presentation(&self) -> bool {
+        self.source.is_some()
+    }
+
+    pub(crate) fn ordered_source(&self) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(|s| s.written() || s.in_place())
+    }
+
+    /// Explicit SRV reads can follow a store to the canonical allocation
+    /// in this command list. Capture the read presentation at that point.
+    pub(crate) fn refresh_read(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if let Some(source) = &self.source
+            && (source.written() || source.in_place())
+            && !self.written()
+        {
+            list.copy_read_view(source, self, address, len);
+        } else {
+            self.refresh(list, address, len);
+        }
+    }
+
     /// The bytes of the host buffer.
     pub(crate) fn width(&self) -> u64 {
         // SAFETY: a live buffer.
@@ -3219,6 +3265,7 @@ impl Shadow {
             window: false,
             changes_only: Default::default(),
             mapped: false,
+            source: None,
             place: None,
         }
     }
@@ -3418,22 +3465,24 @@ impl Shadow {
             // Sized to each stretch read (`back_piece`): a zeroed 64 KiB per
             // range, most of whose ranges differ nowhere, was most of the
             // work for small ranges.
-            let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut title, mut merged) = (Vec::new(), Vec::new());
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
-                let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
+                let Some((first, n)) = back_piece(host, old, &mut title, self.mapped.then_some(&mut merged), read) else {
                     continue;
                 };
                 // Title memory as read, beside it with the card's bytes put
                 // in: only the dwords that differ are written.
-                let was: Vec<u8> = title.iter().zip(&mask).map(|(now, changed)| now ^ changed).collect();
-                if !runs.is_empty() {
-                    written += put_changed(start + at + first, &was[..n], &title[..n]);
-                }
+                let bytes = if self.mapped {
+                    &merged[..n]
+                } else {
+                    &host[first..first + n]
+                };
+                written += put_changed(start + at + first, &title[..n], bytes);
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
@@ -5639,10 +5688,89 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
 /// bytes), each with the asking that last took it; and the askings so far.
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+static EXACT: Mutex<(u64, BTreeMap<(u64, u64, u64), (Arc<Shadow>, u64)>)> =
+    Mutex::new((0, BTreeMap::new()));
 
 /// Since the last frame line: askings for such copies, and copies made.
 static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A union of read intervals. A single interval has no heap allocation.
+#[derive(Clone, Default)]
+pub(crate) struct ReadSpans {
+    first: (usize, usize),
+    rest: Vec<(usize, usize)>,
+}
+
+impl ReadSpans {
+    pub(crate) fn add(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        if self.first.0 == self.first.1 {
+            self.first = (from, to);
+            return;
+        }
+        const GAP: usize = 64 << 10;
+        let mut first = from;
+        let mut end = to;
+        let mut previous = self.first;
+        if self.rest.is_empty() {
+            if first <= previous.1.saturating_add(GAP) && previous.0 <= end.saturating_add(GAP) {
+                self.first = (first.min(previous.0), end.max(previous.1));
+            } else if first < previous.0 {
+                self.first = (first, end);
+                self.rest.push(previous);
+            } else {
+                self.rest.push((first, end));
+            }
+            return;
+        }
+        if end.saturating_add(GAP) < previous.0 {
+            self.first = (first, end);
+            (first, end) = previous;
+        } else if first <= previous.1.saturating_add(GAP) {
+            self.first = (previous.0.min(first), previous.1.max(end));
+            let n = self
+                .rest
+                .partition_point(|r| r.0 <= self.first.1.saturating_add(GAP));
+            if n > 0 {
+                self.first.1 = self.first.1.max(self.rest[n - 1].1);
+                self.rest.drain(..n);
+            }
+            return;
+        }
+        let at = self
+            .rest
+            .partition_point(|r| r.1.saturating_add(GAP) < first);
+        let after = self
+            .rest
+            .partition_point(|r| r.0 <= end.saturating_add(GAP));
+        if at < after {
+            previous = (first.min(self.rest[at].0), end.max(self.rest[after - 1].1));
+            self.rest.splice(at..after, [previous]);
+        } else {
+            self.rest.insert(at, (first, end));
+        }
+        if self.rest.len() > 15 {
+            self.first.1 = self.rest.last().unwrap().1;
+            self.rest.clear();
+        }
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        std::iter::once(self.first)
+            .filter(|(a, b)| a < b)
+            .chain(self.rest.iter().copied())
+    }
+
+    pub(crate) fn contains(&self, from: usize, to: usize) -> bool {
+        self.iter().any(|(a, b)| a <= from && to <= b)
+    }
+
+    pub(crate) fn hull(&self) -> (usize, usize) {
+        (self.first.0, self.rest.last().unwrap_or(&self.first).1)
+    }
+}
 
 /// A copy of the title memory `[address, address + len)` that starts at
 /// `address` itself: for a buffer view whose bytes do not start on an
@@ -5660,14 +5788,15 @@ static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// (start, bytes) for as long as a list or a slot holds it; of the others,
 /// those not asked for lately go once there are many (ring positions
 /// change every frame).
-pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+pub(crate) fn exact(source: &Arc<Shadow>, address: u64, len: u64) -> Option<Arc<Shadow>> {
     /// Copies kept before the idle ones are looked for, and the askings an
     /// idle one stays for.
     const MANY: usize = 256;
     const LATELY: u64 = 512;
-    /// The largest, and no view the title made on purpose: off its dwords.
-    const MOST: u64 = 64 << 20;
-    if len == 0 || len > MOST || !address.is_multiple_of(4) {
+    // The source is byte-addressable. Only the new host allocation needs
+    // CBV alignment. Reject impossible ranges before rounding its width.
+    let width = len.checked_next_multiple_of(256)?;
+    if address == 0 || len == 0 || address.checked_add(len).is_none() {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -5675,7 +5804,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let (tick, map) = &mut *guard;
     *tick += 1;
     let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+    if let Some((shadow, used)) = map.get_mut(&(source.id(), address, len)) {
         *used = now;
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(shadow.clone());
@@ -5687,12 +5816,14 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
             Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
         });
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    let (buffer, data) = host()?.shared_buffer(width)?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
+    let mut shadow = Shadow::new(buffer, data, gpu, address, len);
+    shadow.source = Some(source.clone());
+    let shadow = Arc::new(shadow);
+    map.insert((source.id(), address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)

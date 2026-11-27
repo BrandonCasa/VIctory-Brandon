@@ -1251,7 +1251,7 @@ struct Hosted {
 pub(crate) fn held_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_HELD_LEVELS").is_none_or(|v| v != "0") && !crate::tiles::wanted()
+        std::env::var_os("VICTORY_HELD_LEVELS").is_some_and(|v| v == "1") && !crate::tiles::wanted()
     })
 }
 
@@ -1274,6 +1274,15 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     }
     let first = first.min(layout.first_tail_mip).min(layout.mips.len() as u32 - 1);
     if layout.bytes_from(first) < layout.size { first } else { 0 }
+}
+
+#[cfg(windows)]
+fn fixed_texture_limit() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
+        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+    })
 }
 
 /// The share of the card's local VRAM budget in use, in percent (cached for
@@ -1403,15 +1412,20 @@ fn stored_levels(r: &Resource, first: u32) -> Option<(u32, std::sync::Arc<Vec<u8
         return None;
     }
     let level = read_from(layout, first);
-    let len = crate::texstore::key_levels(layout, u32::from(r.desc.mip_levels))
-        .into_iter()
-        .find(|&(k, _)| k == level)?
-        .1 as usize;
-    let mut smaller = vec![0u8; len];
-    if crate::host::read_there(r.data().cast_const(), &mut smaller) != len {
+    let len = layout.bytes_from(level);
+    if level == 0 || len < crate::texstore::MIN_PREFIX || len >= layout.size {
         return None;
     }
-    crate::texstore::find(r.desc.shape(), level, &smaller).map(|bytes| (level, bytes))
+    // A matching coarse mip alone cannot identify its finer neighbours.
+    let size = usize::try_from(layout.size).ok()?;
+    let _mapping = crate::watch::title_memory_reading();
+    let mut tiled = Vec::new();
+    tiled.try_reserve_exact(size).ok()?;
+    tiled.resize(size, 0);
+    if !crate::host::read_into(r.data().cast_const(), &mut tiled) {
+        return None;
+    }
+    crate::texstore::find(layout, r.desc.shape(), level, &tiled).map(|bytes| (level, bytes))
 }
 
 /// Since the start: host copies made with a first level other than the
@@ -1528,7 +1542,13 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     }
     // Under the table's lock: a texture leaves it before it is freed.
     let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let other = *targets.get(&(r.data() as u64))? as This;
+    let va = r.data() as u64;
+    let other = targets.get(&va).copied().or_else(|| {
+        let bytes = usize::try_from(footprint(&r.desc)?.size).ok()?;
+        crate::inplace::aliases(va as usize, bytes)
+            .into_iter()
+            .find_map(|alias| targets.get(&(alias as u64)).copied())
+    })? as This;
     let o = resource(other);
     const DEPTH: u32 = 0x2;
     let same = one(&o.desc)
@@ -1684,7 +1704,17 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let texture = match texture {
             Some(texture) => Some(texture),
-            None => host_texture(&r.desc.from_level(base), r.host.state, clear),
+            None => {
+                let mut d = r.desc.from_level(base);
+                if r.host.placed.load(Relaxed)
+                    && d.flags & 6 == 0
+                    && d.sample_count == 1
+                    && supports_placed_uav(d.format)
+                {
+                    d.flags |= 4;
+                }
+                host_texture(&d, r.host.state, clear)
+            }
         };
         let Some(texture) = texture else {
             r.host.refused.store(true, Relaxed);
@@ -1774,11 +1804,7 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
-    });
+    let limit = fixed_texture_limit();
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
@@ -2510,6 +2536,27 @@ pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
+fn supports_placed_uav(format: u32) -> bool {
+    use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::DXGI_FORMAT};
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(pc_format(format) as i32),
+        ..Default::default()
+    };
+    (unsafe {
+        host.device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+            .is_ok()
+    }) && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+}
+
+#[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
@@ -2702,7 +2749,13 @@ impl OnDemand {
         let Some(tiled) = &self.0.tiled else {
             return false;
         };
-        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, room(crate::host::host().and_then(|h| h.video_memory())));
+        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, || {
+            room(if fixed_texture_limit().is_some() {
+                None
+            } else {
+                crate::host::host().and_then(|h| h.video_memory())
+            })
+        });
         if changed {
             crate::descriptor::host::levels_changed(memory);
         }
@@ -3089,10 +3142,14 @@ pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Lay
         return None;
     }
     let t = texture_layout(&r.desc)?;
-    let [plane] = &t.planes[..] else {
+    if t.planes.len() != 1 {
         return None;
-    };
-    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
+    }
+    Some((
+        t.planes.into_iter().next()?.layout,
+        r.data() as usize,
+        t.size as usize,
+    ))
 }
 
 /// The bytes of title memory a texture with the resource description
@@ -3161,6 +3218,19 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
             if others.count() > 1 {
                 PLACED_TWINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+        }
+    }
+    // Different GPU VAs can name the very same physical subresources. Reuse
+    // an existing placed object for an equal layout while both views still
+    // cover those bytes. Never let a partial overlap stand for the whole view.
+    if let Some(bytes) = placed_bytes(desc).and_then(|n| usize::try_from(n).ok()) {
+        if let Some((_, resource)) = crate::inplace::aliases(address as usize, bytes)
+            .into_iter()
+            .chain(std::iter::once(address as usize))
+            .filter_map(|a| map.get(&(a as u64, *desc)).map(|&r| (a, r)))
+            .min()
+        {
+            return Some(resource as This);
         }
     }
     if let Some(&r) = map.get(&(address, *desc)) {

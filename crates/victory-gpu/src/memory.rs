@@ -94,8 +94,6 @@ const PACKED: u64 = 64 << 20;
 const YOUNG: u64 = 4;
 /// Free pages there are, at least, when a list is recorded.
 const SPARE: usize = 1024;
-/// A packed structure not named for so many frames is another one.
-const AGAIN: u64 = 8;
 /// From a root view; from one that is written (a structure being built).
 const VIEW: u64 = 256 << 10;
 const BUILT: u64 = 4 << 20;
@@ -136,6 +134,8 @@ struct Held {
 
 /// A packed structure the builder came to.
 struct Packed {
+    backing: Backing,
+    content: blake3::Hash,
     /// The frame it last did.
     frame: u64,
     len: u64,
@@ -143,7 +143,48 @@ struct Packed {
     header: u64,
 }
 
+type Backing = Vec<(usize, usize, usize, u64, u64)>;
+
+#[derive(Clone)]
+struct Structure {
+    size: u64,
+    generation: u64,
+    backing: Backing,
+    compacted: Option<u64>,
+    published: bool,
+    dependencies: Vec<(u64, u64)>,
+}
+
+struct PriorOutput {
+    at: u64,
+    previous: Option<Structure>,
+    backing: Backing,
+    bytes: u64,
+    // Owner buffers and offsets of the previous published GPU bytes.
+    pieces: Vec<(ID3D12Resource, u64, u64)>,
+    snapshot: Option<ID3D12Resource>,
+}
+
+type InstanceGraph = HashMap<u64, Vec<(u64, u64)>>;
+
+struct BuildVersion {
+    instances: Arc<InstanceGraph>,
+    generation: u64,
+    outputs: Vec<PriorOutput>,
+}
+
+struct DirectoryAlias {
+    owner: u64,
+    previous: [u32; 2],
+    backing: Backing,
+    owner_backing: Backing,
+}
+
 struct Memory {
+    directory_aliases: HashMap<u64, DirectoryAlias>,
+    gpu_pages: std::collections::HashSet<u64>,
+    versions: HashMap<u64, BuildVersion>,
+    structures: HashMap<u64, Structure>,
     /// The CPU's entries (number, offset), and the copy shaders read.
     directory: (*mut u32, Arc<Shadow>),
     faults: (ID3D12Resource, *mut u32, u64),
@@ -160,6 +201,7 @@ struct Memory {
     sweep: usize,
     /// Windows of title memory itself ([`Memory::map`]).
     windows: usize,
+    page_scratch: Vec<u8>,
     /// Packed structures the builder came to: the frame it last did.
     packed: HashMap<u64, Packed>,
     /// Their addresses in the order they came, and where the sweep is.
@@ -244,6 +286,11 @@ impl Memory {
             order: Vec::new(),
             sweep: 0,
             windows: 0,
+            page_scratch: vec![0; PAGE as usize],
+            directory_aliases: Default::default(),
+            gpu_pages: Default::default(),
+            versions: HashMap::new(),
+            structures: HashMap::new(),
             packed: HashMap::new(),
             packed_order: Vec::new(),
             packed_sweep: 0,
@@ -296,6 +343,311 @@ impl Memory {
         ours
     }
 
+    fn reserve_ranges(&mut self, ranges: &[[u64; 3]], instances: &InstanceGraph) -> bool {
+        use crate::bvh::{INSTANCE_POINTERS, INSTANCES, OUTPUT, SCRATCH};
+        let mut output = None;
+        for &[at, len, stamp] in ranges {
+            let kind = stamp & 255;
+            if kind == crate::bvh::REHYDRATE {
+                let source = len;
+                let Some(header) = crate::bvh::read(source) else {
+                    return false;
+                };
+                let Some((input, output)) = crate::bvh::rehydration_extents(&header, source == at)
+                else {
+                    return false;
+                };
+                let generation = stamp & !255;
+                if !self.reserve_ranges(
+                    &[
+                        [source, input, generation | crate::bvh::PACKED_INPUT],
+                        [at, output, generation | OUTPUT],
+                    ],
+                    instances,
+                ) {
+                    return false;
+                }
+                continue;
+            }
+            if kind == crate::bvh::COMPACT_COPY {
+                let source = len;
+                let Some(structure) = self.structures.get(&source) else {
+                    return false;
+                };
+                let Some(size) = structure.compacted else {
+                    return false;
+                };
+                if !self.published_range(source) || size == 0 || size > structure.size {
+                    return false;
+                }
+                let src_len = structure.size;
+                let deps = structure.dependencies.clone();
+                if let Some((base, owner_len)) = crate::shadow::in_buffer(at, 1)
+                    && size > owner_len.saturating_sub(at - base)
+                {
+                    return false;
+                }
+                if self.structures.iter().any(|(&base, s)| {
+                    base != at
+                        && base != source
+                        && base < at.saturating_add(size)
+                        && at < base.saturating_add(s.size)
+                        && s.published
+                        && crate::inplace::backing(base as usize, s.size as usize) == s.backing
+                }) {
+                    return false;
+                }
+                if !self.reserve(source, src_len, false) || !self.reserve(at, size, true) {
+                    return false;
+                }
+                let generation = stamp >> 8;
+                if self
+                    .structures
+                    .get(&at)
+                    .is_none_or(|s| s.generation != generation)
+                {
+                    self.structures.insert(
+                        at,
+                        Structure {
+                            size,
+                            generation,
+                            backing: crate::inplace::backing(at as usize, size as usize),
+                            compacted: None,
+                            published: false,
+                            dependencies: deps,
+                        },
+                    );
+                }
+                continue;
+            }
+            if kind == crate::bvh::INPUT
+                && self
+                    .structures
+                    .get(&at)
+                    .is_some_and(|s| !s.published && s.generation != stamp >> 8)
+            {
+                return false;
+            }
+            if !self.reserve(at, len, matches!(kind, OUTPUT | SCRATCH)) {
+                return false;
+            }
+            if kind == crate::bvh::PACKED_INPUT {
+                if !self.land(at, Some(len)) {
+                    return false;
+                }
+            } else if kind == OUTPUT {
+                output = Some(at);
+                let generation = stamp >> 8;
+                if self
+                    .structures
+                    .get(&at)
+                    .is_none_or(|s| s.generation != generation)
+                {
+                    let backing = crate::inplace::backing(at as usize, len as usize);
+                    self.structures.insert(
+                        at,
+                        Structure {
+                            size: len,
+                            backing,
+                            generation,
+                            published: false,
+                            dependencies: Vec::new(),
+                            compacted: None,
+                        },
+                    );
+                }
+            } else if matches!(kind, INSTANCES | INSTANCE_POINTERS) {
+                let mut dependencies = Vec::new();
+                let Some(records) = instances.get(&at) else {
+                    return false;
+                };
+                let mut visited = std::collections::HashSet::new();
+                for &(instance, blas) in records {
+                    if kind == INSTANCE_POINTERS && !self.reserve(instance, 64, false) {
+                        return false;
+                    }
+                    if !visited.insert(blas) {
+                        continue;
+                    }
+                    if blas == 0 {
+                        continue;
+                    }
+                    let canonical = self.structure_at(blas).unwrap_or(blas);
+                    let size = if let Some(s) = self.structures.get(&canonical) {
+                        if (!s.published && s.generation != stamp >> 8)
+                            || crate::inplace::backing(canonical as usize, s.size as usize)
+                                != s.backing
+                        {
+                            return false;
+                        }
+                        dependencies.push((canonical, s.generation));
+                        s.size
+                    } else {
+                        let Some(bytes) = crate::bvh::read(blas) else {
+                            return false;
+                        };
+                        let h = u64::from_le_bytes(bytes);
+                        if h as u16 != 6 {
+                            return false;
+                        }
+                        ((h >> 32) + 1) * 64
+                    };
+                    if !self.reserve(blas, size, false) {
+                        return false;
+                    }
+                }
+                dependencies.sort_unstable();
+                dependencies.dedup();
+                if let Some(s) = output.and_then(|at| self.structures.get_mut(&at)) {
+                    s.dependencies = dependencies;
+                }
+            }
+        }
+        true
+    }
+
+    fn invalidate_directory(&self, page: u64) {
+        let off = (page * 8) as usize;
+        crate::watch::wrote(self.entry(page) as usize, 8);
+        self.directory.1.resend(off, off + 8);
+    }
+
+    fn reconcile_aliases(&mut self) {
+        let stale: Vec<_> = self
+            .directory_aliases
+            .iter()
+            .filter_map(|(&p, a)| {
+                (crate::inplace::backing((p * PAGE) as usize, PAGE as usize) != a.backing
+                    || crate::inplace::backing((a.owner * PAGE) as usize, PAGE as usize)
+                        != a.owner_backing
+                    || self.copy_of(a.owner).is_none())
+                .then_some(p)
+            })
+            .collect();
+        for page in stale {
+            let alias = self.directory_aliases.remove(&page).unwrap();
+            unsafe {
+                self.entry(page).cast::<[u32; 2]>().write(alias.previous);
+            }
+            self.invalidate_directory(page);
+        }
+    }
+
+    fn structure_at(&mut self, address: u64) -> Option<u64> {
+        if self.structures.contains_key(&address) {
+            return Some(address);
+        }
+        for other in crate::inplace::aliases(address as usize, 1) {
+            let Some(s) = self.structures.get(&(other as u64)) else {
+                continue;
+            };
+            if other % PAGE as usize != address as usize % PAGE as usize
+                || !crate::inplace::aliases(address as usize, s.size as usize).contains(&other)
+            {
+                continue;
+            }
+            let pages = address / PAGE..address.checked_add(s.size)?.div_ceil(PAGE);
+            if !pages
+                .clone()
+                .enumerate()
+                .all(|(i, _)| self.copy_of(other as u64 / PAGE + i as u64).is_some())
+            {
+                continue;
+            }
+            for (i, page) in pages.enumerate() {
+                let owner = other as u64 / PAGE + i as u64;
+                let value = unsafe { self.entry(owner).cast::<[u32; 2]>().read() };
+                let ptr = self.entry(page).cast::<[u32; 2]>();
+                self.directory_aliases
+                    .entry(page)
+                    .or_insert_with(|| DirectoryAlias {
+                        owner,
+                        previous: unsafe { ptr.read() },
+                        backing: crate::inplace::backing((page * PAGE) as usize, PAGE as usize),
+                        owner_backing: crate::inplace::backing(
+                            (owner * PAGE) as usize,
+                            PAGE as usize,
+                        ),
+                    });
+                unsafe {
+                    ptr.write(value);
+                }
+                self.invalidate_directory(page);
+            }
+            return Some(other as u64);
+        }
+        None
+    }
+
+    fn published_range(&self, at: u64) -> bool {
+        let Some(s) = self.structures.get(&at) else {
+            return true;
+        };
+        s.published
+            && crate::inplace::backing(at as usize, s.size as usize) == s.backing
+            && s.dependencies.iter().all(|&(base, generation)| {
+                self.structures.get(&base).is_some_and(|child| {
+                    child.generation == generation
+                        && child.published
+                        && child.backing
+                            == crate::inplace::backing(base as usize, child.size as usize)
+                })
+            })
+    }
+
+    fn reserve(&mut self, at: u64, len: u64, writable: bool) -> bool {
+        let Some(end) = at
+            .checked_add(len)
+            .filter(|&end| end <= (u64::from(MEMORY_PAGES) - 1) * PAGE)
+        else {
+            return false;
+        };
+        if at < 1 << 32 || len == 0 {
+            return false;
+        }
+        let pages = at / PAGE..end.div_ceil(PAGE);
+        if !crate::texture::committed_by_query(at as *const u8, len as usize)
+            || !pages.clone().all(|page| self.map_page(page, true))
+        {
+            return false;
+        }
+        // Declared inputs may be filled more than once in the same frame.
+        for page in pages.clone() {
+            if let Some(held) = self.pages.get_mut(&page) {
+                held.looked = u64::MAX;
+            }
+        }
+        self.bring(pages.start, pages.end);
+        if writable {
+            for page in pages {
+                self.opens(page * PAGE);
+            }
+        }
+        true
+    }
+
+    fn descriptors(&mut self, heap: &HostHeap) -> Option<u32> {
+        let key = std::ptr::from_ref(heap) as usize;
+        let (base, made) = match self.heaps.get(&key) {
+            Some(&run) => run,
+            None => {
+                // Held for the heap's life: not given back with a list's slots.
+                let base = heap.dynamic(COPIES + 1)?;
+                // Every slot of the run: a number shows no view of another kind.
+                for n in 0..=COPIES {
+                    heap.null_raw_uav_at(base + n);
+                }
+                (base, 0)
+            }
+        };
+        for (n, shadow) in self.copies.iter().enumerate().skip(made as usize) {
+            let (_, len) = shadow.span();
+            heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        }
+        self.heaps.insert(key, (base, self.copies.len() as u32));
+        Some(base)
+    }
+
     /// Gives a copy a number, if one is left.
     fn number(&mut self, shadow: Arc<Shadow>) -> Option<usize> {
         let key = Arc::as_ptr(&shadow) as usize;
@@ -321,10 +673,14 @@ impl Memory {
     /// Gives `page` a place, if it has none and the memory is the title's;
     /// whether it has one then.
     fn map(&mut self, page: u64) -> bool {
+        self.map_page(page, false)
+    }
+
+    fn map_page(&mut self, page: u64, declared: bool) -> bool {
         if self.copy_of(page).is_some() {
             return true;
         }
-        if !self.possible(page) {
+        if !declared && !self.possible(page) {
             return false;
         }
         let start = page * PAGE;
@@ -346,14 +702,14 @@ impl Memory {
                     let entry = self.entry(at / PAGE);
                     // SAFETY: an entry of the directory.
                     if unsafe { entry.read() } == 0 {
-                        close(entry, n, at - first);
+                        close(entry, n, shadow.offset(at));
                     }
                     at += PAGE;
                 }
             }
             // SAFETY: as above.
             if unsafe { self.entry(page).read() } == 0 {
-                close(self.entry(page), n, start - shadow.span().0);
+                close(self.entry(page), n, shadow.offset(start));
             }
             return true;
         }
@@ -421,6 +777,7 @@ impl Memory {
                 self.pages.remove(&page);
                 // SAFETY: an entry of the directory, under the mutex.
                 unsafe { self.entry(page).write_volatile(0) };
+                self.invalidate_directory(page);
             }
         }
         self.stats.gone += 1;
@@ -466,6 +823,7 @@ impl Memory {
     /// A dispatch of the builder was given `address` to write: if it is in a
     /// title buffer's copy, stores by address reach that from here on.
     fn opens(&mut self, address: u64) {
+        self.gpu_pages.insert(address/PAGE);
         let Some(n) = self.map(address / PAGE).then(|| self.copy_of(address / PAGE)).flatten() else {
             return;
         };
@@ -482,7 +840,7 @@ impl Memory {
         );
         for page in first.div_ceil(PAGE)..(first + len) / PAGE {
             if self.copy_of(page) == Some(n) {
-                fill(self.entry(page), n, page * PAGE - first);
+                fill(self.entry(page), n, self.copies[n].offset(page*PAGE));
             }
         }
     }
@@ -529,14 +887,39 @@ impl Memory {
             let never = std::mem::replace(&mut held.taken, now.max(1)) == 0;
             let shadow = &self.copies[held.copy];
             let base = held.at - shadow.span().0 as usize;
-            let mut title = [0u8; PIECE];
+            if never && !crate::host::skip_memory_copy() {
+                crate::host::copy_mapped(
+                    held.at as *mut u8,
+                    (page * PAGE) as *const u8,
+                    PAGE as usize,
+                    false,
+                );
+                self.stats.changed += PAGE;
+                shadow.resend(base, base + PAGE as usize);
+                continue;
+            }
+            let bulk = !crate::safecopy::on() && !crate::host::skip_memory_copy();
+            if bulk {
+                crate::host::copy_mapped(
+                    self.page_scratch.as_mut_ptr(),
+                    (page * PAGE) as *const u8,
+                    PAGE as usize,
+                    false,
+                );
+            }
+            let mut local = [0u8; PIECE];
             for piece in (0..PAGE as usize).step_by(PIECE) {
                 let from = (page * PAGE) as usize + piece;
                 // (Pages that are not there read as zeros.)
-                crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, PIECE, false);
+                let title: &[u8; PIECE] = if bulk {
+                    self.page_scratch[piece..piece + PIECE].try_into().unwrap()
+                } else {
+                    crate::host::copy_mapped(local.as_mut_ptr(), from as *const u8, PIECE, false);
+                    &local
+                };
                 // SAFETY: a page of an arena of ours, under the mutex.
                 let ours = unsafe { std::slice::from_raw_parts_mut((held.at + piece) as *mut u8, PIECE) };
-                self.stats.changed += merge(&title, ours, never) as u64 * 4;
+                self.stats.changed += merge(title, ours, never) as u64 * 4;
             }
             if never {
                 shadow.resend(base, base + PAGE as usize);
@@ -562,71 +945,137 @@ impl Memory {
     /// there now goes up. When the dispatch is recorded it may not be there
     /// yet: the title's queue waits for its streaming. (Nothing is asked of
     /// the write watch here: the submission's asking stands.)
-    fn land(&mut self, address: u64) {
+    fn land(&mut self, address: u64, declared: Option<u64>) -> bool {
         let page = address / PAGE;
         if !crate::texture::committed((page * PAGE) as *const u8, PAGE as usize) {
-            return;
+            return false;
         }
-        let Some((len, header)) = self.packed_at(address) else {
+        let packed = match declared {
+            Some(len) => {
+                crate::bvh::read::<8>(address).map(|bytes| (len, u64::from_le_bytes(bytes)))
+            }
+            None => self.packed_at(address),
+        };
+        let Some((len, header)) = packed else {
+            if declared.is_some() {
+                return false;
+            }
             // Anything else: what came since its page was first taken.
             for page in page..=(address + VIEW - 1) / PAGE {
                 if self.pages.get(&page).is_some_and(|h| h.born + YOUNG >= self.frame) {
                     self.take(page, 0, PAGE as usize, false);
                 }
             }
-            return;
+            return true;
         };
+        // Capture once. The hash, comparison and GPU upload all refer to
+        // these bytes, even if a producer subsequently writes the same VA.
+        let backing = crate::inplace::backing(address as usize, len as usize);
+        let Ok(length) = usize::try_from(len) else {
+            return false;
+        };
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(length).is_err() {
+            return false;
+        }
+        bytes.resize(length, 0);
+        if !crate::host::read_into(address as *const u8, &mut bytes)
+            || bytes.get(..8) != Some(header.to_le_bytes().as_slice())
+            || crate::inplace::backing(address as usize, len as usize) != backing
+        {
+            crate::host::refuse_frame(format_args!(
+                "packed BVH changed backing during landing at {address:#x}"
+            ));
+            return false;
+        }
+        let content = blake3::hash(&bytes);
         if let Some(known) = self.packed.get_mut(&address) {
-            let soon = known.frame + AGAIN >= self.frame;
             known.frame = self.frame;
-            if known.header == header && soon {
-                return;
+            if known.content == content && known.backing == backing {
+                return true;
             }
-            if known.header != header {
+            // A replacement of the same extent uses the same set of pages.
+            // This submission has already retired earlier GPU readers.
+            if known.len == len {
+                known.content = content;
+                known.backing.clone_from(&backing);
+                known.header = header;
+            } else {
                 self.gone(address);
             }
         }
         let last = (address + len - 1) / PAGE;
         if !self.packed.contains_key(&address) {
-            self.packed.insert(address, Packed { frame: self.frame, len, header });
-            self.packed_order.push(address);
-            for page in page..=last {
-                let new = self.copy_of(page).is_none();
-                if new && !self.place(page) {
-                    continue;
-                }
-                if let Some(held) = self.pages.get_mut(&page) {
+            // Reserve the complete range before publishing any ownership. A partial
+            // directory must never be recorded as a successful landing.
+            let missing: Vec<_> = (page..=last)
+                .filter(|&p| self.copy_of(p).is_none())
+                .collect();
+            if missing.len() > self.free.len()
+                || missing.iter().any(|&p| {
+                    p < 0x1_0000
+                        || p >= u64::from(MEMORY_PAGES) - 1
+                        || !crate::texture::committed((p * PAGE) as *const u8, PAGE as usize)
+                        || crate::shadow::in_buffer(p * PAGE, PAGE).is_some()
+                })
+            {
+                crate::host::refuse_frame(format_args!(
+                    "no complete page reservation for packed BVH at {address:#x} ({len} bytes)"
+                ));
+                return false;
+            }
+            for p in missing {
+                let (copy, at) = self.free.pop().expect("reserved packed page");
+                self.hold(p, at, copy);
+                self.pages.get_mut(&p).unwrap().theirs = true;
+                crate::watch::wrote(self.entry(p) as usize, 8);
+                self.take(p, 0, PAGE as usize, true);
+            }
+            for p in page..=last {
+                if let Some(held) = self.pages.get_mut(&p) {
                     held.owners += 1;
-                    held.theirs |= new;
                 }
             }
+            self.packed.insert(
+                address,
+                Packed {
+                    frame: self.frame,
+                    len,
+                    header,
+                    backing,
+                    content,
+                },
+            );
+            self.packed_order.push(address);
             self.stats.packed_bytes += len;
         }
         for page in page..=last {
             let from = address.max(page * PAGE) - page * PAGE;
             let to = (address + len).min((page + 1) * PAGE) - page * PAGE;
-            self.take(page, from as usize, to as usize, true);
+            if let Some(held) = self.pages.get(&page) {
+                let src = (page * PAGE + from - address) as usize;
+                let n = (to - from) as usize;
+                let dst = held.at + from as usize;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr().add(src), dst as *mut u8, n)
+                };
+                crate::watch::wrote(dst, n);
+                let shadow = &self.copies[held.copy];
+                let off = dst - shadow.span().0 as usize;
+                shadow.resend(off, off + n);
+            } else if let Some(n) = self.copy_of(page) {
+                // Buffer-backed entries refresh directly from title memory. An
+                // identical CPU value can still replace a GPU-produced value.
+                let shadow = &self.copies[n];
+                let Some(off) = shadow.offset_in(page * PAGE + from) else {
+                    return false;
+                };
+                shadow.resend(off as usize, (off + to - from) as usize);
+            } else {
+                return false;
+            }
         }
         self.stats.packed += 1;
-    }
-
-    /// A place in an arena for a page of committed title memory, at a
-    /// submission: only one there is already (the list brings up the arenas
-    /// it knew when it was recorded).
-    fn place(&mut self, page: u64) -> bool {
-        if page < 0x1_0000
-            || page >= u64::from(MEMORY_PAGES) - 1
-            || !crate::texture::committed((page * PAGE) as *const u8, PAGE as usize)
-            || crate::shadow::in_buffer(page * PAGE, PAGE).is_some()
-        {
-            return false;
-        }
-        let Some((copy, at)) = self.free.pop() else {
-            return false;
-        };
-        self.hold(page, at, copy);
-        crate::watch::wrote(self.entry(page) as usize, 8);
-        self.take(page, 0, PAGE as usize, true);
         true
     }
 
@@ -637,11 +1086,31 @@ impl Memory {
         let Some(held) = self.pages.get(&page) else { return };
         let shadow = &self.copies[held.copy];
         let base = held.at - shadow.span().0 as usize;
-        let mut title = [0u8; PIECE];
+        let bulk =
+            to - from >= PIECE * 2 && !crate::safecopy::on() && !crate::host::skip_memory_copy();
+        if bulk {
+            crate::host::copy_mapped(
+                self.page_scratch.as_mut_ptr(),
+                (page as usize * PAGE as usize + from) as *const u8,
+                to - from,
+                false,
+            );
+        }
+        let mut local = [0u8; PIECE];
         let mut at = from;
         while at < to {
             let n = (PIECE - at % PIECE).min(to - at);
-            crate::host::copy_mapped(title.as_mut_ptr(), (page as usize * PAGE as usize + at) as *const u8, n, false);
+            let title = if bulk {
+                &self.page_scratch[at - from..at - from + n]
+            } else {
+                crate::host::copy_mapped(
+                    local.as_mut_ptr(),
+                    (page as usize * PAGE as usize + at) as *const u8,
+                    n,
+                    false,
+                );
+                &local[..n]
+            };
             // SAFETY: a page of an arena of ours, under the mutex.
             let ours = unsafe { std::slice::from_raw_parts_mut((held.at + at) as *mut u8, n) };
             if *ours != title[..n] {
@@ -715,9 +1184,17 @@ impl Memory {
         let words = unsafe { std::slice::from_raw_parts(from as *const u64, len / 8) };
         let mut seen = std::collections::HashSet::new();
         for &word in words {
-            if word & 0xFF == 0 && (1 << 32..1 << 37).contains(&word) && seen.insert(word / PAGE) && self.map(word / PAGE) {
+            if word & 0xFF == 0
+                && (1 << 32..1 << 37).contains(&word)
+                && seen.insert(word)
+                && self.map(word / PAGE)
+            {
                 let page = word / PAGE;
-                self.bring(page, page + 1);
+                if let Some((len, _)) = self.packed_at(word) {
+                    self.ready(word, len);
+                } else {
+                    self.bring(page, page + 1);
+                }
             }
         }
     }
@@ -744,12 +1221,7 @@ impl Memory {
     /// Every copy is brought up to date when `list` is submitted, after what
     /// it deferred so far (once until a copy of the title's intervenes).
     fn bring_up(&self, list: &HostList) {
-        let (start, len) = self.directory.1.span();
-        self.directory.1.refresh(list, start, len);
-        for shadow in &self.copies {
-            let (start, len) = shadow.span();
-            shadow.refresh(list, start, len);
-        }
+        list.defer_numbered(&self.directory.1, &self.copies);
     }
 
     /// Every ten seconds or so, what was used.
@@ -828,6 +1300,364 @@ fn asks_size(written: &[u64], constants: &[u32], threads: Option<[u32; 3]>) -> b
         && written.first().is_some_and(|&at| crate::shadow::in_buffer(at, 1).is_some_and(|b| b.1 <= BACK))
 }
 
+/// Read logical GPU addresses after preceding producers. The upload-side
+/// baseline distinguishes an intervening CPU replacement from bytes written
+/// only on the GPU. All GPU reads in one batch share a single fence.
+fn discover_words(addresses: &[u64]) -> Option<Vec<u64>> {
+    if addresses.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut values = Vec::with_capacity(addresses.len());
+    let mut pieces = Vec::new();
+    {
+        let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        for (index, &at) in addresses.iter().enumerate() {
+            if at % 8 != 0 {
+                return None;
+            }
+            let cpu = crate::bvh::read::<8>(at);
+            let mut mask = [false; 2];
+            if let Some(m) = guard.as_ref()
+                && m.gpu_pages.contains(&(at / PAGE))
+                && let Some(n) = m.copy_of(at / PAGE)
+            {
+                let offset = u64::from(unsafe { m.entry(at / PAGE).add(1).read() }) + at % PAGE;
+                let shadow = m.copies.get(n)?;
+                // CPU bytes are authoritative for a native mapped resource.
+                // The private arena, in contrast, keeps the uploaded title
+                // dwords independently from its shader-visible GPU bytes.
+                if let Some(held) = m.pages.get(&(at / PAGE)) {
+                    let last = crate::bvh::read::<8>((held.at as u64) + at % PAGE)?;
+                    for i in 0..2 {
+                        mask[i] = cpu.is_none_or(|b| b[i * 4..i * 4 + 4] == last[i * 4..i * 4 + 4]);
+                    }
+                } else if shadow.carded() {
+                    let baseline = unsafe { shadow.card_data().add(offset as usize) };
+                    let mut last = [0u8; 8];
+                    if !crate::host::read_into(baseline, &mut last) {
+                        return None;
+                    }
+                    for i in 0..2 {
+                        mask[i] = cpu.is_none_or(|b| b[i * 4..i * 4 + 4] == last[i * 4..i * 4 + 4]);
+                    }
+                }
+                if mask.contains(&true) {
+                    pieces.push((index, shadow.buffer.clone(), offset, mask));
+                }
+            }
+            if cpu.is_none() && mask != [true, true] {
+                return None;
+            }
+            values.push(cpu.unwrap_or_default());
+        }
+    }
+    if !pieces.is_empty() {
+        let host = host()?;
+        let back = host.read_back_buffer((pieces.len() * 8) as u64)?;
+        let transfers: Vec<_> = pieces
+            .iter()
+            .enumerate()
+            .map(|(i, (_, src, offset, _))| (back.clone(), (i * 8) as u64, src.clone(), *offset, 8))
+            .collect();
+        host.copy_preserved_buffers(&transfers)?;
+        let mut data = std::ptr::null_mut();
+        unsafe {
+            back.Map(0, None, Some(&mut data)).ok()?;
+            if data.is_null() {
+                back.Unmap(0, None);
+                return None;
+            }
+            for (i, (index, _, _, mask)) in pieces.iter().enumerate() {
+                let bytes = data.cast::<[u8; 8]>().add(i).read_unaligned();
+                for d in 0..2 {
+                    if mask[d] {
+                        values[*index][d * 4..d * 4 + 4].copy_from_slice(&bytes[d * 4..d * 4 + 4]);
+                    }
+                }
+            }
+            back.Unmap(0, None);
+        }
+    }
+    Some(values.into_iter().map(u64::from_le_bytes).collect())
+}
+
+fn discover_instances(ranges: &[[u64; 3]]) -> Option<InstanceGraph> {
+    let mut graph = InstanceGraph::new();
+    for &[at, len, tag] in ranges {
+        let kind = tag & 255;
+        if !matches!(kind, crate::bvh::INSTANCES | crate::bvh::INSTANCE_POINTERS) {
+            continue;
+        }
+        let indirect = kind == crate::bvh::INSTANCE_POINTERS;
+        let step = if indirect { 8 } else { 64 };
+        let count = len / step;
+        let records = graph.entry(at).or_default();
+        for start in (0..count).step_by(2048) {
+            let mut addresses = (start..count.min(start + 2048))
+                .map(|i| at.checked_add(i * step))
+                .collect::<Option<Vec<_>>>()?;
+            if indirect {
+                addresses = discover_words(&addresses)?;
+            }
+            let fields = addresses
+                .iter()
+                .map(|at| at.checked_add(56))
+                .collect::<Option<Vec<_>>>()?;
+            records.extend(addresses.into_iter().zip(discover_words(&fields)?));
+        }
+    }
+    Some(graph)
+}
+
+/// A recording can be submitted repeatedly. Assign its output generation
+/// here, on the ordered queue, and preserve the preceding published bytes
+/// before any stage of an in-place refit can write them.
+pub(crate) fn begin_build(ranges: &[[u64; 3]]) -> Option<()> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let key = ranges.first()?[2] >> 8;
+    let generation = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let host = host()?;
+    let instances = Arc::new(discover_instances(ranges)?);
+    let mut outputs = Vec::new();
+    let mut copies = Vec::new();
+    {
+        let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Memory::new();
+        }
+        let m = guard.as_mut()?;
+        m.reconcile_aliases();
+        if m.versions.contains_key(&key) {
+            return None;
+        }
+        for &[at, _, kind] in ranges {
+            if !matches!(
+                kind & 255,
+                crate::bvh::OUTPUT | crate::bvh::REHYDRATE | crate::bvh::COMPACT_COPY
+            ) || outputs.iter().any(|p: &PriorOutput| p.at == at)
+            {
+                continue;
+            }
+            let previous = m
+                .structures
+                .get(&at)
+                .filter(|s| s.published && m.published_range(at))
+                .cloned();
+            let bytes = previous.as_ref().map_or(0, |s| s.size);
+            let backing = crate::inplace::backing(at as usize, bytes as usize);
+            let mut pieces = Vec::new();
+            let mut snapshot = None;
+            if bytes != 0 {
+                let saved = host.uav_buffer(bytes)?;
+                let mut pos = 0;
+                while pos < bytes {
+                    let addr = at.checked_add(pos)?;
+                    let page = addr / PAGE;
+                    let idx = m.copy_of(page)?;
+                    let amount = (bytes - pos).min(PAGE - addr % PAGE);
+                    let offset = u64::from(unsafe { m.entry(page).add(1).read() }) + addr % PAGE;
+                    let buffer = m.copies.get(idx)?.buffer.clone();
+                    copies.push((saved.clone(), pos, buffer.clone(), offset, amount));
+                    pieces.push((buffer, offset, amount));
+                    pos += amount;
+                }
+                snapshot = Some(saved);
+            }
+            outputs.push(PriorOutput {
+                at,
+                previous,
+                bytes,
+                backing,
+                pieces,
+                snapshot,
+            });
+        }
+    }
+    host.copy_preserved_buffers(&copies)?;
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let m = guard.as_mut()?;
+    m.versions.insert(
+        key,
+        BuildVersion {
+            generation,
+            outputs,
+            instances: instances.clone(),
+        },
+    );
+    let declared: Vec<_> = ranges
+        .iter()
+        .map(|&[at, len, kind]| [at, len, (generation << 8) | (kind & 255)])
+        .collect();
+    m.reserve_ranges(&declared, &instances).then_some(())
+}
+
+/// Called under the host submission lock. Restore the previous version of
+/// in-place outputs and discard new outputs before a later frame can trace.
+pub(crate) fn abort_builds() {
+    let versions = {
+        let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(m) = guard.as_mut() else { return };
+        std::mem::take(&mut m.versions)
+    };
+    for version in versions.into_values() {
+        let mut copies = Vec::new();
+        for out in &version.outputs {
+            if let Some(saved) = &out.snapshot
+                && crate::inplace::backing(out.at as usize, out.bytes as usize) == out.backing
+            {
+                let mut pos = 0;
+                for (dst, offset, len) in &out.pieces {
+                    copies.push((dst.clone(), *offset, saved.clone(), pos, *len));
+                    pos += len;
+                }
+            }
+        }
+        let restored = host().is_some_and(|host| host.copy_preserved_buffers(&copies).is_some());
+        let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(m) = guard.as_mut() else { return };
+        for out in version.outputs {
+            if m.structures
+                .get(&out.at)
+                .is_some_and(|s| s.generation == version.generation)
+            {
+                m.structures.remove(&out.at);
+                if restored
+                    && let Some(s) = out.previous
+                    && crate::inplace::backing(out.at as usize, out.bytes as usize) == out.backing
+                {
+                    m.structures.insert(out.at, s);
+                }
+            }
+        }
+    }
+}
+
+/// The completion of the group's last stage publishes its outputs together.
+pub(crate) fn published(outputs: &[(u64, u64)]) {
+    let Some(&(_, key)) = outputs.first() else {
+        return;
+    };
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = guard.as_mut() else { return };
+    let Some(version) = m.versions.get(&key) else {
+        return;
+    };
+    let generation = version.generation;
+    if !outputs.iter().all(|&(at, _)| {
+        m.structures.get(&at).is_some_and(|s| {
+            s.generation == generation
+                && crate::inplace::backing(at as usize, s.size as usize) == s.backing
+        })
+    }) {
+        crate::host::refuse_frame(format_args!(
+            "BVH output backing changed before publication"
+        ));
+        return;
+    }
+    for &(at, _) in outputs {
+        m.structures.get_mut(&at).unwrap().published = true;
+    }
+    m.versions.remove(&key);
+}
+
+pub(crate) struct SizeResult {
+    source: u64,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    buffer: ID3D12Resource,
+    address: u64,
+    owner: Arc<Shadow>,
+    backing: Vec<(usize, usize, usize, u64, u64)>,
+}
+
+impl SizeResult {
+    pub(crate) fn range(&self) -> (usize, usize) {
+        (self.address as usize, self.address as usize + 8)
+    }
+
+    pub(crate) fn land(&self) {
+        let _mapped = crate::watch::title_memory_reading();
+        if !crate::shadow::find(self.address, 8).is_some_and(|s| Arc::ptr_eq(&s, &self.owner))
+            || crate::inplace::backing(self.address as usize, 8) != self.backing
+        {
+            crate::host::refuse_frame(format_args!(
+                "compacted-size destination was replaced at {:#x}",
+                self.address
+            ));
+            return;
+        }
+        let mut mapped = std::ptr::null_mut();
+        unsafe {
+            if self.buffer.Map(0, None, Some(&mut mapped)).is_ok() && !mapped.is_null() {
+                let size = mapped.cast::<u64>().read_unaligned();
+                let written =
+                    crate::host::write_mapped_exact(self.address as usize, mapped.cast(), 8);
+                self.buffer.Unmap(0, None);
+                if !written {
+                    crate::host::refuse_frame(format_args!(
+                        "could not publish compacted size at {:#x}",
+                        self.address
+                    ));
+                    return;
+                }
+                drop(_mapped);
+                if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+                    && let Some(s) = m.structures.get_mut(&self.source)
+                    && self.generation.load(std::sync::atomic::Ordering::Acquire) == s.generation
+                    && size != 0
+                    && size <= s.size
+                    && crate::inplace::backing(self.source as usize, s.size as usize) == s.backing
+                {
+                    s.compacted = Some(size);
+                }
+            } else {
+                crate::host::refuse_frame(format_args!("could not map compacted-size readback"));
+            }
+        }
+    }
+}
+
+pub(crate) fn size_result(list: &HostList, address: u64, source: u64) -> Option<SizeResult> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let owner = crate::shadow::find(address, 8)?;
+    owner.offset_in(address)?;
+    let offset = owner.offset(address);
+    if owner.left(address) < 8 {
+        return None;
+    }
+    let buffer = crate::host::host()?.read_back_buffer(8)?;
+    let (uav, src) = (
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+    );
+    unsafe {
+        list.list
+            .ResourceBarrier(&[crate::host::transition(&owner.buffer, uav, src)]);
+        list.list
+            .CopyBufferRegion(&buffer, 0, &owner.buffer, offset, 8);
+        list.list
+            .ResourceBarrier(&[crate::host::transition(&owner.buffer, src, uav)]);
+    }
+    let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let stamp = generation.clone();
+    list.defer_host(move || {
+        let current = MEMORY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|m| m.structures.get(&source))
+            .map_or(0, |s| s.generation);
+        stamp.store(current, std::sync::atomic::Ordering::Release);
+    });
+    Some(SizeResult {
+        buffer,
+        address,
+        owner,
+        generation,
+        source,
+        backing: crate::inplace::backing(address as usize, 8),
+    })
+}
+
 /// Whether one of `lists` asks for sizes.
 pub(crate) fn asked_sizes<'a>(lists: impl Iterator<Item = &'a HostList>) -> bool {
     let mut lists = lists;
@@ -896,18 +1726,99 @@ fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> usize {
 /// submitted. None if the host cannot hold it; the draw is then dropped.
 pub(crate) fn ready(
     list: &HostList,
-    heap: &HostHeap,
+    heap: &Arc<HostHeap>,
     addresses: &[u64],
     written: &[u64],
     constants: &[u32],
     use_: Use,
     threads: Option<[u32; 3]>,
+    ranges: &[[u64; 3]],
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Memory::new();
     }
     let m = guard.as_mut()?;
+    // Declared builders and their consumers acquire directory entries in
+    // submission order. A later recording cannot replace an earlier reader's
+    // entries while its commands are waiting for a pipeline or queue fence.
+    if !ranges.is_empty() || use_ == Use::Reads && crate::pipeline::builder_enabled() {
+        let base = m.descriptors(heap)?;
+        let ready = Ready {
+            directory: m.directory.1.gpu(m.directory.1.span().0),
+            faults: m.faults.2,
+            base: heap.physical(base),
+        };
+        list.keep(&m.faults.0);
+        if use_ == (Use::Builds { back: true }) {
+            for &va in written {
+                if let Some((start, len)) = crate::shadow::in_buffer(va, 1)
+                    && len <= BACK
+                    && let Some(shadow) = crate::shadow::find(start, len)
+                {
+                    shadow.refresh(list, start, len);
+                    shadow.gpu_writes(list, start, len);
+                }
+            }
+        }
+        let spans = ranges.to_vec();
+        let heap = heap.clone();
+        let mut pointers = addresses.to_vec();
+        for w in constants.windows(2) {
+            if (1..32).contains(&w[1]) {
+                pointers.push(u64::from(w[0]) | u64::from(w[1]) << 32);
+            }
+        }
+        pointers.sort_unstable();
+        pointers.dedup();
+        list.defer_builder(move || {
+            let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+            let m = guard.as_mut()?;
+            m.reconcile_aliases();
+            let frame = crate::frame::current();
+            if m.frame != frame {
+                m.frame = frame;
+                m.refused.clear();
+                m.look_again();
+                m.report();
+            }
+            if let Some(first) = spans.first() {
+                let version = m.versions.get(&(first[2] >> 8))?;
+                let (generation, instances) = (version.generation, version.instances.clone());
+                let versioned: Vec<_> = spans
+                    .iter()
+                    .map(|&[at, len, stamp]| [at, len, (generation << 8) | (stamp & 255)])
+                    .collect();
+                if !m.reserve_ranges(&versioned, &instances) {
+                    return None;
+                }
+            }
+            for &at in &pointers {
+                if !(1 << 32..1 << 37).contains(&at) {
+                    continue;
+                }
+                let canonical = m.structure_at(at).unwrap_or(at);
+                if use_ == Use::Reads && !m.published_range(canonical) {
+                    return None;
+                }
+                if let Some(s) = m.structures.get(&canonical) {
+                    let len = s.size;
+                    if !m.reserve(at, len, false) {
+                        return None;
+                    }
+                } else {
+                    m.ready(at, 1);
+                }
+            }
+            m.descriptors(&heap)?;
+            Some(
+                std::iter::once(m.directory.1.clone())
+                    .chain(m.copies.iter().cloned())
+                    .collect(),
+            )
+        });
+        return Some(ready);
+    }
     let frame = crate::frame::current();
     if m.frame != frame {
         m.frame = frame;
@@ -960,6 +1871,7 @@ pub(crate) fn ready(
         // (Several structures to a page.)
         let mut packed = false;
         if builds
+            && ranges.is_empty()
             && list.first_use(usize::MAX - (3 << 33) - (at >> 8) as usize)
             && crate::shadow::in_buffer(at, 1).is_none()
             && m.possible(at / PAGE)
@@ -979,9 +1891,9 @@ pub(crate) fn ready(
                 }
                 m.bring(at / PAGE, (at + len - 1) / PAGE + 1);
             }
-            list.defer_host(move || {
+            list.defer_landing(move || {
                 if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                    m.land(at);
+                    m.land(at, None);
                 }
             });
             m.bring_up(list);
@@ -995,7 +1907,7 @@ pub(crate) fn ready(
                 m.small(list, start, len);
             }
             m.opens(at);
-            if !packed && crate::shadow::in_buffer(at, 1).is_none() {
+            if ranges.is_empty() && !packed && crate::shadow::in_buffer(at, 1).is_none() {
                 #[cfg(feature = "diagnostics")]
                 {
                     let built = m.dump.built.entry(at).or_insert((frame, frame, 0));
@@ -1025,24 +1937,7 @@ pub(crate) fn ready(
     for (sum, n) in m.stats.came.iter_mut().zip(came) {
         *sum += n;
     }
-    let key = std::ptr::from_ref(heap) as usize;
-    let (base, made) = match m.heaps.get(&key) {
-        Some(&run) => run,
-        None => {
-            // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
-            // Every slot of the run: a number shows no view of another kind.
-            for n in 0..=COPIES {
-                heap.null_raw_uav_at(base + n);
-            }
-            (base, 0)
-        }
-    };
-    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
-    }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
+    let base = m.descriptors(heap)?;
     // Every copy by every list that has come to by-address memory, whoever
     // numbered it: an arena another list made while this one was being
     // recorded was brought up to date by that list's submission alone, which
@@ -1066,7 +1961,7 @@ pub(crate) fn ready(
     Some(Ready {
         directory: directory.gpu(directory.span().0),
         faults: m.faults.2,
-        base,
+        base: heap.physical(base),
     })
 }
 

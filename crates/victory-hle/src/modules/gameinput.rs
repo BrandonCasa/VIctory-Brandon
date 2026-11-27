@@ -867,25 +867,21 @@ fn relative(
     }
     let state = hub.state();
     let history = &state.slots[index].history;
-    if history
+    let Some(distance) = history
         .front()
-        .is_none_or(|oldest| reference.sequence < oldest.sequence)
-    {
+        .and_then(|oldest| reference.sequence.checked_sub(oldest.sequence))
+    else {
         return fail(out, REFERENCE_TOO_OLD);
-    }
-    let wanted = |r: &&Ref| r.kind() & kind != 0;
-    let found = if forward {
-        history
-            .iter()
-            .filter(|r| r.sequence > reference.sequence)
-            .find(wanted)
-    } else {
-        history
-            .iter()
-            .rev()
-            .filter(|r| r.sequence < reference.sequence)
-            .find(wanted)
     };
+    let neighbor = if forward {
+        distance.checked_add(1)
+    } else {
+        distance.checked_sub(1)
+    };
+    let found = neighbor
+        .and_then(|n| usize::try_from(n).ok())
+        .and_then(|index| history.get(index))
+        .filter(|r| r.kind() & kind != 0);
     hand(out, found)
 }
 extern "system" fn next_reading(
