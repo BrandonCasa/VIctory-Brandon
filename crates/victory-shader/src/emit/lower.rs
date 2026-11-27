@@ -8354,6 +8354,22 @@ impl<'a> Lower<'a> {
                     } else {
                         self.indexed_forms.uav_indices.push((*index,kind,store));
                     }
+                } else if form == 8 && *first == 0 && exact && (1..=9).contains(&(props.0 & 0xff))
+                    && let Some((_, column)) = self.x.res.fixed_record_columns.iter().find(|(site, _)| site == load)
+                {
+                    let entry = (*column, (props.0 & 0xff) as u8);
+                    if !self.indexed_forms.fixed_record_columns.contains(&entry) {
+                        self.indexed_forms.fixed_record_columns.push(entry);
+                    }
+                } else if form == 8 && *first == 0 && matches!(leaf, Source::Loaded { .. }) && (1..=9).contains(&(props.0 & 0xff))
+                    && self.x.res.scalar_range_columns.iter().any(|(site, _)| site == load)
+                {
+                    for (_, column) in self.x.res.scalar_range_columns.iter().filter(|(site, _)| site == load) {
+                        let entry = (column.clone(), (props.0 & 0xff) as u8);
+                        if !self.indexed_forms.scalar_range_columns.contains(&entry) {
+                            self.indexed_forms.scalar_range_columns.push(entry);
+                        }
+                    }
                 } else if form == 8 && *first == 0 && matches!(leaf, Source::Loaded { .. }) && (1..=9).contains(&(props.0 & 0xff))
                     && self.x.res.packed_material.iter().any(|(site, _)| site == load)
                 {

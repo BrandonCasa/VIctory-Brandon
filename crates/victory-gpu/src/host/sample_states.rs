@@ -45,6 +45,8 @@ pub(super) struct Uses {
     pipelines: Vec<(u32, usize)>,
     #[cfg(feature = "diagnostics")]
     targets: Vec<(u32, Vec<(usize, bool, [u32; 7])>)>,
+    #[cfg(feature = "diagnostics")]
+    clear_ordinals: HashMap<usize, u32>,
 }
 
 impl Uses {
@@ -92,6 +94,16 @@ impl Uses {
         let before = self.targets.partition_point(|(at, _)| *at <= command);
         self.targets[..before].last().into_iter().flat_map(|(_, v)| v.iter())
             .filter(|(p, _, _)| *p == native).map(|(_, depth, view)| (*depth, *view)).collect()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn clear_view(&mut self, native: usize) {
+        self.clear_ordinals.entry(native).or_insert(self.command);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn first_clear(&self, native: usize) -> Option<u32> {
+        self.clear_ordinals.get(&native).copied()
     }
 
     pub(super) fn earlier_read_states(&self, kinds: impl FnOnce() -> u32) -> u32 {
@@ -179,6 +191,11 @@ impl Uses {
         } else {
             changes.push((self.command, published));
         }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn next_command(&self) -> u32 {
+        self.command
     }
 
     #[cfg(feature = "diagnostics")]

@@ -99,6 +99,77 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// An unsigned SDWA byte contributes at most 255 to the uniform row base.
+    pub(super) fn scalar_range_column(
+        &self,
+        read: &Inst,
+        known: &Known,
+        resources: &Resources,
+        index: BufferIndex,
+        field: u32,
+        stride: u32,
+    ) -> Option<ScalarRangeColumn> {
+        if self.stage != HwStage::Ps || stride != 64 { return None; }
+        let Fields::Buffer { addr: Operand::Vector { reg, .. }, .. } = &read.fields else { return None; };
+        let mut base = None;
+        let mut zero_record = false;
+        self.selected_lane_defs(read.read(Reg::V(*reg))?, known, &mut 64, &mut |site, inst, _, _, _| {
+            if inst.name() == "v_mov_b32"
+                && let [src] = plain(inst)?.src.as_slice()
+                && self.term(inst, src) == Some(Term::Const(0))
+            {
+                zero_record = true;
+                return Some(());
+            }
+            let add = if inst.name() == "v_cndmask_b32" {
+                let [zero, Operand::Vector { reg, .. }, Operand::Scalar { .. }] = plain(inst)?.src.as_slice() else { return None; };
+                if self.term(inst, zero) != Some(Term::Const(0)) { return None; }
+                let add_site = self.defs[inst.read(Reg::V(*reg))?.0 as usize]?;
+                let add = self.inst(add_site);
+                // Both instructions execute on the same lanes in this block.
+                // The select can therefore name only the fresh add or row zero.
+                if add_site.0 != site.0 || add_site.1 >= site.1
+                    || add.read(Reg::S(EXEC))? != inst.read(Reg::S(EXEC))?
+                    || self.p.wave64 && add.read(Reg::S(EXEC + 1))? != inst.read(Reg::S(EXEC + 1))?
+                {
+                    return None;
+                }
+                zero_record = true;
+                add
+            } else { inst };
+            let program = self.scalar_byte_add_base(add, resources)?;
+            if base.as_ref().is_some_and(|previous| previous != &program) { return None; }
+            base = Some(program);
+            Some(())
+        })?;
+        Some(ScalarRangeColumn {
+            base: base?,
+            records: (index.table_slot, index.table_dword),
+            count: 256,
+            record_stride: stride,
+            handle_field: field,
+            bytes: index.bytes,
+            zero_record,
+        })
+    }
+
+    fn scalar_byte_add_base(&self, add: &Inst, resources: &Resources) -> Option<Vec<ScalarWordOp>> {
+        let Fields::Valu(v) = &add.fields else { return None; };
+        let [base @ Operand::Scalar { dwords: 1, .. }, Operand::Vector { dwords: 1, .. }] = v.src.as_slice() else {
+            return None;
+        };
+        let sdwa = v.sdwa?;
+        if add.name() != "v_add_nc_u32" || sdwa.dst_sel != 6 || sdwa.dst_unused != 0
+            || sdwa.src_sel[0] != 6 || sdwa.src_sel[1] > 3 || sdwa.sext != 0
+            || v.carry.is_some() || v.dpp.is_some() || v.abs != 0 || v.neg != 0 || v.neg_hi != 0 || v.opsel != 0
+            || v.opsel_hi != 0 || v.clamp || v.omod != 0
+        {
+            return None;
+        }
+        let Term::Value(base) = self.term(add, base)? else { return None; };
+        self.scalar_handle_program(base, resources)
+    }
+
     fn selected_lane_def(&self, value: Value, known: &Known) -> Option<&'a Inst> {
         let inst = self.def(value)?;
         let lanes = self.lanes?;

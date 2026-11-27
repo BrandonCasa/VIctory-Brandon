@@ -256,6 +256,67 @@ impl Made {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PublicationCause {
+    Eviction,
+    NeutralView,
+    TextureFlip,
+    Unmake,
+    EmptyCleanup,
+    ClearView,
+    MirrorView,
+    #[cfg(feature = "diagnostics")]
+    EmptyMirrorSkipped,
+    #[cfg(feature = "diagnostics")]
+    UnmappedFlipSkipped,
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    static IN_INDEXED_PREPARATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct PublicationStats {
+    cause: [std::sync::atomic::AtomicU64; PublicationCause::UnmappedFlipSkipped as usize + 1],
+    indexed: std::sync::atomic::AtomicU64,
+    reported_second: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "diagnostics")]
+impl PublicationStats {
+    fn note(&self, cause: PublicationCause) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !crate::host::gpu_progress() { return; }
+        self.cause[cause as usize].fetch_add(1, Relaxed);
+        if !matches!(cause, PublicationCause::EmptyMirrorSkipped | PublicationCause::UnmappedFlipSkipped)
+            && IN_INDEXED_PREPARATION.get()
+        {
+            self.indexed.fetch_add(1, Relaxed);
+        }
+    }
+
+    fn report_due(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !crate::host::gpu_progress() { return false; }
+        let second = crate::host::now_ms() / 1000;
+        let previous = self.reported_second.load(Relaxed);
+        second > previous && self.reported_second.compare_exchange(previous, second, Relaxed, Relaxed).is_ok()
+    }
+
+    fn report(heap: &HostHeap, version: u64, counts: [u64; PublicationCause::UnmappedFlipSkipped as usize + 1], indexed: u64) {
+        use PublicationCause::*;
+        let count = |cause: PublicationCause| counts[cause as usize];
+        tracing::info!(heap = %format_args!("{heap:p}"), version, frame = crate::frame::current(),
+            eviction = count(Eviction), neutral_view = count(NeutralView), texture_flip = count(TextureFlip),
+            unmake = count(Unmake), empty_cleanup = count(EmptyCleanup), clear_view = count(ClearView),
+            mirror_view = count(MirrorView), from_indexed_preparation = indexed,
+            empty_mirror_skipped = count(EmptyMirrorSkipped), unmapped_flip_skipped = count(UnmappedFlipSkipped),
+            "indexed heap publication causes");
+    }
+}
+
 /// Slots known from root state, plus access forms that remain lane- or memory-dependent.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct IndexedSlots {
@@ -409,6 +470,8 @@ pub(crate) struct HostHeap {
     /// until both ExecuteCommandLists and its signal have been enqueued.
     pub(crate) last_reader: std::sync::RwLock<u64>,
     publication: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "diagnostics")]
+    publication_stats: PublicationStats,
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -2379,6 +2442,8 @@ impl HostHeap {
             changes_seen: Default::default(),
             last_reader: Default::default(),
             publication: Default::default(),
+            #[cfg(feature = "diagnostics")]
+            publication_stats: Default::default(),
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
@@ -2636,13 +2701,15 @@ impl HostHeap {
         Some(self.count + first as u32)
     }
 
-    fn publish_views(&self) -> Option<std::sync::RwLockReadGuard<'_, u64>> {
+    fn publish_views(&self, _cause: PublicationCause) -> Option<std::sync::RwLockReadGuard<'_, u64>> {
         if self.sampler { return None; }
         let guard = self.last_reader.read().unwrap_or_else(|e| e.into_inner());
         if *guard != 0 {
             crate::host::wait_for_descriptor_reader(*guard);
         }
         self.publication.fetch_add(1, std::sync::atomic::Ordering::Release);
+        #[cfg(feature = "diagnostics")]
+        self.publication_stats.note(_cause);
         Some(guard)
     }
 
@@ -2652,8 +2719,21 @@ impl HostHeap {
 
     /// Wait for all publishers already inside their shared critical section.
     pub(crate) fn stable_version(&self) -> u64 {
-        let _alone = self.last_reader.write().unwrap_or_else(|e| e.into_inner());
-        self.publication_version()
+        #[cfg(feature = "diagnostics")]
+        let report = self.publication_stats.report_due();
+        let alone = self.last_reader.write().unwrap_or_else(|e| e.into_inner());
+        let version = self.publication_version();
+        #[cfg(feature = "diagnostics")]
+        let counts = report.then(|| {
+            use std::sync::atomic::Ordering::Relaxed;
+            (std::array::from_fn(|i| self.publication_stats.cause[i].load(Relaxed)), self.publication_stats.indexed.load(Relaxed))
+        });
+        drop(alone);
+        #[cfg(feature = "diagnostics")]
+        if let Some((counts, indexed)) = counts {
+            PublicationStats::report(self, version, counts, indexed);
+        }
+        version
     }
 
     /// Convert an internal title or list slot to its descriptor heap location.
@@ -2783,7 +2863,7 @@ impl HostHeap {
                     && view.as_ref().is_some_and(|v| r.accepts_opaque_texture(v))))
             };
             if pinned(&self.title_readers.lock().unwrap_or_else(|e| e.into_inner())) { continue; }
-            let _publication = self.publish_views();
+            let _publication = self.publish_views(PublicationCause::Eviction);
             let readers = self.title_readers.lock().unwrap_or_else(|e| e.into_inner());
             if pinned(&readers) { continue; }
             self.quick_is(victim, 0);
@@ -2822,6 +2902,25 @@ impl HostHeap {
         if slots.empty() {
             return true;
         }
+        #[cfg(feature = "diagnostics")]
+        #[derive(Default)]
+        struct Visits {
+            catalogue: u64,
+            requested: u64,
+            was_preparing: bool,
+        }
+        #[cfg(feature = "diagnostics")]
+        impl Drop for Visits {
+            fn drop(&mut self) {
+                IN_INDEXED_PREPARATION.set(self.was_preparing);
+                crate::host::note_candidate_slots(self.catalogue, self.requested);
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        let mut visits = (!recording && crate::host::gpu_progress()).then(|| Visits {
+            was_preparing: IN_INDEXED_PREPARATION.replace(true),
+            ..Visits::default()
+        });
         let reject = |logical: u32, reason: &'static str| {
             static SAID: std::sync::LazyLock<Mutex<std::collections::HashSet<&'static str>>> =
                 std::sync::LazyLock::new(Default::default);
@@ -2858,8 +2957,13 @@ impl HostHeap {
             let Some(logical) = [candidates.peek().map(|r| r.slot), selected.peek().copied(), exact.peek().copied()]
                 .into_iter().flatten().min() else { break };
             let row = candidates.next_if(|r| r.slot == logical);
-            selected.next_if_eq(&logical);
+            let _selected_slot = selected.next_if_eq(&logical).is_some();
             let is_exact = exact.next_if_eq(&logical).is_some();
+            #[cfg(feature = "diagnostics")]
+            if let Some(visits) = &mut visits {
+                if is_exact || _selected_slot { visits.requested += 1; }
+                else { visits.catalogue += 1; }
+            }
             let Some(handle) = heap.handle(logical) else {
                 if !is_exact { continue; }
                 return reject(logical, "outside guest heap");
@@ -3073,6 +3177,9 @@ impl HostHeap {
                     let cpu_owned = crate::resource::title_fills(this) && !crate::texture::host_wrote(object);
                     let same_object = matches!(old_view.as_ref(), Some(View::Shader(old, _)) if ordinary && *old == object)
                         || matches!(addresses, (Some(old), Some(new)) if placed && old == new);
+                    let same_allocation = previous.is_some_and(|(_, serial, producer)| serial == copy.serial && producer.is_none())
+                        && same_object;
+                    let mut narrow_mips = false;
                     if !is_exact && matches!(view, View::Unordered(..)) && kind == victory_shader::ResourceType::Uav
                         && source.is_none() && crate::resource::twin(this).is_none()
                         && !crate::resource::title_fills(this) && !crate::texback::wanted(this)
@@ -3167,19 +3274,34 @@ impl HostHeap {
                             if late.as_deref_mut().is_some_and(|samples| list.prepare_late_depth_sample(&copy, twin, samples, access, stencil)) { None }
                             else { Some("sampled depth image has conflicting recorded use") }
                         }
-                        else if let Some(conflict) = (recording && cpu_owned).then(|| late_guest_sample_conflict(logical, object, &copy)).flatten() { Some(conflict) }
+                        else if let Some(conflict) = (recording && cpu_owned).then(|| {
+                            let conflict = late_guest_sample_conflict(logical, object, &copy)?;
+                            // A neighbouring target can own the excluded main mip
+                            // while the published compressed SRV reads the mip prefix.
+                            if same_allocation && matches!(&view, View::Placed(false, resource, _) if matches!(resource[8], 70..=72 | 97..=99))
+                                && old_view.as_ref().is_some_and(|old| same_placed_srv_mip_window(old, &view))
+                                && let Some(prefix) = crate::resource::placed_upload_prefix(this, &resolved, &copy)
+                                && late_sample_span_conflict(logical, object, &copy, Some(prefix), |_| false).is_none()
+                            {
+                                narrow_mips = true;
+                                #[cfg(feature = "diagnostics")]
+                                if crate::switch::on("VICTORY_TRACE_TEXTURE_OWNER") {
+                                    tracing::info!(logical, serial=copy.serial, address=format_args!("{:#x}", prefix.0), bytes=prefix.1,
+                                        "deferred republished compressed SRV with disjoint mip prefix");
+                                }
+                                None
+                            } else { Some(conflict) }
+                        }).flatten() { Some(conflict) }
                         else if recording {
                             let opaque_writer = cpu_owned
                                 && slots.opaque & victory_shader::emit::TEXTURE_WRITE_ACCESS != 0;
                             // Streaming can move the mip window while several draws on
                             // the same list name the same immutable allocation. Both
                             // views contribute their required subresources to its upload.
-                            let same_allocation = previous.is_some_and(|(_, serial, producer)| serial == copy.serial && producer.is_none())
-                                && same_object;
                             let plain_placement = placed && same_allocation && copy.flags() & 7 == 0;
                             // A placed SRV's host image can carry UAV capability
                             // even when the guest description has no writer flag.
-                            let deferred_mips = opaque_writer && !plain_placement && same_allocation
+                            let deferred_mips = narrow_mips || opaque_writer && !plain_placement && same_allocation
                                 && old_view.as_ref().is_some_and(|old| same_placed_srv_mip_window(old, &view));
                             #[cfg(feature = "diagnostics")]
                             if opaque_writer && same_allocation && !plain_placement {
@@ -3195,7 +3317,7 @@ impl HostHeap {
                             {
                                 // Check the execution-time upload against the actual write
                                 // ranges under the pinned descriptor publication.
-                                if opaque_writer { list.note_volatile_sample(slot); }
+                                if opaque_writer || narrow_mips { list.note_volatile_sample(slot); }
                                 if deferred_mips {
                                     // The final descriptor chooses the upload
                                     // range after real writer and alias checks.
@@ -3756,7 +3878,7 @@ impl HostHeap {
                 return false;
             }
             // (As `mirror`.)
-            let _publication = self.publish_views();
+            let _publication = self.publish_views(PublicationCause::NeutralView);
             let stale = self.note_buffer(index, Some(&view), true, key);
             if self.unmapped(index) {
                 return false;
@@ -3907,10 +4029,13 @@ impl HostHeap {
                     continue;
                 }
             }
-            let _publication = self.publish_views();
+            // Under Made, this slot cannot regain a physical assignment here.
             if self.unmapped(f.index) {
+                #[cfg(feature = "diagnostics")]
+                self.publication_stats.note(PublicationCause::UnmappedFlipSkipped);
                 continue;
             }
+            let _publication = self.publish_views(PublicationCause::TextureFlip);
             if let Some(kept) = make(&view, self.at(f.index)) {
                 #[cfg(feature = "diagnostics")]
                 note_before(f.index, shown, if f.late.is_some() { "shown after its upload" } else { "flip" });
@@ -3967,7 +4092,7 @@ impl HostHeap {
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held. Under its lock ([`Made`]).
     fn unmake(&self, index: u32) {
-        let _publication = self.publish_views();
+        let _publication = self.publish_views(PublicationCause::Unmake);
         self.quick_is(index, 0);
         self.view_metadata(index, None);
         let Some(key) = self.made.get(index) else {
@@ -5011,7 +5136,16 @@ impl HostHeap {
         let shown = self.made.get(index).unwrap_or(0);
         let view = (tag == VIEW_TAG).then(decode).flatten();
         let Some(view) = view else {
-            let _publication = self.publish_views();
+            if shown == 0 && !for_draw && self.assigned.is_empty() {
+                #[cfg(feature = "diagnostics")]
+                self.publication_stats.note(PublicationCause::EmptyMirrorSkipped);
+                return None;
+            }
+            let _publication = self.publish_views(if shown == 0 {
+                PublicationCause::EmptyCleanup
+            } else {
+                PublicationCause::ClearView
+            });
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if shown != 0 {
@@ -5019,14 +5153,14 @@ impl HostHeap {
                 self.made.set(index, 0);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false, 0);
-            } else if for_draw || !self.assigned.is_empty() {
+            } else {
                 // Left for later and stale since: out of the sets and the stride table.
                 let _ = self.note_buffer(index, None, false, 0);
             }
             return None;
         };
         if shown != key {
-            let publication = self.publish_views();
+            let publication = self.publish_views(PublicationCause::MirrorView);
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.

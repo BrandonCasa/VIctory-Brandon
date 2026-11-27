@@ -1,6 +1,47 @@
 use super::*;
 
 impl Tracer<'_> {
+    pub(super) fn fixed_record_column(
+        &self,
+        heap: Address,
+        index: BufferIndex,
+        resources: &Resources,
+    ) -> Option<FixedRecordColumn> {
+        if self.stage != HwStage::Ps || index.word_step == 0 || index.guard.is_some() {
+            return None;
+        }
+        let (_, [Term::Value(handle), Term::Const(5)]) = self.sop2(heap.dynamic?, &["s_lshl_b32"])? else {
+            return None;
+        };
+        let handle = match self.sop2(handle, &["s_and_b32"]) {
+            Some((_, [Term::Value(word), Term::Const(mask)] | [Term::Const(mask), Term::Value(word)]))
+                if mask == index.value_mask => word,
+            _ => handle,
+        };
+        let (table, address, field) = self.chain_word(handle, resources)?;
+        let (row, stride) = self.scalar_scale(address)?;
+        let (_, [_, control]) = self.sop2(row, &["s_bfe_u32"])?;
+        let control = match control {
+            Term::Const(control) => control,
+            Term::Value(value) => {
+                let (_, [Term::Const(low), Term::Const(high)]) = self.sop2(value, &["s_or_b32"])? else {
+                    return None;
+                };
+                low | high
+            }
+        };
+        let start = control & 31;
+        let width = (control >> 16) & 127;
+        if !(1..=9).contains(&width) || start + width > 32
+            || !stride.is_multiple_of(4) || !field.is_multiple_of(4) || field.checked_add(4)? > stride
+        {
+            return None;
+        }
+        let count = 1u32 << width;
+        (count - 1).checked_mul(stride)?.checked_add(field)?.checked_add(3)?;
+        Some(FixedRecordColumn { table, field, stride, count, bytes: index.bytes, value_mask: index.value_mask })
+    }
+
     pub(super) fn pointer_field(&self, heap: Address, r: &Resources) -> Option<PointerField> {
         if heap.offset != 0 {
             return None;

@@ -84,6 +84,10 @@ pub(crate) struct Shadow {
     /// Asks for the copy that gave no length (root views: they read from
     /// their address to the copy's end, whatever lies there).
     unsized_asks: AtomicU64,
+    #[cfg(feature = "diagnostics")]
+    root_binding_start: [AtomicU64; 2],
+    #[cfg(feature = "diagnostics")]
+    other_window_ask: std::sync::atomic::AtomicBool,
     /// Whether shaders were ever declared to write it.
     written: std::sync::atomic::AtomicBool,
     /// A number no other copy has had. Its address is no name for a copy:
@@ -3005,6 +3009,8 @@ pub(crate) fn windows() -> [u64; 3] {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
+    let trace_roots = crate::copystat::memory_categories();
+    let mut roots = RootWindowUsage::default();
     let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -3021,10 +3027,75 @@ pub(crate) fn window_use() -> [u64; 8] {
         if s.unsized_asks.load(Ordering::Relaxed) > 0 {
             out[5] += 1;
             out[6] += s.len;
+            if trace_roots {
+                roots.observe(s);
+            }
         }
+    }
+    drop(loose);
+    if trace_roots && out[5] != 0 {
+        roots.report(out[5], out[6]);
     }
     out[7] = window();
     out
+}
+
+/// Geometry of the views that actually named each live shadow, since it was
+/// made. Other lookups may have left bindings in a replayable list or heap.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct RootWindowUsage {
+    srv: u64,
+    uav: u64,
+    both: u64,
+    srv_prefix: u64,
+    uav_prefix: u64,
+    unknown: u64,
+    unknown_bytes: u64,
+    read_only: u64,
+    possible_trim: u64,
+    largest_trim: Option<(u64, u64, u64, u64)>,
+}
+
+#[cfg(feature = "diagnostics")]
+impl RootWindowUsage {
+    fn observe(&mut self, shadow: &Shadow) {
+        const ALIGNMENT: u64 = 64 << 10;
+        let [srv, uav] = shadow.root_binding_start.each_ref().map(|s| s.load(Ordering::Relaxed));
+        let known_srv = srv != u64::MAX;
+        let known_uav = uav != u64::MAX;
+        self.srv += u64::from(known_srv);
+        self.uav += u64::from(known_uav);
+        self.both += u64::from(known_srv && known_uav);
+        let prefix = |start: u64| start.saturating_sub(shadow.start) / ALIGNMENT * ALIGNMENT;
+        if known_srv { self.srv_prefix += prefix(srv); }
+        if known_uav { self.uav_prefix += prefix(uav); }
+        if shadow.other_window_ask.load(Ordering::Relaxed) || !known_srv && !known_uav {
+            self.unknown += 1;
+            self.unknown_bytes += shadow.len;
+            return;
+        }
+        if !known_srv || known_uav || shadow.selector_ownership() != (false, false, false)
+            || shadow.carded() || shadow.mapped {
+            return;
+        }
+        self.read_only += 1;
+        let lowest = srv.min(shadow.asked[0].load(Ordering::Relaxed));
+        let trim = prefix(lowest);
+        self.possible_trim += trim;
+        if trim > 0 && self.largest_trim.is_none_or(|(_, _, _, best)| trim > best) {
+            self.largest_trim = Some((shadow.id, shadow.start, lowest, trim));
+        }
+    }
+
+    fn report(&self, windows: u64, bytes: u64) {
+        tracing::info!(windows, bytes, srv_windows = self.srv, uav_windows = self.uav,
+            both = self.both, srv_prefix_bytes = self.srv_prefix, uav_prefix_bytes = self.uav_prefix,
+            unknown_or_other = self.unknown, unknown_or_other_bytes = self.unknown_bytes,
+            root_srv_only = self.read_only, possible_trim_bytes = self.possible_trim,
+            example_shadow_start_lowest_trim = ?self.largest_trim,
+            alias_generation = crate::resource::alias_generation(), "unsized window binding extents");
+    }
 }
 
 /// Optional byte cap for loose title-window copies, in MiB. Unset or `0`
@@ -3227,6 +3298,17 @@ impl Shadow {
         self.id
     }
 
+    /// Lowest guest address exposed by a successfully prepared native root view.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_root_binding(&self, address: u64, writable: bool) {
+        if self.window && crate::copystat::memory_categories() && self.offset_in(address).is_some() {
+            let start = &self.root_binding_start[usize::from(writable)];
+            if start.load(Ordering::Relaxed) > address {
+                start.fetch_min(address, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Whether it is no copy but title memory in place (`crate::inplace`).
     pub(crate) fn in_place(&self) -> bool {
         self.place.is_some()
@@ -3362,6 +3444,10 @@ impl Shadow {
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
+            #[cfg(feature = "diagnostics")]
+            root_binding_start: [const { AtomicU64::new(u64::MAX) }; 2],
+            #[cfg(feature = "diagnostics")]
+            other_window_ask: Default::default(),
             written: Default::default(),
             id: {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -5451,7 +5537,13 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// (a root view: the caller reads on to the copy's end).
 #[track_caller]
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    lookup(address, len, false)
+    lookup(address, len, false, false)
+}
+
+/// A lengthless native root view and the lookups for its bias and write span.
+#[track_caller]
+pub(crate) fn find_root(address: u64) -> Option<Arc<Shadow>> {
+    lookup(address, 1, false, true)
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has
@@ -5477,7 +5569,7 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if !fine() {
         return find(address, len);
     }
-    lookup(address, len, true)
+    lookup(address, len, true, false)
 }
 
 /// The copy [`find`] gives for a range inside a title buffer, if it was made.
@@ -5529,7 +5621,7 @@ pub(crate) fn existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 #[track_caller]
-fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+fn lookup(address: u64, len: u64, any: bool, root: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
         return Some(shadow);
@@ -5549,7 +5641,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             Some(_) => {}
             None => {
                 drop(map);
-                return loose(address, end, len <= 1, any);
+                return loose(address, end, len <= 1, any, root);
             }
         }
     }
@@ -5558,7 +5650,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end, len <= 1, any);
+        return loose(address, end, len <= 1, any, root);
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -5875,7 +5967,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
 #[track_caller]
-fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, _root: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
     // Under the lock, with the handing out: see `let_go_idle`.
@@ -5893,6 +5985,10 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         }
         if unsized_ask {
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(feature = "diagnostics")]
+        if !_root && crate::copystat::memory_categories() && !shadow.other_window_ask.load(Ordering::Relaxed) {
+            shadow.other_window_ask.store(true, Ordering::Relaxed);
         }
     };
     // The window is there already (nearly always): readers share the lock.

@@ -872,6 +872,16 @@ static SUBMIT_SELECTOR_READ_US: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "diagnostics")]
 static SUBMIT_CANDIDATES_US: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "diagnostics")]
+static SUBMIT_SELECTOR_SCOPES_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static SUBMIT_CANDIDATE_EPOCH_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static SUBMIT_CANDIDATE_VISIT_US: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(feature = "diagnostics")]
+static SUBMIT_CANDIDATE_PASSES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(feature = "diagnostics")]
+static SUBMIT_CANDIDATE_SLOTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(feature = "diagnostics")]
 static SUBMIT_PIN_CHECKS_US: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "diagnostics")]
 static SUBMIT_HEAP_RETRIES: AtomicU64 = AtomicU64::new(0);
@@ -879,9 +889,15 @@ static SUBMIT_HEAP_RETRIES: AtomicU64 = AtomicU64::new(0);
 static SUBMIT_BATCH_RETRIES: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "diagnostics")]
-fn gpu_progress() -> bool {
+pub(crate) fn gpu_progress() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_PROGRESS"))
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_candidate_slots(catalogue: u64, requested: u64) {
+    SUBMIT_CANDIDATE_SLOTS[0].fetch_add(catalogue, Ordering::Relaxed);
+    SUBMIT_CANDIDATE_SLOTS[1].fetch_add(requested, Ordering::Relaxed);
 }
 
 #[cfg(feature = "diagnostics")]
@@ -929,6 +945,14 @@ fn card_progress(clock: &'static CardClock) {
             submit_heap_sync_us = SUBMIT_HEAP_SYNC_US.load(Ordering::Relaxed),
             submit_selector_read_us = SUBMIT_SELECTOR_READ_US.load(Ordering::Relaxed),
             submit_candidates_us = SUBMIT_CANDIDATES_US.load(Ordering::Relaxed),
+            submit_selector_scopes_us = SUBMIT_SELECTOR_SCOPES_US.load(Ordering::Relaxed),
+            submit_candidate_epoch_us = SUBMIT_CANDIDATE_EPOCH_US.load(Ordering::Relaxed),
+            submit_candidate_first_us = SUBMIT_CANDIDATE_VISIT_US[0].load(Ordering::Relaxed),
+            submit_candidate_retry_us = SUBMIT_CANDIDATE_VISIT_US[1].load(Ordering::Relaxed),
+            submit_candidate_first_passes = SUBMIT_CANDIDATE_PASSES[0].load(Ordering::Relaxed),
+            submit_candidate_retry_passes = SUBMIT_CANDIDATE_PASSES[1].load(Ordering::Relaxed),
+            submit_candidate_catalogue_slots = SUBMIT_CANDIDATE_SLOTS[0].load(Ordering::Relaxed),
+            submit_candidate_requested_slots = SUBMIT_CANDIDATE_SLOTS[1].load(Ordering::Relaxed),
             submit_pin_checks_us = SUBMIT_PIN_CHECKS_US.load(Ordering::Relaxed),
             submit_heap_retries = SUBMIT_HEAP_RETRIES.load(Ordering::Relaxed),
             submit_batch_retries = SUBMIT_BATCH_RETRIES.load(Ordering::Relaxed),
@@ -2709,6 +2733,8 @@ struct Deferred {
     textures: std::collections::HashSet<usize>,
     texture_uploads: std::sync::Arc<Vec<crate::texture::PreludeUpload>>,
     texture_reads: std::collections::HashMap<(usize, u64), Vec<crate::texture::ViewRange>>,
+    #[cfg(feature = "diagnostics")]
+    texture_read_origins: std::collections::HashMap<(usize, u64), Vec<(u32, [u32; 10])>>,
     numbered_prefix: Option<usize>,
     landing: bool,
     builder_batches: Vec<std::sync::Arc<AtomicBool>>,
@@ -3186,22 +3212,37 @@ impl SampleSelection {
         words: &[crate::descriptor::index_words::SampleWords], heap_count: u32, writes: Option<&[(usize, usize)]>,
         device: Option<&crate::descriptor::index_words::DeviceBytes>,
     ) -> Option<std::collections::BTreeSet<u32>> {
-        Self::try_read(words, heap_count, writes?, device).ok()
+        Self::try_read(words, heap_count, writes?, device, None).ok()
     }
 
     fn try_read(
         words: &[crate::descriptor::index_words::SampleWords], heap_count: u32, writes: &[(usize, usize)],
-        device: Option<&crate::descriptor::index_words::DeviceBytes>,
+        device: Option<&crate::descriptor::index_words::DeviceBytes>, mut trace: Option<(u32, &mut Vec<usize>)>,
     ) -> Result<std::collections::BTreeSet<u32>, usize> {
         let mut selected = std::collections::BTreeSet::new();
         if words.is_empty() { return Err(0); }
         for (i, input) in words.iter().enumerate() {
             #[cfg(feature = "diagnostics")]
             crate::descriptor::index_words::take_missing_word();
+            let previous = trace.as_ref().is_some_and(|(slot, _)| selected.remove(slot));
             if !input.values_after(writes, heap_count, &mut selected, device) { return Err(i); }
+            if let Some((slot, hits)) = &mut trace {
+                if selected.contains(slot) { hits.push(i); }
+                if previous { selected.insert(*slot); }
+            }
         }
         Ok(selected)
     }
+}
+
+pub(crate) fn trace_selector_slot() -> Option<u32> {
+    #[cfg(feature = "diagnostics")]
+    {
+        static SLOT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        *SLOT.get_or_init(|| std::env::var("VICTORY_TRACE_SELECTOR_SLOT").ok()?.parse().ok())
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    None
 }
 
 /// Independent selector values for each reflected stage and set of root bindings.
@@ -3211,6 +3252,8 @@ pub(crate) struct StageSelections {
     readers: Vec<(u32, Option<usize>)>,
     #[cfg(feature = "diagnostics")]
     missing: std::collections::HashMap<usize, UnresolvedSelector>,
+    #[cfg(feature = "diagnostics")]
+    selector_hits: std::collections::HashMap<usize, (std::sync::Arc<[crate::descriptor::index_words::SampleWords]>, Vec<usize>)>,
     coverage: std::cell::RefCell<std::collections::HashMap<u32, Option<StageCoverage>>>,
     entries: std::collections::HashMap<usize, (SampleSelection, std::cell::Cell<bool>)>,
 }
@@ -3225,6 +3268,18 @@ struct UnresolvedSelector {
 }
 
 impl StageSelections {
+    #[cfg(feature = "diagnostics")]
+    fn report_selector_hits(&self, scope: usize, command: u32, pipeline: usize, logical: u32) {
+        let Some((words, hits)) = self.selector_hits.get(&scope) else { return };
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            for &input in hits {
+                tracing::info!(scope, command, pipeline=format_args!("{pipeline:#x}"), logical, input,
+                    source=?words[input], "first conflicting candidate selector");
+            }
+        });
+    }
+
     #[cfg(feature = "diagnostics")]
     fn report_missing(&self, scope: usize, command: u32, pipeline: usize, logical: u32) {
         let Some(&UnresolvedSelector { input, word, native_spans, write_spans, merged }) = self.missing.get(&scope) else { return };
@@ -7490,8 +7545,12 @@ impl HostList {
     }
 
     pub(crate) fn note_clear_view(&self, texture: &ID3D12Resource, words: [u32; 7]) {
-        if unsafe { texture.GetDesc() }.MipLevels > 1 {
-            self.sample_uses.lock().unwrap_or_else(|e| e.into_inner()).render_view(texture.as_raw() as usize, false, words);
+        let multiple_mips = unsafe { texture.GetDesc() }.MipLevels > 1;
+        if multiple_mips || trace_selector_slot().is_some() {
+            let mut uses = self.sample_uses.lock().unwrap_or_else(|e| e.into_inner());
+            if multiple_mips { uses.render_view(texture.as_raw() as usize, false, words); }
+            #[cfg(feature = "diagnostics")]
+            if trace_selector_slot().is_some() { uses.clear_view(texture.as_raw() as usize); }
         }
     }
 
@@ -9420,6 +9479,14 @@ impl HostList {
             let selected = source.and_then(|id| stages?.entries.get(&id).map(|(p,_)| p.slots.len()));
             if let (Some((cmd,_,_,Some(scope))), Some(stages)) = (conflict, stages) {
                 stages.report_missing(scope, cmd, pipeline, logical);
+                if trace_selector_slot() == Some(logical) { stages.report_selector_hits(scope, cmd, pipeline, logical); }
+            }
+            if let Some((command, _, _, _)) = conflict && trace_selector_slot() == Some(logical) {
+                static TRACE: std::sync::Once = std::sync::Once::new();
+                TRACE.call_once(|| tracing::info!(serial=copy.serial, logical, command, pipeline=format_args!("{pipeline:#x}"),
+                    initial, last=_last, target_views=?uses.target_view(command, copy.texture.as_raw() as usize),
+                    first_clear=?uses.first_clear(copy.texture.as_raw() as usize), shader_states=?uses.shader_states(copy.serial),
+                    "first conflicting candidate color chronology"));
             }
             SAID[usize::from(conflict.is_some())].call_once(|| tracing::info!(serial=copy.serial, initial, last=_last, kind, logical, ?conflict, ?selected,
                 pipeline=format_args!("{pipeline:#x}"),
@@ -9438,10 +9505,15 @@ impl HostList {
         let mut sampled = LateSamples::default();
         let observed = self.deferred().indexed_heaps.clone();
         let ready = observed.into_iter().all(|(title, host, forms)| {
+            #[cfg(feature = "diagnostics")]
+            let scopes_timer = SubmitTimer::start(&SUBMIT_SELECTOR_SCOPES_US);
             let count = host.count();
             // Read outside the guest heap visitor, which can hold the same heap's
             // publication lock. Unavailable sources retain the full stage footprint.
-            let merged = forms.words_only.then(|| writes.map(|w| SampleSelection::try_read(&forms.words, count, w, device))).flatten();
+            let trace_slot = trace_selector_slot();
+            let mut merged_hits = Vec::new();
+            let merged = forms.words_only.then(|| writes.map(|w| SampleSelection::try_read(&forms.words, count, w, device,
+                trace_slot.map(|slot| (slot, &mut merged_hits))))).flatten();
             #[cfg(feature = "diagnostics")]
             let merged_failure = merged.as_ref().and_then(|r| r.as_ref().err()).copied()
                 .map(|i| (i, crate::descriptor::index_words::take_missing_word()));
@@ -9461,10 +9533,17 @@ impl HostList {
                             stages.missing.insert(id, UnresolvedSelector { input: i, word: why,
                                 native_spans: device.map_or(0, |b| b.len()), write_spans: writes.len(), merged: true });
                         }
+                        #[cfg(feature = "diagnostics")]
+                        if selection.is_some() && !merged_hits.is_empty() {
+                            stages.selector_hits.insert(id, (words, merged_hits.clone()));
+                        }
                         continue;
                     }
-                    match SampleSelection::try_read(&words, count, writes, device) {
+                    let mut hits = Vec::new();
+                    match SampleSelection::try_read(&words, count, writes, device, trace_slot.map(|slot| (slot, &mut hits))) {
                         Ok(slots) => {
+                            #[cfg(feature = "diagnostics")]
+                            if !hits.is_empty() { stages.selector_hits.insert(id, (words.clone(), hits)); }
                             stages.entries.insert(id, (SampleSelection { words, slots, heap_count: count }, false.into()));
                         }
                         Err(_i) => {
@@ -9478,20 +9557,36 @@ impl HostList {
             };
             let stages = selections(false);
             let uav_stages = selections(true);
+            #[cfg(feature = "diagnostics")]
+            drop(scopes_timer);
+            let stable_version = || {
+                #[cfg(feature = "diagnostics")]
+                let _timer = SubmitTimer::start(&SUBMIT_CANDIDATE_EPOCH_US);
+                host.stable_version()
+            };
             // Publishing a missing descriptor or streaming a new set of
             // textures advances the version. A race requires another pass,
             // since dropping this list would also lose its completion writes.
             let mut retries = 0u32;
             loop {
-                let before = host.stable_version();
+                let before = stable_version();
                 let mut candidates = LateSamples::default();
+                #[cfg(feature = "diagnostics")]
+                let visit_timer = {
+                    let pass = usize::from(retries != 0);
+                    let timer = SubmitTimer::start(&SUBMIT_CANDIDATE_VISIT_US[pass]);
+                    if timer.is_some() { SUBMIT_CANDIDATE_PASSES[pass].fetch_add(1, Ordering::Relaxed); }
+                    timer
+                };
                 let ready = crate::descriptor::with_heap(title, |heap| {
                     heap.host_owner().is_some_and(|current| {
                         std::sync::Arc::ptr_eq(current, &host)
                             && host.indexed_resident(heap, &forms, self, false, Some(&mut candidates), selection.as_ref(), Some((&stages,&uav_stages)))
                     })
                 }).unwrap_or(false);
-                let after = host.stable_version();
+                #[cfg(feature = "diagnostics")]
+                drop(visit_timer);
+                let after = stable_version();
                 if before == after {
                     if !ready { return false; }
                     sampled.merge(candidates);
@@ -9617,10 +9712,25 @@ impl HostList {
             self.refused_pipeline(0);
             return;
         };
+        #[cfg(feature = "diagnostics")]
+        let origin = match view {
+            crate::descriptor::View::Shader(_, Some(words)) if words[1] == 2 && trace_texture_reads() => {
+                let uses = self.sample_uses.lock().unwrap_or_else(|e| e.into_inner());
+                Some((uses.next_command(), *words))
+            }
+            _ => None,
+        };
         let mut d = self.deferred();
         let ranges = d.texture_reads.entry((resource, serial)).or_default();
         if !ranges.contains(&range) {
             ranges.push(range);
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(origin) = origin {
+            let origins = d.texture_read_origins.entry((resource, serial)).or_default();
+            if origins.len() < 8 && !origins.contains(&origin) {
+                origins.push(origin);
+            }
         }
     }
 
@@ -9881,6 +9991,22 @@ impl HostList {
                 let staged = by_resource.get(&(resource, serial)).map_or(&[][..], Vec::as_slice);
                 for &range in ranges {
                     if let Some(missing) = crate::texture::missing_view(staged, range) {
+                        #[cfg(feature = "diagnostics")]
+                        if let Some(origins) = d.texture_read_origins.get(&(resource, serial)).cloned() {
+                            drop(d);
+                            let uses = self.sample_uses.lock().unwrap_or_else(|e| e.into_inner());
+                            let native = staged.first().map(|upload| {
+                                // SAFETY: the staging entry retains the native image.
+                                unsafe { upload.copy.texture.GetDesc() }
+                            });
+                            for (command, view) in origins {
+                                let pipeline = (command < uses.next_command()).then(|| uses.pipeline(command)).flatten();
+                                tracing::warn!(resource = format_args!("{resource:#x}"), serial, command,
+                                    pipeline = ?pipeline.map(|p| format!("{p:#x}")), ?view, ?native, ?range,
+                                    "recorded required Texture1D provenance");
+                            }
+                            drop(uses);
+                        }
                         refuse_frame(format_args!("required subresources of texture {resource:#x} image {serial} are unavailable: view {range:?}, first missing {missing:?}, {} staging ranges", staged.len()));
                         return Vec::new();
                     }
@@ -9906,6 +10032,12 @@ impl HostList {
         }
         uploads
     }
+}
+
+#[cfg(feature = "diagnostics")]
+fn trace_texture_reads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_TRACE_TEXTURE_OWNER"))
 }
 
 /// The numbers of [`HostList::epoch`].

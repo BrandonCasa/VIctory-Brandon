@@ -15,11 +15,34 @@ pub(super) fn plain(inst: &Inst) -> Option<&Valu> {
 struct Columns {
     coarse: Vec<BufferIndex>,
     packed: Option<Vec<PackedMaterialColumn>>,
+    ranges: Option<Vec<ScalarRangeColumn>>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wave64_column_requires_both_mask_halves_to_cover_the_entry() {
+        let words = [
+            0x7e0a_0280u32, // v_mov_b32 v5, 0 under the original EXEC.
+            0xbe82_2400, // s_and_saveexec_b64 s[2:3], s[0:1].
+            0x7e0c_0280, // v_mov_b32 v6, 0 under the narrower EXEC.
+            0xbf81_0000,
+        ];
+        let code: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let program = crate::ir::build(&code, true, 32).unwrap();
+        let tracer = Tracer::new(&program, &[], HwStage::Cs, None).unwrap();
+        let [wide, save, narrow, _] = program.blocks[0].insts.as_slice() else { panic!("unexpected mask program") };
+        let exec = |inst: &Inst| [inst.read(Reg::S(EXEC)).unwrap(), inst.read(Reg::S(EXEC + 1)).unwrap()];
+        for half in 0..2u8 {
+            assert_eq!(tracer.saved_mask(save.write(Reg::S(2 + half)).unwrap(), &mut 64), Some(exec(wide)[half as usize]));
+        }
+        assert_eq!(tracer.wave64_write_covers_entry(exec(wide), wide), Some(true));
+        assert_eq!(tracer.wave64_write_covers_entry(exec(narrow), wide), Some(true));
+        assert_ne!(tracer.wave64_write_covers_entry(exec(wide), narrow), Some(true));
+        assert_ne!(tracer.wave64_write_covers_entry([exec(narrow)[0], exec(wide)[1]], wide), Some(true));
+    }
 
     #[test]
     fn masked_writes_union_all_reachable_structured_components() {
@@ -189,6 +212,56 @@ mod tests {
     }
 
     #[test]
+    fn scalar_range_columns_include_the_actual_zero_record_of_a_masked_address() {
+        let track = |default: u32, sdwa: u32| {
+            let words = [
+                0xbe84_0308, 0xbe85_0380,
+                0xf408_0402, 0xfa00_05c0, // s[16:19] from record table dword 368.
+                0xbe86_0309, 0xbe87_0380,
+                0xf408_0503, 0xfa00_0a00, // s[20:23] from base table dword 640.
+                0xf420_008a, 0xfa00_03a8, // s2 from the base SRV's field at 936.
+                0x7e60_0280 | default,    // Default address in v48.
+                0xbe9a_047e,             // Save both halves of EXEC.
+                0x7da4_1a80,             // v_cmpx_eq_u32 exec, 0, v13.
+                0x4a60_6af9, sdwa,       // v48 = s2 + unsigned byte of v53.
+                0xbf07_8002, 0x8582_807e, // Select the current EXEC when the base is nonzero.
+                0xd501_0030, 0x000a_6080, // v48 selects zero or the computed record.
+                0xbefe_041a,             // Restore both halves of EXEC.
+                0xe030_2024, 0x8004_0630, // v6 = records[v48].dword_at_36.
+                0x3424_0c85, 0xbf81_0000, // v18 = v6 << 5.
+            ];
+            let code: Vec<_> = words.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, true, 64).unwrap();
+            let lanes = crate::structure::structure(&p).unwrap();
+            let layout = [0u8, 1].map(|slot| RootParam {
+                root: RootType::Table, table_offset_dwords: 0, sgprs: 1, base_register: 0,
+                user_data: 8 + slot, slot,
+            });
+            let used = [UsedResource {
+                root: RootType::Table, kind: ResourceType::Srv, table_offset_dwords: 368,
+                lower_bound: 0, stride: 64, dwords: 4, user_data: 8, slot: 0,
+            }];
+            let resources = track(&p, &layout, HwStage::Ps, Some(&lanes)).unwrap();
+            let tracer = Tracer::new(&p, &layout, HwStage::Ps, Some(&lanes)).unwrap();
+            let shift = p.blocks.last().unwrap().insts.iter().find(|inst| inst.name() == "v_lshlrev_b32")?;
+            let active = lanes.mask_bits(shift.read(Reg::S(EXEC))?, shift.read(Reg::S(EXEC + 1)))?;
+            let mut out = Columns { ranges: Some(Vec::new()), ..Default::default() };
+            tracer.selector_branches(shift.write(Reg::V(18))?, true, &vec![(active, true)],
+                &resources, &used, 0, &mut out, &mut 128)?;
+            out.ranges
+        };
+        let [column] = track(0, 0x0386_0602).unwrap().try_into().unwrap();
+        assert_eq!(column, ScalarRangeColumn {
+            base: vec![ScalarWordOp::Constant(0), ScalarWordOp::Constant(936), ScalarWordOp::Add(0, 1),
+                ScalarWordOp::Read { table: (1, 640), address: 2 }],
+            records: (0, 368), count: 256, record_stride: 64, handle_field: 36, bytes: 0, zero_record: true,
+        });
+        assert_eq!(track(0, 0x0286_0602).unwrap(), [column]);
+        assert!(track(0, 0x0b86_0602).is_none()); // Sign extension is not an unsigned byte range.
+        assert!(track(1, 0x0386_0602).is_none()); // Only a zero record can accompany the byte range.
+    }
+
+    #[test]
     fn image_waterfall_proof_does_not_cover_a_scalar_descriptor_read() {
         let words = super::super::tests::WATERFALL_INDEXED_WAVE32;
         let accepts = |words: &[u32]| {
@@ -342,7 +415,7 @@ mod tests {
             let read = p.blocks.iter().flat_map(|block| &block.insts)
                 .find(|inst| inst.name() == "buffer_load_dwordx2").unwrap();
             let selected = tracer.selected_records(read.read(Reg::V(11)).unwrap(), read.read(Reg::S(EXEC)).unwrap());
-            let reachable_store = resources.waterfall.loads.iter().any(|&load| tracer.wave32_waterfall_shift(load).is_some());
+            let reachable_store = resources.waterfall.loads.iter().any(|&load| tracer.waterfall_shift(load).is_some());
             let indices = resources.buffer_uav_indices.into_iter().map(|(_, index)| index).collect::<Vec<_>>();
             (indices, selected, reachable_store)
         };
@@ -391,7 +464,7 @@ impl Tracer<'_> {
         load: Site,
         resources: &Resources,
         used: &[UsedResource],
-    ) -> Option<(Vec<BufferIndex>, Vec<PackedMaterialColumn>)> {
+    ) -> Option<(Vec<BufferIndex>, Vec<PackedMaterialColumn>, Vec<ScalarRangeColumn>)> {
         if used.is_empty() {
             return None;
         }
@@ -433,8 +506,10 @@ impl Tracer<'_> {
             return None;
         }
         let shifted = self.first_lane_source(offset)?;
+        let image = self.stage == HwStage::Ps && resources.waterfall.loads.contains(&load);
         let mut out = Columns {
-            packed: (self.stage == HwStage::Ps && resources.waterfall.loads.contains(&load)).then(Vec::new),
+            packed: image.then(Vec::new),
+            ranges: image.then(Vec::new),
             ..Default::default()
         };
         let mut fuel = 128;
@@ -451,13 +526,15 @@ impl Tracer<'_> {
         if out.coarse.is_empty() || !self.p.wave64 && !self.image_only_in_waterfall(load, resources) {
             return None;
         }
-        let packed = out.packed.filter(|columns| !columns.is_empty() && self.image_only_in_waterfall(load, resources));
-        Some((out.coarse, packed.unwrap_or_default()))
+        let image_only = image && self.image_only_in_waterfall(load, resources);
+        let packed = out.packed.filter(|_| image_only).unwrap_or_default();
+        let ranges = out.ranges.filter(|_| image_only).unwrap_or_default();
+        Some((out.coarse, packed, ranges))
     }
 
     /// The image proof only bounds lanes active at waterfall entry. A
     /// scalar descriptor use can run even when no lane is active.
-    fn image_only_in_waterfall(&self, load: Site, resources: &Resources) -> bool {
+    pub(super) fn image_only_in_waterfall(&self, load: Site, resources: &Resources) -> bool {
         self.descriptor_only_in_waterfall(load, resources, |inst| matches!(inst.fields, Fields::Image { .. }))
     }
 
@@ -532,6 +609,18 @@ impl Tracer<'_> {
         out: &mut Columns,
         fuel: &mut usize,
     ) -> Option<()> {
+        self.selected_lane_defs(v, known, fuel, &mut |site, inst, component, here, fuel| {
+            self.selector_definition(site, inst, component, needs_shift, here, resources, used, bias, out, fuel)
+        })
+    }
+
+    pub(super) fn selected_lane_defs(
+        &self,
+        v: Value,
+        known: &Known,
+        fuel: &mut usize,
+        visit: &mut impl FnMut(Site, &Inst, u8, &Known, &mut usize) -> Option<()>,
+    ) -> Option<()> {
         *fuel = fuel.checked_sub(1)?;
         let lanes = self.lanes?;
         if let Some((b, i)) = self.phis[v.0 as usize] {
@@ -553,16 +642,7 @@ impl Tracer<'_> {
                     edge.push((when, taken == b));
                 }
                 if self.meet(lanes, &edge) {
-                    self.selector_branches(
-                        block.phis[i].args[j],
-                        needs_shift,
-                        &edge,
-                        resources,
-                        used,
-                        bias,
-                        out,
-                        fuel,
-                    )?;
+                    self.selected_lane_defs(block.phis[i].args[j], &edge, fuel, visit)?;
                 }
             }
             return Some(());
@@ -580,21 +660,28 @@ impl Tracer<'_> {
         let mut skipped = known.clone();
         skipped.push((mask, false));
         if self.meet(lanes, &skipped) {
-            self.selector_branches(
-                inst.read(reg)?,
-                needs_shift,
-                &skipped,
-                resources,
-                used,
-                bias,
-                out,
-                fuel,
-            )?;
+            self.selected_lane_defs(inst.read(reg)?, &skipped, fuel, visit)?;
         }
         here.push((mask, true));
         if !self.meet(lanes, &here) {
             return Some(());
         }
+        visit(site, inst, component, &here, fuel)
+    }
+
+    fn selector_definition(
+        &self,
+        site: Site,
+        inst: &Inst,
+        component: u8,
+        needs_shift: bool,
+        here: &Known,
+        resources: &Resources,
+        used: &[UsedResource],
+        bias: u32,
+        out: &mut Columns,
+        fuel: &mut usize,
+    ) -> Option<()> {
         if !self.p.wave64 && inst.name() == "v_mov_b32"
             && let [src] = plain(inst)?.src.as_slice()
             && self.term(inst, src)? == Term::Const(0)
@@ -617,7 +704,7 @@ impl Tracer<'_> {
             return self.selector_branches(
                 inst.read(Reg::V(*reg))?,
                 false,
-                &here,
+                here,
                 resources,
                 used,
                 bias,
@@ -671,12 +758,19 @@ impl Tracer<'_> {
             out.coarse.push(index);
         }
         if let Some(columns) = &mut out.packed {
-            if let Some(column) = self.packed_material_column(inst, &here, resources, used, index, field, stride) {
+            if let Some(column) = self.packed_material_column(inst, here, resources, used, index, field, stride) {
                 if !columns.contains(&column) { columns.push(column); }
             } else {
                 // We can replace the coarse scan only if every reachable
                 // load has a bounded address chain.
                 out.packed = None;
+            }
+        }
+        if let Some(columns) = &mut out.ranges {
+            if let Some(column) = self.scalar_range_column(inst, here, resources, index, field, stride) {
+                if !columns.contains(&column) { columns.push(column); }
+            } else {
+                out.ranges = None;
             }
         }
         Some(())
@@ -736,6 +830,16 @@ impl Tracer<'_> {
             && inst.write(Reg::S(*code)) == Some(v)
         {
             return self.saved_mask(inst.read(Reg::S(EXEC))?, remaining);
+        }
+        if inst.name() == "s_and_saveexec_b64"
+            && let Fields::Sop {
+                dst: Some(Operand::Scalar { code, dwords: 2 }),
+                ..
+            } = &inst.fields
+            && *code < EXEC - 1
+            && let Some(half) = (0..2).find(|half| inst.write(Reg::S(*code + half)) == Some(v))
+        {
+            return self.saved_mask(inst.read(Reg::S(EXEC + half))?, remaining);
         }
         Some(v)
     }
@@ -932,7 +1036,7 @@ impl Tracer<'_> {
             return None;
         }
         let lanes = self.lanes?;
-        let (shift, input, mask, preheader) = self.wave32_waterfall_shift(load)?;
+        let (shift, input, [mask, _], preheader) = self.waterfall_shift(load)?;
         let masked = self.def(input)?;
         if masked.name() != "v_and_b32" {
             return None;
@@ -1000,7 +1104,7 @@ impl Tracer<'_> {
         })
     }
 
-    fn wave32_waterfall_shift(&self, load: Site) -> Option<(&Inst, Value, Value, usize)> {
+    fn waterfall_shift(&self, load: Site) -> Option<(&Inst, Value, [Value; 2], usize)> {
         let offset = self.first_lane_offset(load)?;
         let shifted = self.first_lane_source(offset)?;
         let shift = self.def(shifted)?;
@@ -1010,14 +1114,112 @@ impl Tracer<'_> {
         if shift.name() != "v_lshlrev_b32" || self.term(shift, bits)? != Term::Const(5) {
             return None;
         }
-        let (phi_block, phi_index) = self.phis[self.def(offset)?.read(Reg::S(EXEC))?.0 as usize]?;
+        let reader = self.def(offset)?;
         let block = &self.p.blocks[load.0];
-        if phi_block != load.0 || block.preds.len() != 2 || !block.preds.contains(&load.0) {
+        if block.preds.len() != 2 || !block.preds.contains(&load.0) {
             return None;
         }
         let pre = block.preds.iter().position(|&b| b != load.0)?;
-        let mask = block.phis[phi_index].args[pre];
-        Some((shift, shift.read(Reg::V(*reg))?, mask, block.preds[pre]))
+        let entry = |reg| {
+            let (b, phi) = self.phis[reader.read(Reg::S(reg))?.0 as usize]?;
+            (b == load.0).then(|| block.phis[phi].args[pre])
+        };
+        let low = entry(EXEC)?;
+        let high = if self.p.wave64 { entry(EXEC + 1)? } else { low };
+        Some((shift, shift.read(Reg::V(*reg))?, [low, high], block.preds[pre]))
+    }
+
+    /// Check the native EXEC values directly so a wave-wide scalar branch
+    /// cannot introduce an unknown masked-off VGPR predecessor.
+    fn wave64_write_covers_entry(&self, entry: [Value; 2], inst: &Inst) -> Option<bool> {
+        let saved = |[lo, hi]: [Value; 2]| Some([self.saved_mask(lo, &mut 64)?, self.saved_mask(hi, &mut 64)?]);
+        let read_exec = |inst: &Inst| Some([inst.read(Reg::S(EXEC))?, inst.read(Reg::S(EXEC + 1))?]);
+        let written = read_exec(inst)?;
+        if entry == written {
+            return Some(true);
+        }
+        let entry = saved(entry)?;
+        let written = saved(written)?;
+        if entry == written {
+            return Some(true);
+        }
+        let restrict = self.def(entry[0])?;
+        if restrict.name() != "s_and_saveexec_b64"
+            || [restrict.write(Reg::S(EXEC))?, restrict.write(Reg::S(EXEC + 1))?] != entry
+        {
+            return Some(false);
+        }
+        // The implicit result of AND_SAVEEXEC is a subset of its incoming EXEC.
+        Some(saved(read_exec(restrict)?)? == written)
+    }
+
+    /// A split Wave64 can retain the original retry loop even when the
+    /// per-lane analysis cannot eliminate it. Bound only its sampled slots;
+    /// do not turn it into per-lane descriptor accesses.
+    pub(super) fn native_retry_buffer_index(
+        &self,
+        load: Site,
+        resources: &Resources,
+        used: &[UsedResource],
+    ) -> Option<BufferIndex> {
+        if !self.p.wave64 || self.stage != HwStage::Cs || load.1 != 2 {
+            return None;
+        }
+        let block = &self.p.blocks[load.0];
+        if block.preds.len() != 2 || !matches!(block.exit, Exit::Branch { taken, not_taken }
+            if taken == load.0 && not_taken != load.0)
+        {
+            return None;
+        }
+        let back = block.preds.iter().position(|&pred| pred == load.0)?;
+        let [reader, select, descriptor, body @ .., retry, repeat] = block.insts.as_slice() else {
+            return None;
+        };
+        let sample = match body {
+            [sample] => sample,
+            [setup, sample] if setup.name() == "v_mov_b32" => sample,
+            _ => return None,
+        };
+        if reader.name() != "v_readfirstlane_b32" || select.name() != "v_cmpx_eq_u32"
+            || descriptor.name() != "s_load_dwordx8" || !matches!(sample.name(), "image_sample" | "image_sample_l")
+            || retry.name() != "s_andn2_wrexec_b64" || repeat.name() != "s_cbranch_execnz"
+            || !std::ptr::eq(reader, self.def(self.first_lane_offset(load)?)?)
+        {
+            return None;
+        }
+        let Fields::Sop { dst: Some(Operand::Scalar { code, dwords: 2 }), src, .. } = &retry.fields else {
+            return None;
+        };
+        if *code >= EXEC - 1 || !matches!(src.as_slice(), [Operand::Scalar { code: from, dwords: 2 }] if from == code) {
+            return None;
+        }
+        let entry = |v: Value, reg, next| {
+            let (b, i) = self.phis[v.0 as usize]?;
+            if b != load.0 { return None; }
+            let phi = &block.phis[i];
+            (phi.reg == reg && phi.args[back] == next).then(|| phi.args[1 - back])
+        };
+        for half in 0..2 {
+            let exec = Reg::S(EXEC + half);
+            let remain = Reg::S(*code + half);
+            let reader_exec = reader.read(exec)?;
+            let after_retry = retry.write(exec)?;
+            if select.read(exec)? != reader_exec || retry.read(exec)? != select.write(exec)?
+                || repeat.read(exec)? != after_retry
+            {
+                return None;
+            }
+            // CMPX intersects EXEC. The only image still uses that mask.
+            // WREXEC subtracts it from the saved remaining mask, which must
+            // start equal to EXEC and take the same retry result thereafter.
+            let start = entry(reader_exec, exec, after_retry)?;
+            let saved = entry(retry.read(remain)?, remain, retry.write(remain)?)?;
+            let save = self.def(saved)?;
+            if save.name() != "s_mov_b64" || save.read(exec) != Some(start) || save.write(remain) != Some(saved) {
+                return None;
+            }
+        }
+        self.structured_buffer_index(load, resources, used)
     }
 
     pub(super) fn structured_buffer_index(
@@ -1026,11 +1228,16 @@ impl Tracer<'_> {
         resources: &Resources,
         used: &[UsedResource],
     ) -> Option<BufferIndex> {
-        if self.p.wave64 || used.is_empty() {
+        if used.is_empty() || self.p.wave64
+            && (self.stage != HwStage::Cs || !self.image_only_in_waterfall(load, resources))
+        {
             return None;
         }
-        let (shift, input, mask, _) = self.wave32_waterfall_shift(load)?;
+        let (shift, input, entry, _) = self.waterfall_shift(load)?;
         let cvt = self.def(input).filter(|i| i.name() == "v_cvt_u32_f32");
+        if self.p.wave64 && cvt.is_some() {
+            return None;
+        }
         let word = if let Some(cvt) = cvt {
             let [Operand::Vector { reg, .. }] = plain(cvt)?.src.as_slice() else {
                 return None;
@@ -1062,9 +1269,14 @@ impl Tracer<'_> {
         {
             return None;
         }
-        let mask = self.saved_mask(mask, &mut 64)?;
+        let mask = if self.p.wave64 { entry[0] } else { self.saved_mask(entry[0], &mut 64)? };
         for inst in [Some(read), cvt, Some(shift)].into_iter().flatten() {
-            if self.saved_mask(inst.read(Reg::S(EXEC))?, &mut 64)? != mask {
+            let covered = if self.p.wave64 {
+                self.wave64_write_covers_entry(entry, inst)?
+            } else {
+                self.saved_mask(inst.read(Reg::S(EXEC))?, &mut 64)? == mask
+            };
+            if !covered {
                 return None;
             }
         }

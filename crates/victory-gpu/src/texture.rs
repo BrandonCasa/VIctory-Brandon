@@ -71,6 +71,7 @@ pub(crate) struct Staging {
     /// without memory of its own when the staging buffer was made.
     on_demand: bool,
     sparse_image: Option<std::sync::Weak<crate::resource::HostTexture>>,
+    linear_null: bool,
     native_null: std::sync::atomic::AtomicBool,
     null_levels: std::sync::atomic::AtomicU32,
     /// For such a texture: the levels that were the title's at the last
@@ -1270,7 +1271,7 @@ pub(crate) fn missing_view(uploads: &[&PreludeUpload], view: ViewRange) -> Optio
                         .collect::<Vec<_>>()
                 });
                 drop(mapping);
-                tracing::warn!(image = s.serial, memory = format_args!("{source:#x}"), ?part, first = s.first,
+                tracing::warn!(image = s.serial, format = s.shape[2], memory = format_args!("{source:#x}"), ?part, first = s.first,
                     base = s.level0, ?captured, mapping_stable, ?spans, desc = ?s.layout.desc, "required texture backing");
                 continue;
             }
@@ -1278,7 +1279,7 @@ pub(crate) fn missing_view(uploads: &[&PreludeUpload], view: ViewRange) -> Optio
                 let start = source + r.start;
                 (format!("{start:#x}"), r.len(), mapped_bytes(start as *const u8, r.len()))
             }).collect::<Vec<_>>());
-            tracing::warn!(image = s.serial, memory = format_args!("{source:#x}"), ?part, first = s.first,
+            tracing::warn!(image = s.serial, format = s.shape[2], memory = format_args!("{source:#x}"), ?part, first = s.first,
                 base = s.level0, ?captured, ?spans, desc = ?s.layout.desc, "required texture backing");
         }
     }
@@ -1799,6 +1800,17 @@ fn null_sample_block(format: u32) -> Option<&'static [u8]> {
     }
 }
 
+fn linear_1d_null_sample(layout: &victory_formats::texture::Layout, format: u32, native_depth: bool) -> bool {
+    use victory_formats::texture::{Dimension, Swizzle};
+    let desc = &layout.desc;
+    // Zero bits encode numeric zero in the RGBA8, RG16 and R32 color
+    // families. Keep the native view's channel defaults and component mapping.
+    !native_depth && matches!(format, 27..=39 | 41..=43)
+        && desc.dimension == Dimension::Tex1d && desc.swizzle == Swizzle::LINEAR
+        && desc.mips == 1 && layout.slices == 1 && desc.samples == 1
+        && desc.element_bytes == 4 && desc.block == 1
+}
+
 fn fill_null_blocks(bytes: &mut [u8], block: &[u8]) {
     if bytes.is_empty() { return; }
     if block.iter().all(|&v| v == 0) { bytes.fill(0); return; }
@@ -1809,6 +1821,32 @@ fn fill_null_blocks(bytes: &mut [u8], block: &[u8]) {
         bytes.copy_within(..count, filled);
         filled += count;
     }
+}
+
+/// Xbox page mappings address encoded texels or blocks before detiling.
+/// Preserve live pages even when part of a subresource is explicitly NULL.
+fn capture_sparse_blocks(start: usize, at: usize, out: &mut [u8], block: &[u8]) -> Option<usize> {
+    if !crate::inplace::sparse_range(at, out.len()) { return None; }
+    if (at - start) % block.len() == 0 && crate::inplace::sparse_null_range(at, out.len()) {
+        fill_null_blocks(out, block);
+        return Some(0);
+    }
+    let mut copied = 0;
+    let mut offset = 0;
+    while offset < out.len() {
+        let address = at + offset;
+        let count = (0x10000 - (address & 0xffff)).min(out.len() - offset);
+        let part = &mut out[offset..offset + count];
+        if crate::inplace::sparse_null_range(address, count) {
+            let phase = (address - start) % block.len();
+            if phase != 0 || part.len() % block.len() != 0 { return None; }
+            fill_null_blocks(part, block);
+        } else if crate::host::read_into(address as *const u8, part) {
+            copied += count;
+        } else { return None; }
+        offset += count;
+    }
+    Some(copied)
 }
 
 impl Staging {
@@ -2248,30 +2286,16 @@ impl Staging {
         (coverage, bytes)
     }
 
-    /// Xbox page mappings address the encoded texels or blocks before detiling.
-    /// A partially resident mip can have valid artwork on one page and NULL
-    /// texels on its neighbour, even inside a single native mip level.
     fn read_sparse_blocks(&self, at: usize, out: &mut [u8]) -> Option<usize> {
-        if !crate::inplace::sparse_range(at, out.len()) { return None; }
-        let block = null_sample_block(self.shape[2])?;
-        if (at - self.memory as usize) % block.len() == 0 && crate::inplace::sparse_null_range(at, out.len()) {
-            fill_null_blocks(out, block);
-            return Some(0);
-        }
-        let mut copied = 0;
-        let mut offset = 0;
-        while offset < out.len() {
-            let address = at + offset;
-            let count = (0x10000 - (address & 0xffff)).min(out.len() - offset);
-            let part = &mut out[offset..offset + count];
-            if crate::inplace::sparse_null_range(address, count) {
-                let phase = (address - self.memory as usize) % block.len();
-                if phase != 0 || part.len() % block.len() != 0 { return None; }
-                fill_null_blocks(part, block);
-            } else if crate::host::read_into(address as *const u8, part) {
-                copied += count;
-            } else { return None; }
-            offset += count;
+        let format = self.shape[2];
+        let block = if self.linear_null { &[0; 4] } else { null_sample_block(format)? };
+        let copied = capture_sparse_blocks(self.memory as usize, at, out, block)?;
+        #[cfg(feature = "diagnostics")]
+        if self.linear_null && copied < out.len() && crate::switch::on("VICTORY_TRACE_TEXTURE_OWNER") {
+            static FIRST: [std::sync::Once; 17] = [const { std::sync::Once::new() }; 17];
+            FIRST[(format - 27) as usize].call_once(|| tracing::info!(image = self.serial, format,
+                address = format_args!("{at:#x}"), bytes = out.len(), copied, width = self.layout.desc.width,
+                "staged explicit NULL Tex1D pages as zero texels"));
         }
         Some(copied)
     }
@@ -2868,6 +2892,8 @@ fn staging_for(resource: This, copy: &Arc<crate::resource::HostTexture>, first: 
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(storage.allocated(total), std::sync::atomic::Ordering::Relaxed);
+    let linear_null = !on_demand && linear_1d_null_sample(&layout, desc.shape()[2],
+        d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0);
     let s = Arc::new(Staging {
         storage: Mutex::new(storage),
         footprints,
@@ -2890,6 +2916,7 @@ fn staging_for(resource: This, copy: &Arc<crate::resource::HostTexture>, first: 
         on_demand,
         sparse_image: (on_demand && null_sample_block(desc.shape()[2]).is_some()
             && crate::inplace::sparse_range(memory as usize, read)).then(|| Arc::downgrade(copy)),
+        linear_null,
         native_null: Default::default(),
         null_levels: Default::default(),
         detiled: std::sync::atomic::AtomicU32::new(0),
@@ -3105,6 +3132,54 @@ mod prelude_upload_tests {
         super::fill_null_blocks(&mut texels, block);
         assert_eq!(texels, [0; 8]);
         assert_eq!(super::null_sample_block(DXGI_FORMAT_R16_TYPELESS.0 as u32), Some(block));
+    }
+
+    #[test]
+    fn linear_1d_null_texels_require_an_unbiased_color_format_and_single_subresource() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let desc = Desc { dimension: Dimension::Tex1d, width: 129, height: 1, depth: 1,
+            mips: 1, element_bytes: 4, block: 1, samples: 1, swizzle: Swizzle::LINEAR };
+        let layout = Layout::new(&desc).unwrap();
+        for format in (27..=39).chain(41..=43) {
+            assert!(super::linear_1d_null_sample(&layout, format, false));
+        }
+        for format in [24, 40, 87, 88, 89] {
+            assert!(!super::linear_1d_null_sample(&layout, format, false));
+        }
+        assert!(!super::linear_1d_null_sample(&layout, 39, true));
+        for other in [Desc { dimension: Dimension::Tex2d, ..desc }, Desc { depth: 2, ..desc },
+            Desc { mips: 2, ..desc }, Desc { swizzle: Swizzle::SW_4KB_S, ..desc }]
+        {
+            assert!(!super::linear_1d_null_sample(&Layout::new(&other).unwrap(), 28, false));
+        }
+    }
+
+    #[test]
+    fn sparse_texel_capture_keeps_the_mapped_bytes_beside_a_declared_null_page() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE: usize = 0x10000;
+        // SAFETY: this private reservation is committed and released only here.
+        unsafe {
+            let at = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert_ne!(at, 0);
+            crate::inplace::title_placeholder_reserved(at, 2 * PAGE);
+            let mapped = (at + PAGE) as *mut u8;
+            assert_eq!(VirtualAlloc(mapped.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), mapped.cast());
+            mapped.write_bytes(0x5a, PAGE);
+            let start = at + PAGE - 256;
+            let mut output = [0x77; 768];
+            {
+                let _mapping = crate::watch::title_memory_reading();
+                assert_eq!(super::capture_sparse_blocks(start, start, &mut output, &[0; 4]), None);
+                crate::inplace::title_gpu_mapping_ranges(&[(at as u64, 0, PAGE as u64)]);
+                assert_eq!(super::capture_sparse_blocks(start, start, &mut output[..256], &[0; 4]), Some(0));
+                assert_eq!(super::capture_sparse_blocks(start, start, &mut output, &[0; 4]), Some(512));
+            }
+            assert!(crate::inplace::release_title_placeholder(at, 0,
+                || VirtualFree(at as *mut _, 0, MEM_RELEASE) != 0));
+            assert_eq!(output[..256], [0; 256]);
+            assert_eq!(output[256..], [0x5a; 512]);
+        }
     }
 
     #[test]

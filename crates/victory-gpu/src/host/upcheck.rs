@@ -774,6 +774,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bounded_uav_selector_checks_only_writes_before_its_command() {
+        use crate::descriptor::host::IndexedSlots;
+        use crate::descriptor::index_words::{IndexWords, SampleWords};
+        use crate::descriptor::{create_srv, create_uav, heap, test_view_heap};
+        use crate::object::{This, slot};
+
+        let Some(host) = host() else { return };
+        const COUNT: u32 = 64;
+        const WRITER: u32 = 17;
+        let null = std::ptr::null();
+        let handle = test_view_heap(COUNT);
+        let views = heap(handle);
+        let buffer = crate::resource::test_buffer(4096);
+        let (data, _) = crate::resource::buffer_bytes(buffer).unwrap();
+        // The selector and the UAV share the first 16 bytes of this test buffer.
+        unsafe { data.cast::<u32>().write_unaligned(WRITER.to_le()) };
+        let source = views.handle(0).unwrap();
+        let target = views.handle(WRITER).unwrap();
+        create_srv(null, buffer, &[39, 1, 5768, 0, 0, 0, 4, 0, 1, 0], source);
+        create_uav(null, buffer, null, &[39, 1, 0, 0, 4, 0, 0, 0, 1, 0], target);
+        views.host().unwrap().mirror(0, source, true);
+        let word = IndexWords::capture(views, source, None, 0, 0, 0, Some((0, 1, 16, false)), u32::MAX).unwrap();
+        let words = || vec![SampleWords::direct(Some(word.clone()), None)];
+        let list = host.new_list().unwrap();
+        let proof = list.recording_buffer_selection(words(), COUNT).expect("selector before writer");
+        assert_eq!(proof.slots().iter().copied().collect::<Vec<_>>(), [WRITER]);
+
+        let writer = IndexedSlots {
+            exact: [(WRITER, 4 | victory_shader::emit::BUFFER_WRITE_ACCESS)].into_iter().collect(),
+            ..Default::default()
+        };
+        list.observe_view_heap(views, &writer, 0x40);
+        let at = data as usize;
+        assert_eq!(list.indexed_write_ranges().unwrap(), [(at, at + 16)]);
+        assert!(proof.stays_current(Some(&[])), "later same-list writer cannot change an earlier selector");
+        assert!(list.recording_buffer_selection(words(), COUNT).is_none(), "an earlier same-list writer prevents CPU proof");
+        assert!(!proof.stays_current(Some(&[(at, at + 4)])), "a preceding list can change the selected word");
+
+        list.close();
+        drop(list);
+        let release = |object| slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        release(handle);
+        release(buffer);
+    }
+
+    #[test]
     fn notes_are_cut_to_whole_words() {
         // Bytes 5..18 of a copy: the words at 8 and 12.
         let (was, new): (Vec<u8>, Vec<u8>) = ((5..18).collect(), (105..118).collect());

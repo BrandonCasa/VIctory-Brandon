@@ -38,6 +38,11 @@ impl ScalarPrograms {
     }
 
     pub(super) fn evaluate(&self, writes: &[(usize, usize)], limit: u32, out: &mut BTreeSet<u32>, device: Option<&DeviceBytes>, pending: &mut DeviceRanges) -> bool {
+        self.evaluate_values(writes, device, pending, |slot| insert_slot(slot, 0, limit, out))
+    }
+
+    pub(super) fn evaluate_values(&self, writes: &[(usize, usize)], device: Option<&DeviceBytes>,
+        pending: &mut DeviceRanges, mut emit: impl FnMut(u32)) -> bool {
         let mut complete = true;
         let mut words = BTreeMap::new();
         for code in &self.programs {
@@ -46,7 +51,7 @@ impl ScalarPrograms {
                     .dependent_word(at, writes, device, pending))
             });
             if let Some(slot) = value {
-                insert_slot(slot, 0, limit, out);
+                emit(slot);
             } else {
                 complete = false;
             }

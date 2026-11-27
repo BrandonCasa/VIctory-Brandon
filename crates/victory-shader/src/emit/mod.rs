@@ -340,7 +340,9 @@ pub struct IndexedAccess {
     pub uav_indices: Vec<(crate::resource::BufferIndex, u8, bool)>,
     /// Structured record fields selecting buffer UAV slots, with their access forms.
     pub buffer_uav_indices: Vec<(crate::resource::BufferIndex, u8)>,
+    pub fixed_record_columns: Vec<(crate::resource::FixedRecordColumn, u8)>,
     pub packed_material: Vec<(crate::resource::PackedMaterialColumn, u8)>,
+    pub scalar_range_columns: Vec<(crate::resource::ScalarRangeColumn, u8)>,
     pub chains: Vec<(crate::resource::MaterialChain, u8)>,
     pub scalar_records: Vec<(crate::resource::ScalarRecordChain, u8)>,
     pub pointer_fields: Vec<(crate::resource::PointerField, u8)>,

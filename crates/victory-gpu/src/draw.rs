@@ -897,7 +897,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb.saturating_mul(1 << 20))
     });
-    let shadow = crate::shadow::find(address, 1)?;
+    let shadow = if srv { crate::shadow::find_root(address) } else { crate::shadow::find(address, 1) }?;
     let len = shadow.left(address);
     if !srv && len > 1 << 16 {
         return None;
@@ -908,7 +908,10 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         list.keep(&shadow.buffer);
         #[cfg(feature = "diagnostics")]
-        crate::book::root(gpu, len);
+        {
+            crate::book::root(gpu, len);
+            if srv { shadow.note_root_binding(address, false); }
+        }
         return Some(gpu);
     }
     if shadow.written() || shadow.in_place() {
@@ -1414,8 +1417,10 @@ impl State {
         }
         {
             // Late indexed SRVs may refer to another mip of a bound target.
+            let trace_targets = crate::host::trace_selector_slot().is_some();
             let colors = views.iter().zip(&now.0).filter_map(|((texture, _), (ptr, (_, words)))| {
-                (unsafe { texture.as_ref()?.GetDesc() }.MipLevels > 1).then_some((*ptr, false, *words))
+                (unsafe { texture.as_ref()?.GetDesc() }.MipLevels > 1 || trace_targets)
+                    .then_some((*ptr, false, *words))
             });
             let depth = dsv.as_ref().and_then(|(texture, record)| {
                 (cfg!(feature = "diagnostics") || unsafe { texture.GetDesc() }.MipLevels > 1)
@@ -1596,7 +1601,7 @@ impl State {
             // (`root_uav`, `root_srv_table`).
             // shortcut: found again here, not taken from the list's slot.
             return match self.roots_ref(compute).get(usize::from(slot)) {
-                Some(&Root::View(address)) => crate::shadow::find(address, 1).map_or(0, |s| {
+                Some(&Root::View(address)) => crate::shadow::find_root(address).map_or(0, |s| {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
                     ((s.gpu(address) - base) & 15) as u32
@@ -2182,7 +2187,7 @@ impl State {
                     return false;
                 }
                 if let Some(a) = address.filter(|_| t.stores) {
-                    if let Some(shadow) = crate::shadow::find(a, 1) {
+                    if let Some(shadow) = crate::shadow::find_root(a) {
                         aliases.root_writes.push((a, a.saturating_add(shadow.left(a))));
                     } else {
                         aliases.unknown_writer = true;
@@ -2243,7 +2248,7 @@ impl State {
                 .map_or(u64::MAX, |mb| mb << 20)
         });
         let find = |a: u64| {
-            let s = crate::shadow::find(a, 1)?;
+            let s = crate::shadow::find_root(a)?;
             // SAFETY: a live buffer.
             let flags = unsafe { s.buffer.GetDesc() }.Flags;
             if flags.0 & UNORDERED == 0 {
@@ -2270,7 +2275,8 @@ impl State {
             // From the 16 bytes below: the shader adds the rest.
             // SAFETY: a live buffer.
             let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-            let gpu = base + ((s.gpu(a) - base) & !15);
+            let offset = s.gpu(a) - base;
+            let gpu = base + (offset & !15);
             // SAFETY: an open list; the address is in a live buffer.
             unsafe {
                 if compute {
@@ -2279,6 +2285,8 @@ impl State {
                     list.list.SetGraphicsRootUnorderedAccessView(param, gpu);
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            s.note_root_binding(a.saturating_sub(offset & 15), true);
             return true;
         }
         let heap = match self.heaps[0] {
@@ -2310,6 +2318,8 @@ impl State {
                     // builder's counters are at such addresses.)
                     let bias = offset & 15;
                     host.raw_uav_at(index, &s.buffer, offset - bias, s.left(*a).min(limit) + bias);
+                    #[cfg(feature = "diagnostics")]
+                    s.note_root_binding(a.saturating_sub(bias), true);
                 }
                 if shadow.is_none() {
                     host.null_raw_uav_at(index);
@@ -2369,7 +2379,7 @@ impl State {
             None => {
                 let shadow = match constant {
                     Some(b) => Some((b.address, b.source.clone())),
-                    None => address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s))),
+                    None => address.and_then(|a| crate::shadow::find_root(a).map(|s| (a, s))),
                 };
                 let Some(index) = host.dynamic(1) else {
                     return false;
@@ -2392,8 +2402,12 @@ impl State {
                             let bytes = constant.map_or_else(|| s.left(*a), |b| u64::from(b.bytes));
                             let len = (bytes + bias).next_multiple_of(4).min(room);
                             host.raw_at(index, &s.buffer, from, len);
+                            #[cfg(feature = "diagnostics")]
+                            s.note_root_binding(a.saturating_sub(bias), false);
                         } else if offset.is_multiple_of(16) {
                             host.raw_at(index, &s.buffer, offset, s.left(*a));
+                            #[cfg(feature = "diagnostics")]
+                            s.note_root_binding(*a, false);
                         } else {
                             // Raw views start on 16 bytes; one from the
                             // aligned start would shift every read.
@@ -2471,7 +2485,7 @@ impl State {
             }
             slots.opaque |= 8;
         }
-        use crate::descriptor::index_words::{DependentWords, MaterialWords, PackedMaterialWords, SampleWords};
+        use crate::descriptor::index_words::{DependentWords, FixedRecordWords, MaterialWords, PackedMaterialWords, SampleWords, ScalarPrograms, ScalarRangeWords};
         let capture = |(table_slot, table_dword)| self.buffer_index(victory_shader::resource::BufferIndex {
             table_slot, table_dword, word: victory_shader::resource::HeapOffset { bytes: 0, constant: None },
             word_step: 0, bytes: 0, guard: None, records: None, value_mask: u32::MAX,
@@ -2536,6 +2550,31 @@ impl State {
             let words = capture(parent).zip(capture(records)).and_then(|(parent, records)|
                 PackedMaterialWords::new(parent, records, columns));
             bind(words.map(DependentWords::PackedMaterial), kind);
+        }
+        let mut fixed = std::collections::BTreeMap::new();
+        for &(column, kind) in &access.fixed_record_columns {
+            fixed.entry((column.table, column.stride, column.count, kind))
+                .or_insert_with(Vec::new).push(column);
+        }
+        for ((table, _, _, kind), columns) in fixed {
+            let words = capture(table).and_then(|source| FixedRecordWords::new(source, columns));
+            bind(words.map(DependentWords::FixedRecord), kind);
+        }
+        let mut scalar_ranges: Vec<(u8, Vec<&victory_shader::resource::ScalarRangeColumn>)> = Vec::new();
+        for (column, kind) in &access.scalar_range_columns {
+            let group = scalar_ranges.iter_mut().find(|(group_kind, columns)| {
+                let first = columns[0];
+                *group_kind == *kind && first.records == column.records && first.count == column.count
+                    && first.record_stride == column.record_stride && first.base == column.base
+            });
+            if let Some((_, columns)) = group { columns.push(column); }
+            else { scalar_ranges.push((*kind, vec![column])); }
+        }
+        for (kind, columns) in scalar_ranges {
+            let first = columns[0];
+            let words = ScalarPrograms::capture(vec![first.base.clone()], capture).zip(capture(first.records))
+                .and_then(|(base, records)| ScalarRangeWords::new(base, records, &columns));
+            bind(words.map(DependentWords::ScalarRange), kind);
         }
         slots.words_only = words_only && !slots.words.is_empty();
         let mut uav_words_only = access.opaque & 16 == 0;

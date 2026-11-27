@@ -1741,6 +1741,28 @@ pub(crate) fn placed_view_spans(this: This, view: &crate::descriptor::View) -> O
     Some(spans)
 }
 
+/// Byte span an ordered, narrowed upload would read for this placed SRV.
+#[cfg(windows)]
+pub(crate) fn placed_upload_prefix(this: This, view: &crate::descriptor::View, copy: &HostTexture) -> Option<(usize, usize)> {
+    let crate::descriptor::View::Shader(_, Some(desc)) = view else { return None };
+    if desc[1] != 4 || desc[6] != 0 { return None; }
+    let (_, start, whole) = placed_span(this)?;
+    let (layout, at, _) = title_texture(this)?;
+    if at != start || layout.slices != 1 || layout.desc.swizzle.xor() { return None; }
+    let view = crate::texture::ViewRange::for_view(view)?;
+    // The same clamping used by texture::staging_for for this retained image.
+    let native_mips = u32::from(unsafe { copy.texture.GetDesc() }.MipLevels);
+    let last = copy.base.checked_add(native_mips)?.checked_sub(1)?;
+    if !(copy.base..=last).contains(&view.mip()) { return None; }
+    let first = read_from(&layout, view.mip()).max(copy.base).min(last);
+    let len = usize::try_from(layout.bytes_from(first)).ok()?;
+    if len == 0 || len >= whole || !view.storage_runs(&layout)?.iter().all(|run| run.end <= len) {
+        return None;
+    }
+    at.checked_add(len)?;
+    Some((at, len))
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn live_texture_description(id: usize) -> Option<(usize, ResourceDesc)> {
     let live = textures();
@@ -3922,6 +3944,25 @@ mod tests {
         assert!(!matches(ResourceDesc { width: 1280, ..view }));
         assert!(!matches(ResourceDesc { flags: 0, ..view }));
         assert!(!matches(ResourceDesc { format: 10, ..view }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bc1_tail_view_excludes_the_aliased_main_mip() {
+        let desc = ResourceDesc { layout: 0x105, flags: 0x300000, ..texture(1024, 1024, 71, 9) };
+        let texture = texture_layout(&desc).unwrap();
+        let layout = &texture.planes[0].layout;
+        let view = crate::descriptor::View::Shader(1, Some([71, 4, 5768, 0, 8, 1, 0, 0, 0, 0]));
+        let range = crate::texture::ViewRange::for_view(&view).unwrap();
+        let first = read_from(layout, range.mip());
+
+        assert_eq!(range.mip(), 8);
+        assert!(!range.includes(0, 0));
+        assert_eq!(footprint(&desc).unwrap().size, 0xab000);
+        assert_eq!(layout.bytes_from(first), 0x1000);
+        assert_eq!(range.storage_runs(layout).unwrap(), [0..0x1000]);
+        let main: Vec<_> = layout.subresource_runs(0, 0).unwrap().collect();
+        assert_eq!(main, [0x2b000..0xab000]);
     }
 
     #[cfg(windows)]

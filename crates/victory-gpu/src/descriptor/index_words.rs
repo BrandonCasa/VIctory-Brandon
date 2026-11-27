@@ -10,7 +10,7 @@ mod scalar_records;
 mod scalar_program;
 pub(crate) use scalar_program::ScalarPrograms;
 pub(crate) use material_chain::{IndirectGroups, MaterialWords};
-pub(crate) use scalar_records::{DependentWords, PackedMaterialWords};
+pub(crate) use scalar_records::{DependentWords, FixedRecordWords, PackedMaterialWords, ScalarRangeWords};
 
 struct NativeOwner<T>(Weak<T>);
 impl<T> Clone for NativeOwner<T> {
@@ -193,11 +193,11 @@ pub(crate) const WIDE_SELECTOR_READ_BUDGET: usize = 512 * 1024;
 
 impl RecordWindow {
     // Tiny sparse gathers cost at most 64 copy commands. For larger compact
-    // tables copy one interval and extract its columns from that snapshot.
-    // Integer scans can share the wide snapshot of the same raw view.
+    // integer tables copy one interval regardless of stride. Closely spaced
+    // integer columns can also share the wide snapshot of the same raw view.
     fn copy_interval(self) -> bool {
-        let budget = if self.float { SELECTOR_READ_BUDGET } else { WIDE_SELECTOR_READ_BUDGET };
-        self.words > 64 && self.stride <= 16 && self.len() <= budget
+        let budget = if !self.float && self.stride <= 16 { WIDE_SELECTOR_READ_BUDGET } else { SELECTOR_READ_BUDGET };
+        self.words > 64 && (!self.float || self.stride <= 16) && self.len() <= budget
     }
 }
 
@@ -244,15 +244,19 @@ impl SampleWords {
             #[cfg(feature = "diagnostics")]
             if let Some(bytes) = device {
                 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-                static USES: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+                static USES: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
                 let scalar = matches!(**chain, DependentWords::Scalar { .. });
                 let fields = matches!(**chain, DependentWords::Fields { .. });
                 let program = matches!(**chain, DependentWords::Programs(_));
                 let packed = matches!(**chain, DependentWords::PackedMaterial(_));
-                let kind = usize::from(scalar) + 2 * usize::from(fields) + 3 * usize::from(program) + 4 * usize::from(packed);
+                let fixed = matches!(**chain, DependentWords::FixedRecord(_));
+                let scalar_range = matches!(**chain, DependentWords::ScalarRange(_));
+                let kind = usize::from(scalar) + 2 * usize::from(fields) + 3 * usize::from(program)
+                    + 4 * usize::from(packed) + 5 * usize::from(fixed) + 6 * usize::from(scalar_range);
                 let uses = USES[kind * 2 + usize::from(complete)].fetch_add(1, Relaxed) + 1;
                 if uses.is_power_of_two() {
-                    tracing::info!(uses, complete, scalar_records=scalar, pointer_fields=fields, scalar_program=program, packed_material=packed, native_spans=bytes.len(), still_missing=missing.len(),
+                    tracing::info!(uses, complete, scalar_records=scalar, pointer_fields=fields, scalar_program=program, packed_material=packed,
+                        fixed_record_column=fixed, scalar_range, native_spans=bytes.len(), still_missing=missing.len(),
                         sampled=out.len(), "validated a dependent material selector");
                 }
             }
@@ -559,6 +563,29 @@ mod tests {
         assert_eq!(slots, std::iter::once(0).chain(200..296).collect());
         assert!(!RecordWindow::integer_column(4, 8, 1 << 20).unwrap().copy_interval());
         assert!(!RecordWindow::integer_column(4, 32, 128 << 10).unwrap().copy_interval());
+    }
+
+    #[test]
+    fn compact_integer_columns_can_copy_a_larger_stride_within_budget() {
+        const STRIDE: u32 = 128;
+        const RECORDS: u32 = 146;
+        const FIELD: u32 = 36;
+        let mut bytes = vec![0x99; (STRIDE * RECORDS) as usize];
+        for row in 0..RECORDS {
+            let at = (row * STRIDE + FIELD) as usize;
+            bytes[at..at + 4].copy_from_slice(&(200 + row).to_le_bytes());
+        }
+        let interval = RecordWindow::integer_column(FIELD, STRIDE, bytes.len() as u64).unwrap();
+        assert_eq!(interval.words, RECORDS);
+        assert!(interval.copy_interval());
+        let mut slots = BTreeSet::new();
+        interval.decode(&bytes[FIELD as usize..][..interval.len()], u32::MAX, 0, 1024, &mut slots);
+        assert_eq!(slots, std::iter::once(0).chain(200..200 + RECORDS).collect());
+
+        let floats = RecordWindow::new(FIELD, 0, RECORDS, STRIDE, bytes.len() as u64, true).unwrap();
+        assert!(!floats.copy_interval());
+        let oversized = RecordWindow::integer_column(FIELD, STRIDE, (2 * SELECTOR_READ_BUDGET) as u64).unwrap();
+        assert!(!oversized.copy_interval());
     }
 
     #[test]

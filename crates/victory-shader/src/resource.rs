@@ -169,6 +169,17 @@ pub struct IndexRecords {
     pub stride: u32,
 }
 
+/// A texture slot read from one field of a bounded, zero-based record table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FixedRecordColumn {
+    pub table: (u8, u32),
+    pub field: u32,
+    pub stride: u32,
+    pub count: u32,
+    pub bytes: u32,
+    pub value_mask: u32,
+}
+
 mod structured_index;
 mod guarded_index;
 mod material_chain;
@@ -200,6 +211,18 @@ pub struct PackedMaterialColumn {
     pub record_stride: u32,
     pub handle_field: u32,
     pub bytes: u32,
+}
+
+/// A sampled descriptor in one field of the rows reached from a scalar base.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ScalarRangeColumn {
+    pub base: Vec<ScalarWordOp>,
+    pub records: (u8, u32),
+    pub count: u32,
+    pub record_stride: u32,
+    pub handle_field: u32,
+    pub bytes: u32,
+    pub zero_record: bool,
 }
 
 /// Uniform SRV reads that select a record and walk its signed-count member list.
@@ -261,7 +284,9 @@ pub struct Resources {
     pub buffer_indices: Vec<(Site, BufferIndex)>,
     /// Fields selecting the UAV of a typed buffer store waterfall.
     pub buffer_uav_indices: Vec<(Site, BufferIndex)>,
+    pub fixed_record_columns: Vec<(Site, FixedRecordColumn)>,
     pub packed_material: Vec<(Site, PackedMaterialColumn)>,
+    pub scalar_range_columns: Vec<(Site, ScalarRangeColumn)>,
     pub chains: Vec<(Site, MaterialChain)>,
     pub scalar_records: Vec<(Site, ScalarRecordChain)>,
     pub pointer_fields: Vec<(Site, PointerField)>,
@@ -505,6 +530,9 @@ pub(crate) fn track_with_used(
                     out.scalar_programs.push((site,program));
                     continue;
                 }
+                if let Some(column) = t.fixed_record_column(address, index, &out) {
+                    out.fixed_record_columns.push((site, column));
+                }
                 out.buffer_indices.push((site, index));
                 continue;
             }
@@ -558,17 +586,24 @@ pub(crate) fn track_with_used(
         if let Some(index) = t.waterfall_buffer_index(load, &out)
             .or_else(|| t.structured_buffer_index(load, &out, used)) {
             out.buffer_indices.push((load, index));
-        } else if let Some((indices, packed)) = t.structured_indices(load, &out, used) {
+        } else if let Some((indices, packed, ranges)) = t.structured_indices(load, &out, used) {
             out.buffer_indices.extend(indices.into_iter().map(|index| (load, index)));
             out.packed_material.extend(packed.into_iter().map(|index| (load, index)));
+            out.scalar_range_columns.extend(ranges.into_iter().map(|range| (load, range)));
         }
     }
-    // SMEM descriptor fields also supply numeric texture queries. These
-    // have no image instruction for the ordinary waterfall pass to visit.
+    // A retry loop retained in the translation can still bound its sampled
+    // slots. Numeric texture queries have their own proof because they can
+    // use the descriptor even when no image instruction executes.
     for &(load, addr) in &out.scalar {
-        if !out.waterfall.loads.contains(&load) && t.p.wave64
-            && t.layout.get(addr.param).is_some_and(|p| p.root == RootType::ResourceHeap)
-            && let Some((indices, _)) = t.structured_indices(load, &out, used) {
+        if out.waterfall.loads.contains(&load) || !t.p.wave64
+            || !t.layout.get(addr.param).is_some_and(|p| p.root == RootType::ResourceHeap)
+        {
+            continue;
+        }
+        if let Some(index) = t.native_retry_buffer_index(load, &out, used) {
+            out.buffer_indices.push((load, index));
+        } else if let Some((indices, _, _)) = t.structured_indices(load, &out, used) {
             out.buffer_indices.extend(indices.into_iter().map(|index| (load, index)));
         }
     }
@@ -582,6 +617,12 @@ pub(crate) fn track_with_used(
                 }
                 Some(linked_fields::PixelFields::Words(words)) => {
                     for index in words { if !out.buffer_indices.contains(&(site,index)) {out.buffer_indices.push((site,index));} }
+                }
+                Some(linked_fields::PixelFields::Ranges(ranges)) => {
+                    for range in ranges {
+                        let entry = (site, range);
+                        if !out.scalar_range_columns.contains(&entry) { out.scalar_range_columns.push(entry); }
+                    }
                 }
                 None=>{}
             }
@@ -913,9 +954,20 @@ impl<'a> Tracer<'a> {
         let (term, extra, word_step) = match self.term(read, soffset) {
             Some(Term::Const(k)) => (None, k, 0),
             Some(Term::Value(v)) => {
-                let (v, constant) = match self.sop2(v, &["s_add_i32", "s_add_u32"]) {
-                    Some((_, [Term::Value(input), Term::Const(k)] | [Term::Const(k), Term::Value(input)])) => (input, k),
-                    _ => (v, 0),
+                let (v, constant) = if let Some((_, [Term::Value(input), Term::Const(k)] | [Term::Const(k), Term::Value(input)]))
+                    = self.sop2(v, &["s_add_i32", "s_add_u32"])
+                {
+                    (input, k)
+                } else if let Some(add) = self.def(v)
+                    && add.name() == "s_addk_i32"
+                    && let Fields::Sop { dst: Some(Operand::Scalar { code, dwords: 1 }), imm: Some(imm), .. } = &add.fields
+                    && add.write(Reg::S(*code)) == Some(v)
+                    && let Some(prior) = add.read(Reg::S(*code))
+                    && let Term::Value(input) = self.origin(prior)
+                {
+                    (input, i32::from(*imm as i16) as u32)
+                } else {
+                    (v, 0)
                 };
                 if let Some(root) = self.shifted_constant(v) {
                     (Some(root), constant, 0)
@@ -3050,6 +3102,67 @@ pub(crate) mod tests {
             assert_eq!((index.word_step, index.word.bytes, index.word.constant), (step, residue, None));
         }
         assert!(track(304, 4).buffer_indices.is_empty());
+    }
+
+    #[test]
+    fn root_indexed_buffer_word_uses_the_old_sopk_destination_and_signed_immediate() {
+        for (immediate, bytes) in [(0x0054, 84), (0xffac, 0xffff_ffac)] {
+            let r = track_words(
+                &[
+                    0xbe89_0380,                 // Zero-extend the table base in s[8:9].
+                    0xbed8_030f, 0xbed9_0380,   // Heap base in s[88:89].
+                    0xf408_1404, 0xfa00_0ac0,   // Read the SRV from table dword 688.
+                    0xb78e_0000 | immediate,    // s14 = root word plus signed immediate.
+                    0xf420_0968, 0x1c00_0000,   // Fetch a descriptor index at s14.
+                    0x8f5f_8525,                 // Convert the index to a byte offset.
+                    0xf40c_032c, 0xbe00_0000,   // Read the heap descriptor at that offset.
+                    S_ENDPGM,
+                ],
+                &[param(Table, 8, 1), RootParam { slot: 4, ..param(Constants, 13, 2) }, param(ResourceHeap, 15, 1)],
+                HwStage::Ps,
+            );
+            let [(_, index)] = r.buffer_indices.as_slice() else { panic!("{:?}", r.buffer_indices) };
+            assert_eq!(*index, BufferIndex {
+                table_slot: 0,
+                table_dword: 688,
+                word: HeapOffset { bytes, constant: Some((4, 1, 0)) },
+                word_step: 0,
+                bytes: 0,
+                guard: None,
+                records: None,
+                value_mask: u32::MAX,
+            });
+        }
+    }
+
+    #[test]
+    fn fixed_scalar_column_uses_the_unsigned_bitfield_domain_and_exact_stride() {
+        let track = |width: u32, stride: u32| track_words(
+            &[
+                0xbe89_0380,                 // Zero-extend the table base in s[8:9].
+                0xbec2_030f, 0xbec3_0380,   // Heap base in s[66:67].
+                0x880c_ff89, width << 16,   // s12 = encode bitfield at bit 9.
+                0x938b_0c0b,                 // s11 = s_bfe_u32(s11, s12).
+                0xb80b_0000 | stride,        // s11 *= stride.
+                0xf408_0504, 0xfa00_0000,   // Record SRV from table dword 0.
+                0x8119_840b,                 // s25 = s11 + 4.
+                0xf420_064a, 0x3200_0000,   // Read the heap slot at that offset.
+                0x8f0d_8519,                 // Scale the slot into a heap byte offset.
+                0xf40c_0521, 0x1a00_0000,   // Read the descriptor from the heap.
+                S_ENDPGM,
+            ],
+            &[param(Table, 8, 1), param(ResourceHeap, 15, 1)],
+            HwStage::Ps,
+        );
+        let r = track(9, 136);
+        let [(_, column)] = r.fixed_record_columns.as_slice() else {
+            panic!("{:?}", r.buffer_indices);
+        };
+        assert_eq!(*column, FixedRecordColumn {
+            table: (0, 0), field: 4, stride: 136, count: 512, bytes: 0, value_mask: u32::MAX,
+        });
+        assert!(track(10, 136).fixed_record_columns.is_empty());
+        assert!(track(9, 137).fixed_record_columns.is_empty());
     }
 
     #[test]

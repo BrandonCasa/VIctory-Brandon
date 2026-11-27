@@ -12,6 +12,7 @@ type AddressWord = (Option<(Table, u32)>, u32);
 pub(super) enum PixelFields {
     Pointers(Vec<PointerField>, Vec<Limit>),
     Words(Vec<BufferIndex>),
+    Ranges(Vec<ScalarRangeColumn>),
 }
 const MAX_FIELDS: usize = 128;
 // Enumerate a small flat-input domain only when the *bound producer*
@@ -183,6 +184,7 @@ impl Tracer<'_> {
         }
         let mut fields = BTreeSet::new();
         let mut words = Vec::new();
+        let mut ranges = Some(Vec::new());
         let mut limits = BTreeSet::new();
         let mut fuel = 900;
         let mut shifts = Vec::new();
@@ -260,10 +262,13 @@ impl Tracer<'_> {
                         None
                     };
                     if addresses.is_none() {
-                        let step = if *idxen && !*offen && base == 0 {
-                            1 << self
-                                .record_stride(records.0, records.1, field, used)?
-                                .trailing_zeros()
+                        let stride = if *idxen && !*offen && base == 0 {
+                            Some(self.record_stride(records.0, records.1, field, used)?)
+                        } else {
+                            None
+                        };
+                        let step = if let Some(stride) = stride {
+                            1 << stride.trailing_zeros()
                         } else if *offen && !*idxen {
                             let mut writers = Vec::new();
                             self.possible_writes(address, &k, &mut fuel, &mut writers)?;
@@ -301,6 +306,15 @@ impl Tracer<'_> {
                             records: None,
                             value_mask: u32::MAX,
                         };
+                        if let Some(proven) = &mut ranges {
+                            if let Some(stride) = stride
+                                && let Some(column) = self.scalar_range_column(load, &k, r, index, field, stride)
+                            {
+                                if !proven.contains(&column) { proven.push(column); }
+                            } else {
+                                ranges = None;
+                            }
+                        }
                         if !words.contains(&index) {
                             words.push(index);
                         }
@@ -322,6 +336,11 @@ impl Tracer<'_> {
             }
         }
         if fields.is_empty() && !words.is_empty() {
+            if let Some(ranges) = ranges && !ranges.is_empty()
+                && r.waterfall.loads.contains(&site) && self.image_only_in_waterfall(site, r)
+            {
+                return Some(PixelFields::Ranges(ranges));
+            }
             return Some(PixelFields::Words(words));
         }
         if fields.is_empty() || !words.is_empty() {
@@ -420,6 +439,15 @@ impl Tracer<'_> {
             {
                 let ptr = self.constant_buffer_word(base, r)?;
                 out.insert((Some(ptr), off));
+                continue;
+            }
+            if let Some((_, operands)) = self.sop2(w, &["s_min_u32"]) {
+                let bound = operands.into_iter().filter_map(|operand| match operand {
+                    Term::Const(bound) => Some(bound),
+                    Term::Value(_) => None,
+                }).min()?;
+                if bound >= MAX_FIELDS as u32 { return None; }
+                out.extend((0..=bound).map(|value| (None, value)));
                 continue;
             }
             let i = self.def(w)?;
@@ -560,4 +588,31 @@ pub(crate) fn mesh_output_limits(
         .into_iter()
         .filter_map(|((row, col), m)| Some((row, col, m.filter(|m| *m <= 255)?)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linked_fields_bound_a_broadcast_scalar_unsigned_minimum() {
+        let prove = |bound| {
+            let words: [u32; 5] = [
+                0x8380_ff00, bound, // s0 = s_min_u32(s0, bound).
+                0x7e12_0200,       // v9 = s0.
+                0x3412_1284,       // v9 <<= 4.
+                0xbf81_0000,
+            ];
+            let code: Vec<_> = words.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 32).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let t = Tracer::new(&p, &[], HwStage::Ps, Some(&st)).unwrap();
+            let shift = p.blocks[0].insts.iter().find(|i| i.name() == "v_lshlrev_b32").unwrap();
+            let active = st.mask_bits(shift.read(Reg::S(EXEC))?, None)?;
+            let known = vec![(active, true)];
+            t.address_words(shift.write(Reg::V(9))?, &known, &[], &Resources::default(), &mut Default::default(), &mut 64)
+        };
+        assert_eq!(prove(7), Some((0..8).map(|i| (None, i * 16)).collect()));
+        assert_eq!(prove(MAX_FIELDS as u32), None);
+    }
 }

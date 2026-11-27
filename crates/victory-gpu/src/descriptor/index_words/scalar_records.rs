@@ -1,5 +1,5 @@
 use super::*;
-use victory_shader::resource::{PackedMaterialColumn, ScalarRecordChain};
+use victory_shader::resource::{FixedRecordColumn, PackedMaterialColumn, ScalarRangeColumn, ScalarRecordChain};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum DependentWords {
@@ -8,6 +8,169 @@ pub(crate) enum DependentWords {
     Fields { pointer: IndexWords, records: IndexWords, offset: u32, fields: Vec<u32> },
     Programs(ScalarPrograms),
     PackedMaterial(PackedMaterialWords),
+    FixedRecord(FixedRecordWords),
+    ScalarRange(ScalarRangeWords),
+}
+
+/// The device-validated scalar base is extended by the original bounded
+/// lane delta. Every field uses the same wrapped set of child record rows.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ScalarRangeWords {
+    base: ScalarPrograms,
+    records: IndexWords,
+    count: u32,
+    stride: u32,
+    fields: Vec<(u32, u32, bool)>,
+}
+
+impl ScalarRangeWords {
+    pub(crate) fn new(base: ScalarPrograms, records: IndexWords, columns: &[&ScalarRangeColumn]) -> Option<Self> {
+        let first = columns.first()?;
+        if !(1..=256).contains(&first.count) || !first.record_stride.is_power_of_two()
+            || !(4..=64).contains(&first.record_stride)
+            || !matches!(first.base.last(), Some(victory_shader::resource::ScalarWordOp::Read { .. }))
+        {
+            return None;
+        }
+        let mut fields = Vec::with_capacity(columns.len());
+        for column in columns {
+            if column.base != first.base || column.records != first.records
+                || column.count != first.count || column.record_stride != first.record_stride
+                || !column.handle_field.is_multiple_of(4) || column.handle_field.checked_add(4)? > first.record_stride
+            {
+                return None;
+            }
+            fields.push((column.handle_field, column.bytes, column.zero_record));
+        }
+        fields.sort_unstable();
+        fields.dedup();
+        Some(Self { base, records, count: first.count, stride: first.record_stride, fields })
+    }
+
+    fn evaluate(
+        &self, writes: &[(usize, usize)], limit: u32, out: &mut BTreeSet<u32>,
+        device: Option<&DeviceBytes>, pending: &mut DeviceRanges,
+    ) -> bool {
+        let mut base = None;
+        if !self.base.evaluate_values(writes, device, pending, |value| base = Some(value)) { return false; }
+        let Some(base) = base else { return false; };
+        let rows = scalar_range_rows(base, self.count, self.stride);
+        let mut complete = true;
+        let mut has_interval = false;
+        let first = self.fields[0].0;
+        let last = self.fields.last().expect("scalar range fields").0;
+        for &(_, bias, _) in &self.fields { insert_slot(0, bias, limit, out); }
+        for (start, count) in rows {
+            if count == 0 { continue; }
+            let begin = start + first;
+            let end = u64::from(start) + u64::from((count - 1) * self.stride + last + 4);
+            let len = end.min(self.records.size & !3).saturating_sub(u64::from(begin)) as usize;
+            if len == 0 { continue; }
+            has_interval = true;
+            complete &= self.records.dependent_bytes(begin, len, writes, device, pending, |bytes| {
+                for row in 0..count {
+                    for &(field, bias, _) in &self.fields {
+                        let at = (row * self.stride + field - first) as usize;
+                        if let Some(word) = bytes.get(at..at + 4) {
+                            insert_slot(u32::from_le_bytes(word.try_into().expect("four-byte field")), bias, limit, out);
+                        }
+                    }
+                }
+            });
+        }
+        if rows[0].0 != 0 && rows[1].1 == 0 {
+            for &(field, bias, zero_record) in &self.fields {
+                if !zero_record { continue; }
+                if let Some(slot) = self.records.dependent_word(field, writes, device, pending) {
+                    insert_slot(slot, bias, limit, out);
+                } else { complete = false; }
+            }
+        }
+        // A wholly out-of-bounds range supplies zero only for the same
+        // view, so still verify the recorded native descriptor identity.
+        complete && (has_interval || self.records.validated_bytes((self.records.base as usize, 0), writes, device, |_| {}))
+    }
+}
+
+fn scalar_range_rows(base: u32, count: u32, stride: u32) -> [(u32, u32); 2] {
+    let start = base.wrapping_mul(stride);
+    let before_wrap = (1u64 << 32) - u64::from(start);
+    let first = count.min((before_wrap / u64::from(stride)) as u32);
+    [(start, first), (0, count - first)]
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct FixedRecordWords {
+    source: IndexWords,
+    columns: Vec<FixedRecordColumn>,
+}
+
+impl FixedRecordWords {
+    pub(crate) fn new(source: IndexWords, mut columns: Vec<FixedRecordColumn>) -> Option<Self> {
+        let first = *columns.first()?;
+        if !(1..=512).contains(&first.count) || !first.stride.is_multiple_of(4)
+            || first.count.checked_mul(first.stride)? > 2 * SELECTOR_READ_BUDGET as u32
+        {
+            return None;
+        }
+        for column in &columns {
+            if column.table != first.table || column.count != first.count || column.stride != first.stride
+                || !column.field.is_multiple_of(4) || column.field.checked_add(4)? > first.stride
+            {
+                return None;
+            }
+        }
+        columns.sort_unstable_by_key(|column| (column.field, column.bytes, column.value_mask));
+        columns.dedup();
+        if columns.len().checked_mul(first.count as usize)? > 512 { return None; }
+        Some(Self { source, columns })
+    }
+
+    fn evaluate(
+        &self, writes: &[(usize, usize)], limit: u32, out: &mut BTreeSet<u32>,
+        device: Option<&DeviceBytes>, pending: &mut DeviceRanges,
+    ) -> bool {
+        let first = self.columns[0];
+        let last = self.columns.last().expect("fixed record columns");
+        let end = (first.count - 1) * first.stride + last.field + 4;
+        let end = u64::from(end).min(self.source.size & !3);
+        let len = end.saturating_sub(u64::from(first.field)) as usize;
+        if len == 0 {
+            return self.source.validated_bytes((self.source.base as usize, 0), writes, device,
+                |b| decode_fixed_records(&self.columns, b, first.field, limit, out));
+        }
+        if self.source.device_input().is_none() || len <= SELECTOR_READ_BUDGET {
+            return self.source.dependent_bytes(first.field, len, writes, device, pending,
+                |b| decode_fixed_records(&self.columns, b, first.field, limit, out));
+        }
+        // A mostly empty span can still be bounded by exact device words.
+        // Missing words are requested together through the ordinary plan.
+        let mut complete = true;
+        for column in &self.columns {
+            insert_slot(0, column.bytes, limit, out);
+            for row in 0..column.count {
+                if let Some(slot) = self.source.dependent_word(row * column.stride + column.field, writes, device, pending) {
+                    insert_slot(slot & column.value_mask, column.bytes, limit, out);
+                } else {
+                    complete = false;
+                }
+            }
+        }
+        complete
+    }
+}
+
+fn decode_fixed_records(columns: &[FixedRecordColumn], bytes: &[u8], start: u32, limit: u32, out: &mut BTreeSet<u32>) {
+    for column in columns {
+        insert_slot(0, column.bytes, limit, out);
+        for row in 0..column.count {
+            let offset = (row * column.stride + column.field - start) as usize;
+            if let Some(word) = bytes.get(offset..offset + 4) {
+                let slot = u32::from_le_bytes(word.try_into().expect("four-byte field"));
+                insert_slot(slot & column.value_mask, column.bytes, limit, out);
+            }
+        }
+    }
 }
 
 /// Gather the slots from a bounded first table of packed record indices.
@@ -99,11 +262,17 @@ impl DependentWords {
             Self::Fields { pointer, records, .. } => pointer.device_input().is_some() || records.device_input().is_some(),
             Self::Programs(programs) => programs.device_sources().next().is_some(),
             Self::PackedMaterial(words) => words.parent.device_input().is_some() || words.records.device_input().is_some(),
+            Self::FixedRecord(words) => words.source.device_input().is_some(),
+            Self::ScalarRange(words) => words.records.device_input().is_some() || words.base.device_sources().next().is_some(),
         }
     }
 
     pub(crate) fn device_sources(&self) -> impl Iterator<Item = u64> {
-        let programs = if let Self::Programs(p) = self { Some(p) } else { None };
+        let programs = match self {
+            Self::Programs(programs) => Some(programs),
+            Self::ScalarRange(words) => Some(&words.base),
+            _ => None,
+        };
         match self {
             Self::Compute(chain) => chain.device_sources(),
             Self::Scalar { sources, .. } => sources.each_ref().map(|s| s.device_input().map(|b| b.id())),
@@ -116,6 +285,8 @@ impl DependentWords {
                 words.parent.device_input().map(|b| b.id()),
                 words.records.device_input().map(|b| b.id()), None,
             ],
+            Self::FixedRecord(words) => [words.source.device_input().map(|b| b.id()), None, None],
+            Self::ScalarRange(words) => [words.records.device_input().map(|b| b.id()), None, None],
         }
         .into_iter().flatten().chain(programs.into_iter().flat_map(ScalarPrograms::device_sources))
     }
@@ -132,6 +303,8 @@ impl DependentWords {
             Self::Compute(chain) => chain.evaluate(writes, limit, out, device, pending),
             Self::Programs(programs) => programs.evaluate(writes, limit, out, device, pending),
             Self::PackedMaterial(words) => words.evaluate(writes, limit, out, device, pending),
+            Self::FixedRecord(words) => words.evaluate(writes, limit, out, device, pending),
+            Self::ScalarRange(words) => words.evaluate(writes, limit, out, device, pending),
             Self::Scalar { spec, sources } => {
                 scalar_handles(spec, |table, offset| sources[table].dependent_word(offset, writes, device, pending),
                     |slot| insert_slot(slot, 0, limit, out))
@@ -177,6 +350,34 @@ fn read_fields(base: u32, fields: impl Iterator<Item = u32>, mut read: impl FnMu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scalar_based_record_ranges_preserve_wrapping_byte_addresses() {
+        let range = |base, count| scalar_range_rows(base, count, 64);
+        assert_eq!(range(31, 256), [(31 * 64, 256), (0, 0)]);
+        assert_eq!(range(u32::MAX - 1, 4), [(0xffff_ff80, 2), (0, 2)]);
+        for base in [0, 1, 0x3ff_fffe, 0x3ff_ffff, 0x400_0000, u32::MAX] {
+            let clipped = range(base, 256).into_iter().flat_map(|(start, rows)| {
+                (0..rows).map(move |row| start + row * 64 + 44)
+            });
+            let actual = (0..256).map(|row| base.wrapping_add(row).wrapping_mul(64).wrapping_add(44));
+            assert!(clipped.eq(actual));
+        }
+    }
+
+    #[test]
+    fn fixed_record_proof_reads_field_four_at_non_power_of_two_stride() {
+        let column = FixedRecordColumn {
+            table: (0, 0), field: 4, stride: 136, count: 512, bytes: 0, value_mask: u32::MAX,
+        };
+        let mut bytes = [0; 140];
+        bytes[..4].copy_from_slice(&91u32.to_le_bytes());
+        bytes[13..17].copy_from_slice(&60u32.to_le_bytes());
+        bytes[136..140].copy_from_slice(&37u32.to_le_bytes());
+        let mut slots = BTreeSet::new();
+        decode_fixed_records(&[column], &bytes, 4, 1024, &mut slots);
+        assert_eq!(slots.into_iter().collect::<Vec<_>>(), [0, 37, 91]);
+    }
 
     #[test]
     fn packed_material_columns_gather_unique_records_and_include_out_of_bounds_zero() {

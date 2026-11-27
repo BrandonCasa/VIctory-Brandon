@@ -236,7 +236,9 @@ impl WarmReplacement {
 }
 
 fn legacy_scheduler(bytes: &[u8]) -> bool {
-    !bytes.starts_with(MAGIC) && !bytes.starts_with(PACKED_MAGIC) && decode(bytes).is_some_and(|(shader, source)| {
+    let current = [MAGIC, PACKED_MAGIC, FIXED_MAGIC, SCALAR_RANGE_MAGIC]
+        .iter().any(|magic| bytes.starts_with(*magic));
+    !current && decode(bytes).is_some_and(|(shader, source)| {
         source != SOURCE.as_bytes() && shader.stage == HwStage::Cs && cooperative::scheduler(&shader.dxil)
     })
 }
@@ -283,16 +285,85 @@ fn stale_skinning_reflection(shader: &HostShader, container: &[u8]) -> bool {
                 | "dd24ff46af3ae6eef3da7ef126337c2efd3d378b6a1556b888a7c27a3ff30a67")
 }
 
-// The vehicle shader's older reflection scans whole columns of the target
-// table. Re-translate it to use the bounded packed parent records instead.
+// Older vehicle entries scan whole columns of the target table. Re-translate
+// the variants that can use the bounded packed parent records throughout.
 fn stale_vehicle_reflection(shader: &HostShader, container: &[u8]) -> bool {
     let access = &shader.indexed_forms;
     shader.stage == HwStage::Ps && access.packed_material.is_empty()
         && access.buffer_indices.iter().any(|(index, _)| {
             index.table_slot == 0 && index.table_dword == 368 && index.word_step == 64
         })
+        && matches!(blake3::hash(container).to_hex().as_str(),
+            "19acd330dacc8f325d8385f839ef8697ba8c8d8da5d7a69b6ced20bdc71d3837"
+                | "166fb96b4a4584e0cd11df981f7e91864d45f9a73e0e40cd68af043e4ca4fc6a"
+                | "212379c7f4ae453fcdb4c803af28ede0b7c9b29171abe553bd70adfb16e177e5"
+                | "2af15279e972b9487423a669c75e131d84dc524df72422b3049a730f7f0c0c5b"
+                | "34e0f5531559039df421a747875ed80f2777c14366a9707354ee5417e768d070"
+                | "5588031a7d0dce3d21389f47970e5e9f306c0a800f19ad4e1e5ffc1c5dd2d711"
+                | "5862598309ecead43de02a920f9857470bc4ea09911b8a05a139aa79ccd896b7"
+                | "7333603e0e1b4e905112308f532a7a7afea2d5734ba88d0e65d759a57124c514"
+                | "7778fb128a65511e46c55ac36e0d24f7745d9b0a217df8468934d0115e6441ad"
+                | "81f23cdc52f59a699fe3c17b2b59c263795fe85c142f1b51dc42882bafcbfd16"
+                | "8866d7d19733564c54eb06ca993d514ede63b0613ba619b8878932ba3855adfd"
+                | "8b796bb872f4252a2f592124756cc187cae5ed3a852b35813f0761b61e6b8a52"
+                | "99bdcd7c5640452d1d9295ae9634c81ee3ec4e3451910fc1e99f8ec20a0a4560"
+                | "a686a374bbf863c13c39afaec4c6c235b70295cbe791b3c0e6e2a0c4690dffdc"
+                | "b3d05023ed08e15e25a3ef171ccab97c4aef9d08a121470fbf436952bdb77b07"
+                | "b3e18290c534283df7f461c932caaba488f39ece4d13e454dddd154cc9a73131"
+                | "c100f3c699648196ea57c6d57751bdabee42e5a87bcd79f75efe421e89906c7c")
+}
+
+fn stale_pedestrian_reflection(shader: &HostShader, container: &[u8]) -> bool {
+    let access = &shader.indexed_forms;
+    shader.stage == HwStage::Ps && access.fixed_record_columns.is_empty()
+        && access.buffer_indices.iter().any(|(index, _)| {
+            index.table_slot == 0 && index.table_dword == 0 && index.word_step == 1
+        })
+        && matches!(blake3::hash(container).to_hex().as_str(),
+            "3212e1d185104746b05822f904a3ae33f5b618908468d96a204b846d2f411d2d"
+                | "5392b01466c6d1cfba81829025280b6bdc0a1c0c474a198fd4a164b9d1afe2c3"
+                | "6a3a8d3fe52b4eabe5fe50808556cb5ed23d97d17974a2f27563d52c16dc60f7"
+                | "73644c6a0b7b5b352af29bfdeda729bd7bf537011df84b4c7235dc2dc2bc9464"
+                | "7978fc1bf5d076afa268772de86d4c409b44c5d6ad3ecf02328d4f6ade05c58c"
+                | "e7bdd8b081286a92e43a11c988e9242e03f4780598408fb512753607cda87380")
+}
+
+fn stale_livery_reflection(shader: &HostShader, container: &[u8]) -> bool {
+    let access = &shader.indexed_forms;
+    shader.stage == HwStage::Ps && access.scalar_range_columns.is_empty()
+        && access.buffer_indices.iter().any(|(index, _)| {
+            index.table_slot == 0 && index.table_dword == 368 && index.word_step == 64
+        })
         && blake3::hash(container).to_hex().as_str()
-            == "19acd330dacc8f325d8385f839ef8697ba8c8d8da5d7a69b6ced20bdc71d3837"
+            == "4b3d2c8f7a15e7a116d03cd21483ad8d288aab6ce2270aa5d76463d421b8f119"
+}
+
+fn stale_vehicle_offset_reflection(shader: &HostShader, container: &[u8]) -> bool {
+    shader.stage == HwStage::Ps
+        && shader.indexed_forms.buffer_indices.iter().any(|(index, _)| {
+            index.table_slot == 0 && index.table_dword == 688 && index.word_step == 1
+        })
+        && blake3::hash(container).to_hex().as_str()
+            == "5588031a7d0dce3d21389f47970e5e9f306c0a800f19ad4e1e5ffc1c5dd2d711"
+}
+
+// These linked pixel stages use bounded mesh input and scalar-clamped indices
+// for the material handle fields that older entries also scan byte by byte.
+fn stale_linked_material_reflection(shader: &HostShader, container: &[u8]) -> bool {
+    shader.stage == HwStage::Ps
+        && shader.indexed_forms.buffer_indices.iter().any(|(index, _)| {
+            index.table_slot == 0 && index.table_dword == 160 && index.word_step == 1
+        })
+        && matches!(blake3::hash(container).to_hex().as_str(),
+            "3847458f4cebb0ba79820cc9c52fedd8439a25aba443e9d15aec796d7a37ae12"
+                | "ea90eea5044117c0baaf893278b50f4c7ac163bf4f3a5a8aff604db14f3362e2")
+}
+
+fn stale_clustered_compute_reflection(shader: &HostShader, container: &[u8]) -> bool {
+    let access = &shader.indexed_forms;
+    shader.stage == HwStage::Cs && access.opaque & 8 != 0 && access.texture_kinds[0] == 1 << 2
+        && blake3::hash(container).to_hex().as_str()
+            == "c4183d3cbee28e8e1aee1806f6b2cfcb4732e8fbe9386910e723ce0a32f73205"
 }
 
 pub(crate) fn warm_replacement(container: &[u8]) -> Result<Option<(WarmReplacement, HostShader)>, String> {
@@ -383,6 +454,11 @@ fn cached_by(
                 if refresh || stale_material_reflection(&shader)
                     || stale_skinning_reflection(&shader, container)
                     || stale_vehicle_reflection(&shader, container)
+                    || stale_pedestrian_reflection(&shader, container)
+                    || stale_livery_reflection(&shader, container)
+                    || stale_vehicle_offset_reflection(&shader, container)
+                    || stale_linked_material_reflection(&shader, container)
+                    || stale_clustered_compute_reflection(&shader, container)
                     || stale_compute_translation(&shader, container)
                 {
                     tracing::debug!(path = %path.display(), "shader cache entry of an earlier translator; translating again");
@@ -444,6 +520,8 @@ fn cached_by(
 const MAGIC: &[u8; 4] = b"VSHK";
 // Only shaders with packed parent selectors need the additional section.
 const PACKED_MAGIC: &[u8; 4] = b"VSHL";
+const FIXED_MAGIC: &[u8; 4] = b"VSHM";
+const SCALAR_RANGE_MAGIC: &[u8; 4] = b"VSHN";
 const INDEXED_BUFFER_WRITE: u32 = 4;
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
@@ -480,11 +558,33 @@ fn root_type(code: u32) -> RootType {
     }
 }
 
+fn write_scalar_program(out: &mut Vec<u8>, program: &[victory_shader::resource::ScalarWordOp]) {
+    use victory_shader::resource::ScalarWordOp::*;
+    out.extend((program.len() as u32).to_le_bytes());
+    for &op in program {
+        let (tag, a, b): (u32, u32, u32) = match op {
+            Constant(k) => (0, k, 0),
+            Read { table: (slot, dword), address } => (1, u32::from(slot) | u32::from(address) << 8, dword),
+            Add(a, b) => (2, a.into(), b.into()),
+            Multiply(a, b) => (3, a.into(), b.into()),
+            And(a, b) => (4, a.into(), b.into()),
+            Or(a, b) => (5, a.into(), b.into()),
+            ShiftLeft(a, b) => (6, a.into(), b.into()),
+            ShiftRight(a, b) => (7, a.into(), b.into()),
+        };
+        for word in [tag, a, b] { out.extend(word.to_le_bytes()); }
+    }
+}
+
 /// Little-endian words and length-prefixed lists, after the build of the
 /// translator that made the entry (`source`, length-prefixed).
 fn encode(s: &HostShader, source: &str) -> Vec<u8> {
     let packed = &s.indexed_forms.packed_material;
-    let mut out = if packed.is_empty() { MAGIC } else { PACKED_MAGIC }.to_vec();
+    let fixed = &s.indexed_forms.fixed_record_columns;
+    let ranges = &s.indexed_forms.scalar_range_columns;
+    let magic = if !ranges.is_empty() { SCALAR_RANGE_MAGIC } else if !fixed.is_empty() { FIXED_MAGIC }
+        else if !packed.is_empty() { PACKED_MAGIC } else { MAGIC };
+    let mut out = magic.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
     word(&mut out, source.len() as u32);
     out.extend(source.as_bytes());
@@ -584,22 +684,8 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
     }
     word(&mut out, s.indexed_forms.scalar_programs.len() as u32);
     for (program, kind) in &s.indexed_forms.scalar_programs {
-        use victory_shader::resource::ScalarWordOp::*;
         word(&mut out, u32::from(*kind));
-        word(&mut out, program.len() as u32);
-        for &op in program {
-            let (tag, a, b) = match op {
-                Constant(k) => (0,k,0),
-                Read { table: (slot,dword), address } => (1,u32::from(slot) | u32::from(address) << 8,dword),
-                Add(a,b) => (2,a.into(),b.into()),
-                Multiply(a,b) => (3,a.into(),b.into()),
-                And(a,b) => (4,a.into(),b.into()),
-                Or(a,b) => (5,a.into(),b.into()),
-                ShiftLeft(a,b) => (6,a.into(),b.into()),
-                ShiftRight(a,b) => (7,a.into(),b.into()),
-            };
-            for x in [tag,a,b] { word(&mut out,x); }
-        }
+        write_scalar_program(&mut out, program);
     }
     let sampled=s.indexed_forms.buffer_indices.iter().map(|(i,k)|(i,u32::from(*k)));
     let storage=s.indexed_forms.uav_indices.iter().map(|(i,k,w)|(i,u32::from(*k) | 256 | (u32::from(*w)<<9)));
@@ -627,7 +713,7 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
         }
         word(&mut out, index.value_mask);
     }
-    if !packed.is_empty() {
+    if magic != MAGIC {
         word(&mut out, packed.len() as u32);
         for &(column, kind) in packed {
             for (slot, dword) in [column.parent, column.records] {
@@ -640,6 +726,27 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
             {
                 word(&mut out, value);
             }
+        }
+    }
+    if magic == FIXED_MAGIC || magic == SCALAR_RANGE_MAGIC {
+        word(&mut out, fixed.len() as u32);
+        for &(column, kind) in fixed {
+            for value in [u32::from(column.table.0), column.table.1, column.field,
+                column.stride, column.count, column.bytes, column.value_mask, u32::from(kind)]
+            {
+                word(&mut out, value);
+            }
+        }
+    }
+    if magic == SCALAR_RANGE_MAGIC {
+        word(&mut out, ranges.len() as u32);
+        for (column, kind) in ranges {
+            for value in [u32::from(column.records.0), column.records.1, column.count,
+                column.record_stride, column.handle_field, column.bytes, u32::from(column.zero_record), u32::from(*kind)]
+            {
+                word(&mut out, value);
+            }
+            write_scalar_program(&mut out, &column.base);
         }
     }
     word(&mut out, s.halfword_aligned_roots.len() as u32);
@@ -666,10 +773,29 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
             let n = self.word()? as usize;
             Some(self.take(n)?.to_vec())
         }
+        fn scalar_program(&mut self) -> Option<Vec<victory_shader::resource::ScalarWordOp>> {
+            use victory_shader::resource::ScalarWordOp::*;
+            let count = self.word()?;
+            if !(1..=32).contains(&count) { return None; }
+            let mut program = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let (tag, a, b) = (self.word()?, self.word()?, self.word()?);
+                let op = match tag {
+                    0 if b == 0 => Constant(a),
+                    1 if a >> 8 < i => Read { table: (a as u8, b), address: (a >> 8) as u8 },
+                    2..=7 if a < i && b < i => [Add, Multiply, And, Or, ShiftLeft, ShiftRight][tag as usize - 2](a as u8, b as u8),
+                    _ => return None,
+                };
+                program.push(op);
+            }
+            matches!(program.last(), Some(Read { .. })).then_some(program)
+        }
     }
     let mut r = Reader(bytes);
     let magic = r.take(4)?;
-    let packed_access = magic == PACKED_MAGIC;
+    let range_access = magic == SCALAR_RANGE_MAGIC;
+    let fixed_access = magic == FIXED_MAGIC || range_access;
+    let packed_access = magic == PACKED_MAGIC || fixed_access;
     let typed_access = packed_access || magic == MAGIC || magic == b"VSHJ";
     let linked_access = typed_access || matches!(magic,b"VSHG"|b"VSHH"|b"VSHI");
     let record_access = linked_access || magic == b"VSHF";
@@ -784,24 +910,9 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
     }
     let mut scalar_programs = Vec::new();
     if linked_access {
-        use victory_shader::resource::ScalarWordOp::*;
         for _ in 0..r.word()? {
             let kind = u8::try_from(r.word()?).ok().filter(|k| (1..=9).contains(k))?;
-            let count = r.word()?;
-            if !(1..=32).contains(&count) { return None; }
-            let mut program = Vec::with_capacity(count as usize);
-            for i in 0..count {
-                let (tag,a,b) = (r.word()?,r.word()?,r.word()?);
-                let op = match tag {
-                    0 if b == 0 => Constant(a),
-                    1 if a >> 8 < i => Read { table: (a as u8,b), address: (a >> 8) as u8 },
-                    2..=7 if a < i && b < i => [Add,Multiply,And,Or,ShiftLeft,ShiftRight][tag as usize-2](a as u8,b as u8),
-                    _ => return None,
-                };
-                program.push(op);
-            }
-            if !matches!(program.last(),Some(Read {..})) { return None; }
-            scalar_programs.push((program,kind));
+            scalar_programs.push((r.scalar_program()?, kind));
         }
     }
     let count = r.word()? as usize;
@@ -899,7 +1010,41 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
             packed_material.push((column, kind));
         }
     }
-    let indexed_forms = victory_shader::emit::IndexedAccess { opaque, texture_kinds, offsets, buffer_indices, uav_indices, buffer_uav_indices, packed_material, chains, scalar_records, scalar_programs, pointer_fields,input_limits,output_limits };
+    let mut fixed_record_columns = Vec::new();
+    if fixed_access {
+        for _ in 0..r.word()? {
+            let column = victory_shader::resource::FixedRecordColumn {
+                table: (u8::try_from(r.word()?).ok()?, r.word()?),
+                field: r.word()?, stride: r.word()?, count: r.word()?, bytes: r.word()?, value_mask: r.word()?,
+            };
+            if !(1..=512).contains(&column.count) || !column.stride.is_multiple_of(4)
+                || !column.field.is_multiple_of(4) || column.field.checked_add(4)? > column.stride
+                || column.count.checked_mul(column.stride).is_none()
+            {
+                return None;
+            }
+            let kind = u8::try_from(r.word()?).ok().filter(|kind| (1..=9).contains(kind))?;
+            fixed_record_columns.push((column, kind));
+        }
+    }
+    let mut scalar_range_columns = Vec::new();
+    if range_access {
+        for _ in 0..r.word()? {
+            let records = (u8::try_from(r.word()?).ok()?, r.word()?);
+            let (count, record_stride, handle_field, bytes) = (r.word()?, r.word()?, r.word()?, r.word()?);
+            let zero_record = match r.word()? { 0 => false, 1 => true, _ => return None };
+            let kind = u8::try_from(r.word()?).ok().filter(|kind| (1..=9).contains(kind))?;
+            if !(1..=256).contains(&count) || !record_stride.is_power_of_two() || record_stride > 64
+                || !handle_field.is_multiple_of(4) || handle_field.checked_add(4)? > record_stride
+            {
+                return None;
+            }
+            scalar_range_columns.push((victory_shader::resource::ScalarRangeColumn {
+                base: r.scalar_program()?, records, count, record_stride, handle_field, bytes, zero_record,
+            }, kind));
+        }
+    }
+    let indexed_forms = victory_shader::emit::IndexedAccess { opaque, texture_kinds, offsets, buffer_indices, uav_indices, buffer_uav_indices, packed_material, fixed_record_columns, scalar_range_columns, chains, scalar_records, scalar_programs, pointer_fields,input_limits,output_limits };
     let count = r.word()? as usize;
     if r.0.len() != count.checked_mul(8)? {
         return None;
@@ -960,6 +1105,8 @@ mod tests {
                 },2,true)],
                 buffer_uav_indices: Vec::new(),
                 packed_material: Vec::new(),
+                fixed_record_columns: Vec::new(),
+                scalar_range_columns: Vec::new(),
                 pointer_fields:vec![(victory_shader::resource::PointerField {pointer:(1,56),records:(0,160),pointer_offset:28,field:4},2)],
                 scalar_programs: vec![(vec![victory_shader::resource::ScalarWordOp::Constant(20),
                     victory_shader::resource::ScalarWordOp::Read { table:(1,8),address:0 }],2)],
@@ -1110,6 +1257,25 @@ mod tests {
         assert_eq!(decode(&packed_bytes), Some((packed.clone(), b"made by".to_vec())));
         packed.indexed_forms.packed_material[0].0.parent_count += 1;
         assert!(decode(&encode(&packed, "made by")).is_none());
+        let mut fixed = host.clone();
+        fixed.indexed_forms.fixed_record_columns.push((victory_shader::resource::FixedRecordColumn {
+            table: (0, 0), field: 4, stride: 136, count: 512, bytes: 0, value_mask: u32::MAX,
+        }, 2));
+        let fixed_bytes = encode(&fixed, "made by");
+        assert!(fixed_bytes.starts_with(FIXED_MAGIC));
+        assert_eq!(decode(&fixed_bytes), Some((fixed.clone(), b"made by".to_vec())));
+        fixed.indexed_forms.fixed_record_columns[0].0.count += 1;
+        assert!(decode(&encode(&fixed, "made by")).is_none());
+        let mut range = host.clone();
+        range.indexed_forms.scalar_range_columns.push((victory_shader::resource::ScalarRangeColumn {
+            base: range.indexed_forms.scalar_programs[0].0.clone(), records: (0, 368),
+            count: 256, record_stride: 64, handle_field: 44, bytes: 0, zero_record: true,
+        }, 2));
+        let range_bytes = encode(&range, "made by");
+        assert!(range_bytes.starts_with(SCALAR_RANGE_MAGIC));
+        assert_eq!(decode(&range_bytes), Some((range.clone(), b"made by".to_vec())));
+        range.indexed_forms.scalar_range_columns[0].0.count += 1;
+        assert!(decode(&encode(&range, "made by")).is_none());
         let mut legacy = bytes.clone();
         legacy[..4].copy_from_slice(b"VSH8");
         assert!(decode(&legacy).is_none());
